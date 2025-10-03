@@ -1,0 +1,151 @@
+#!/bin/bash -eu
+
+# Set up Postgres slot-based streaming replication based on https://www.slideshare.net/denishpatel/out-of-the-box-replication-in-postgres-94pg-con
+
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
+# https://stackoverflow.com/a/28085062
+: "${ATL_REPLICATION_PRIMARY_PG_REPLICATION_USER:=replication}"
+: "${ATL_REPLICATION_PRIMARY_PG_REPLICATION_PASSWORD:=replication}"
+
+main() {
+	if [[ $# -ne 0 ]]; then usage; fi
+	pgver="${ATL_DATABASE_VERSION:?}"
+	pgcluster="${ATL_DATABASE_CLUSTER:?}"
+	pgport="${ATL_DATABASE_PORT:?}"
+	interface="$ATL_REPLICATION_PRIMARY_HOST"
+	shift
+	port="${ATL_REPLICATION_PRIMARY_PORT:?}"
+	shift
+	pgdatadir=/var/lib/postgresql/$pgver/$pgcluster
+	pgconf=/etc/postgresql/$pgver/$pgcluster/postgresql.conf
+	sanitychecks
+	validate_service
+	install_pgpass
+	basebackup
+	if version_greaterequalthan "$pgver" 12; then
+		# In Postgres 12+ recovery.conf is no longer used. pg_basebackup sets the 'primary_conninfo' setting which tells the standby how to connect to the primary
+		:
+	else
+		edit_recoveryconf
+	fi
+	set_hotstandby
+	startpostgres
+	#pg_dump: Dumping the contents of table "changeitem" failed: PQgetResult() failed.
+	#pg_dump: Error message from server: ERROR:  canceling statement due to conflict with recovery
+	#DETAIL:  User query might have needed to see row versions that must be removed.
+	#pg_dump: The command was: COPY public.changeitem (id, groupid, fieldtype, field, oldvalue, oldstring, newvalue, newstring) TO stdout;
+	if ! grep -q "max_standby_streaming_delay = '-1'" "$pgdatadir"/postgresql.auto.conf; then
+		if ! grep -q '^max_standby_streaming_delay = -1 ' "$pgconf"; then
+			log "Setting max_standby_streaming_delay = -1 in $pgconf"
+			perl -i -pe 'BEGIN{undef $/;} s,(\n#max_standby_streaming_delay = ),\nmax_standby_streaming_delay = -1  # Must be set to -1 in order to pg_dump databases in recover. See https://stackoverflow.com/questions/14592436/postgresql-error-canceling-statement-due-to-conflict-with-recovery\1,sgm' "$pgconf"
+		fi
+	fi
+	# Can we just set this on the primary, and have it replicated to standby?
+	#echo 'alter system set max_standby_streaming_delay=-1'|  su - postgres -c psql
+	if [[ $ATL_DATABASE_VERSION -gt 12 ]]; then
+		echo "alter system  set primary_slot_name='standby1'" | atl_psql --super
+	fi
+
+	# Avoid errors: https://stackoverflow.com/questions/14592436/postgresql-error-canceling-statement-due-to-conflict-with-recovery
+	# pg_dump: Dumping the contents of table "bodycontent" failed: PQgetResult() failed.
+	# pg_dump: Error message from server: ERROR:  canceling statement due to conflict with recovery
+	# DETAIL:  User query might have needed to see row versions that must be removed.
+	# pg_dump: The command was: COPY public.bodycontent (bodycontentid, body, contentid, bodytypeid) TO stdout;
+	echo "alter system set max_standby_archive_delay = 900000;" | atl_psql --super
+	echo "alter system set max_standby_streaming_delay = 900000;" | atl_psql --super
+}
+
+usage() {
+	echo >&2 "Usage: $0 <primary_interface> <primary_port>"
+	echo >&2 "E.g. atl_install_postgresql_replication_standby 127.0.0.1 5433"
+	echo >&2
+	exit 1
+}
+
+validate_service() {
+	test -d /etc/postgresql/"$pgver/$pgcluster" || error "No such directory: /etc/postgresql/$pgver/$pgcluster"
+}
+
+sanitychecks() {
+	version_greaterequalthan "$pgver" 9.4 || error "Slot-based replication is only available on Postgres 9.4 and above (not $pgver)"
+	[[ -v ATL_ROLE ]] || error "ATL_ROLE is unset. This script will only run on confirmed non-production server. Either load a profile or set a default with 'echo \"ATL_ROLE=staging\" >> $ATL_PROFILEDIR/\\*'"
+	[[ $ATL_ROLE = standby ]] || "ATL_ROLE indicates this is a $ATL_ROLE server. Refusing to turn it into a standby."
+	[[ -v ATL_REPLICATION_STANDBY ]] || error "ATL_REPLICATION_STANDBY flag is not set. The $0 command should only be run on standby servers"
+	[[ -v ATL_REPLICATION_PRIMARY_HOST ]] || error "ATL_REPLICATION_PRIMARY_HOST is not set (?? must be set if ATL_REPLICATION_STANDBY is set ??)."
+}
+
+getpgport() {
+	pg_lsclusters | grep "$pgver \+$pgcluster" | awk '{print $3}' || error "No such cluster: $pgver $pgcluster "
+}
+
+install_pgpass() {
+	newline="$interface:$port:*:$ATL_REPLICATION_PRIMARY_PG_REPLICATION_USER:$ATL_REPLICATION_PRIMARY_PG_REPLICATION_PASSWORD"
+	# Note grep -F ('fixed' because there is a * in $newline
+	if [[ ! -f ~postgres/.pgpass ]] || ! grep -Fq "$newline" ~postgres/.pgpass; then
+		log "Addine line to ~postgres/.pgpass"
+		echo "$newline" >>~postgres/.pgpass
+		chown postgres. ~postgres/.pgpass
+		chmod go-rwx ~postgres/.pgpass
+		ls -la ~postgres/.pgpass
+	else
+		log '~postgres/.pgpass already exists with an entry for our replication primary'
+	fi
+}
+
+basebackup() {
+	if [[ -d $pgdatadir && -n "$($SUDO ls -A "$pgdatadir")" ]]; then
+		read -r -p "Database directory $pgdatadir is not empty. If you really want to proceed, type 'delete': " deleverything
+		case $deleverything in
+		delete)
+			$SUDO pg_ctlcluster "$pgver" "$pgcluster" stop -m immediate || true
+			#$SUDO find "${pgdatadir:?}" -mindepth 1 -maxdepth 1 -delete    # Don't delete the directory too as it might be a ZFS mount
+
+			$SUDO rm -rf "${pgdatadir:?}"
+			;;
+		*) error "Aborting. You may delete the '$pgdatadir' database by hand if you want" ;;
+		esac
+	else
+		log "$pgdatadir exists"
+	fi
+	if [[ ! -e "$pgdatadir" ]]; then
+		log "Creating $pgdatadir"
+		$SUDO install -d -o postgres -g postgres -m 0700 "$pgdatadir"
+	fi
+	#$SUDO pg_ctlcluster $pgver $pgcluster start
+	log "You shouldn't be prompted for the '$ATL_REPLICATION_PRIMARY_PG_REPLICATION_USER' password, as it is specified in ~/.pgpass (pasted below). But if not, the password to enter is '$ATL_REPLICATION_PRIMARY_PG_REPLICATION_PASSWORD'.\n$(<~postgres/.pgpass)".
+	# https://stackoverflow.com/questions/47824297/postgresql-waiting-for-checkpoint-to-complete
+	$SUDO su - postgres -c "set -x; pg_basebackup -h $interface -p $port -U '${ATL_REPLICATION_PRIMARY_PG_REPLICATION_USER}' -S standby1 -D '$pgdatadir' --write-recovery-conf --wal-method=stream --progress -v --checkpoint=fast -v"
+}
+
+edit_recoveryconf() {
+	if $SUDO grep -q 'primary_slot_name=.standby1' "$pgdatadir"/recovery.conf; then
+		log "recovery.conf already configured"
+	else
+		log "Adding extra vars to $pgdatadir/recovery.conf"
+		{
+			echo "primary_slot_name='standby1'"
+			echo "trigger_file = '$pgdatadir/finish.recovery'"
+			echo "recovery_target_timeline = 'latest'"
+		} | $SUDO tee -a "$pgdatadir"/recovery.conf
+		$SUDO cat "$pgdatadir"/recovery.conf
+	fi
+}
+
+set_hotstandby() {
+	# This doesn't seem to be necessary - hot_standby is on for replicas I've checked
+	if ! $SUDO grep -q "^hot_standby" "$pgdatadir"/postgresql.auto.conf; then
+		log "Enabling hot_standby"
+		echo "hot_standby = 'on'" | $SUDO tee -a "$pgdatadir"/postgresql.auto.conf
+	else
+		log "hot_standby already enabled"
+	fi
+}
+
+startpostgres() {
+	$SUDO pg_ctlcluster "$pgver" "$pgcluster" start
+}
+
+main "$@"

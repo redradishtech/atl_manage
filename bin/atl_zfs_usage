@@ -1,0 +1,56 @@
+#!/bin/bash
+## Prints space used by snapshots and non-snapshots on ZFS
+# https://wiki.redradishtech.com/display/~jturner/2020/03/09/ZFS+disk+space+cleanup+with+sanoid+snapshots
+set -o pipefail
+
+#shellcheck source=/opt/atl_manage/lib/common.sh
+. "$ATL_MANAGE"/lib/logging.sh
+
+snapshots="$(mktemp --dry-run)"
+trap 'rm $snapshots' EXIT TERM
+
+#echo "Snapshot usage:"
+#zfs list -Hpo space -r "$root"  | perl -lane '{$x+=$F[3];} END {print "".($x >> 30)." Gb" ;}'
+#echo "Actual data usage:"
+#zfs list -Hpo space -r "$root"  | perl -lane '{$x+=$F[4];} END {print "".($x >> 30)." Gb" ;}'
+
+main() {
+	local root="${1:-$ATL_ZFSPOOL}"
+	log "non-autosnap sizes:"
+	listsnapshots | grep -v autosnap_ | sumsnapshots
+	log "autosnap snapshot sizes:"
+	listsnapshots | grep autosnap_ | sumsnapshots
+}
+
+sumsnapshots() {
+	while read -r snapshot; do
+		zfs destroy -np "$snapshot" 2>/dev/null | {
+			# This yields two lines of output like:
+			#   destroy secondary2023/GooglePhotosBackup@autosnap_2023-08-03_03:00:10_hourly
+			#   reclaim 0
+			# It would be nice to parallelize the 'zfs destroy' operations but I don't know how to store lines together
+			# https://unix.stackexchange.com/questions/564569/while-loop-reading-two-lines-at-a-time
+			read -r l1
+			[[ $l1 =~ ^destroy[[:space:]]+(.*) ]] || fail "Unexpected line: $l1"
+			local fs="${BASH_REMATCH[1]}"
+			while read -r l2; do
+				[[ $l2 =~ ^reclaim[[:space:]]([[:digit:]]+)$ ]] || fail "Unexpected second line: $l2"
+				local space="${BASH_REMATCH[1]}"
+				printf "%-10d\t%s\n" "$space" "$fs"
+			done
+		} || warn "Could not delete: $snapshot"
+	done | sort -nk1 | awk '{ printf "%02f Gb	%s\n", $1/1024/1024/1024, $2 }'
+}
+
+listsnapshots() {
+	if [[ -f "$snapshots" ]]; then
+		:
+		#log "Reusing snapshots $snapshots"
+	else
+		#log "Creating snapshots $snapshots"
+		zfs list -t snapshot -H -s name -o name -r "$root" >"$snapshots"
+	fi
+	cat "$snapshots"
+}
+
+main "$@"

@@ -1,0 +1,10 @@
+#!/opt/atl_manage/venv/bin/python
+import sys, os;
+exe = os.path.realpath(os.path.abspath(sys.argv[0]))
+exedir = os.path.dirname(exe)
+sys.path.insert(0, os.path.join(exedir, '../lib'))
+sys.path.insert(0, os.path.join(exedir, '..'))
+import redo.title
+import redo.cmd_always
+redo.title.auto()
+redo.cmd_always.main()

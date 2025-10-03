@@ -1,0 +1,139 @@
+#!/usr/bin/perl
+#
+# An ugly script to extract key:value headers from comment blocks in scripts, and emit key=value pairs parseable by bash.
+# Supports:
+#  - Variable substitituion, e.g. if 'foo: 1' is defined, then 'bar: $foo' evaluates to bar=1
+#  - Environment variable substitution, e.g. 'homedir: $HOME/foo' evaluates to homedir=/home/jturner/foo
+#  - $[...] bash-style arithmetic expressions, e.g. $[1+1] evaluates to 2, as does $[1+$foo] if 'foo: 1' is define
+#  - $0 is evaluated to the file basename.
+#  - Multiple values for a key are converted to a bash array. 
+#  - Variables beginning with underscore are considered internal and are not emitted.
+#
+# A sample header:
+#
+# BEGIN NAGIOS PASSIVE CHECK METADATA
+# service_description: All app :mods \"are" in version control
+# _1m: 60
+# _1h: $[$_1m*60]
+# _1d: $[$_1h*24]
+# freshness_threshold: $[ ${_1d} + $_1m ]
+# croninterval: 0 * * * *
+## This comment will be ignored.
+# foo: one
+# foo: two
+# quoted: O'Brien
+# homedir: $HOME/scripthome	# Comments after values are stripped
+# install_if: $0 --check-we-should-install
+# END NAGIOS PASSIVE CHECK METADATA
+# 
+# Running:
+#
+# headervars $(which headervars)
+#
+# yields:
+#
+# quoted='O'"'"'Brien'
+# service_description='All app :mods \"are" in version control'
+# freshness_threshold='86460'
+# foo=('one' 'two')
+# croninterval='0 * * * *'
+# homedir='/home/jturner/scripthome'
+# install_if='headervars --check-we-should-install'
+
+#
+# FIXME: add docs as per https://dba.stackexchange.com/questions/5110/determine-when-a-postgresql-database-was-last-changed
+
+use strict;
+use warnings;
+use Data::Dumper;
+
+#use Getopt::Long;
+#my $safe = '';
+#GetOptions('safe' => \$safe);
+
+#done <  <(< "$servicefile" awk 'BEGIN { state=0 } { if (state==1) state=2 }; /# BEGIN / { state=1 }; /# END / { state=3 } { if (state==2) {
+my $state=0;
+# Note: we could use "/^# BEGIN/ .. /^# END/" for this. See https://stackoverflow.com/questions/44544122/perl-one-liner-to-simulate-awk-script
+#
+## https://stackoverflow.com/questions/4933710/perl-opening-file
+my $path = $ARGV[0];
+use File::Basename;
+my $filename = basename($path);
+
+open my $fh, '<', $path or die $!;
+my %keyvals;
+while (<$fh>) {
+	chomp;
+	next unless /^ *#/;		# Only consider commented lines
+	next if /^ *##/;		# Ignore double-hash-commented lines
+	s/^ *# *//;			# Remove beginning hash
+	if (/BEGIN /) { $state=1; }
+	elsif (/END /) { exit(); }
+	elsif ($state==1) { $state=2; }
+	next unless $state==2;
+	s/\s#.+$//;			# Remove comment blocks after values. Note the whitespace is just required in case we have strings like 'install_if: test ${ATL_FQDN#www\.} != $ATL_BASEDOMAIN'
+	s/ *$//;			# With comments stripped, remove whitespace at end of lines
+
+	# https://perldoc.perl.org/perlrequick.html#Extracting-matches
+	# https://stackoverflow.com/questions/1412567/how-can-i-split-a-string-into-only-two-parts-with-perl
+	if (!/.+:.*/) {
+		print STDERR "Header line not in <key>: <var> format:\t".$_."\n\n";
+		exit(1);
+	}
+	my ($key, $val) = split /:/, $_, 2;
+	next unless $key;
+	#print STDERR "Key: «$key»    Val: «$val»\n";
+	# https://perlmaven.com/how-to-set-default-values-in-perl
+	$val //= "";			# If value is blank it would be undefined. This is crazy perl for 'set value if undefined'
+	# https://perlmaven.com/trim
+	$key =~ s/^\s+|\s+$//g;
+	$val =~ s/^\s+|\s+$//g;
+	#print STDERR "Key: «$key»    Val: «$val»\n";
+	#print("Considering line $_\n");
+	$key =~ /[a-zA-Z_-]+/ or die("Key '$key' is invalid\n");
+	# FIXME: Check $val to allow only environment variable substitution
+	$val =~ s/\$\{?0\}?/$filename/g;    # Expand $0 to the filename
+
+	my $var_regex = qr/\$ (?: \{(\w+)\} | (\w+) )/x;	# Regex matching $foo or ${foo}
+	while ($val =~ /$var_regex/g) {				# Evaluate our regex on the current line, setting $1='foo' if '$foo' was present
+
+		# Either $1 or $2 will be set, depending on which regex alternative path (..|..) was matched.
+		# We don't actually care, so first set $var to $1 or $2
+		my $var;
+		if (defined $1) { $var = $1; } elsif (defined $2) { $var = $2; } else { die; }
+		#print STDERR "$key: '$val' contains variable: $var\n";
+		
+		if (exists($keyvals{$var}) ) {			# Is 'foo' a variable previously defined in our header? If so, interpolate
+			my @vals = @{$keyvals{$var}};
+			if (scalar @vals == 1) {
+				$val =~ s/\$\{?$var\}?/@vals/g;	# Just one; evaluate in scalar context. 
+			} else {
+				my $out = join(" ", @vals);
+				$val =~ s/$var_regex/$out/g;	# space-separated. Perhaps we should just throw an error here since this would be unusual
+			}
+
+		} elsif (defined $ENV{$var}) {			# is 'foo' an environment variable? We expect so
+			$val =~ s/$var_regex/$ENV{$var}/g;
+		} else {
+			print STDERR "Error: $var is undefined in $path\n";
+			exit(1);
+		}
+	}
+	#print STDERR "Key: «$key»    Val: «$val»\n";
+	$val =~ s/\$\[([ 0-9+*\/-]+)\]/$1/gee;	# Allow arithmethic expressions. All variables have been evaluated at this point
+	# https://www.perlmonks.org/?node_id=1977
+	push( @{$keyvals{$key}}, $val );
+}
+END {
+	#print Dumper(%keyvals);
+	for my $key (grep !/^_/, (keys %keyvals)) {
+		my @vals = @{$keyvals{$key}};
+		# Single-quote each value, and escape pre-existing single-quotes
+		@vals = map { "'" . s/'/'"'"'/gr . "'" } @vals;
+		if (scalar @vals == 1) {
+			printf("%s=%s\n", $key, @vals );
+		} else {
+			printf("%s=(%s)\n", $key, join(" ", @vals) );
+		}
+	}
+}

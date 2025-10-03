@@ -1,0 +1,5 @@
+#!/bin/bash -eu
+
+for compatver in "${compatvers[@]}"; do
+	:
+done

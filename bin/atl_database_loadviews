@@ -1,0 +1,30 @@
+#!/bin/bash -eu
+
+PURPOSE="Adds any defined SQL views into the database"
+USAGE="${0}"
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+if [ "$#" -lt 0 ]; then
+	echo "-------------------------------------"
+	echo "Purpose: $PURPOSE"
+	echo "  Usage:"
+	echo "         $USAGE"
+	echo "-------------------------------------"
+	exit 1
+fi
+
+for f in $(
+	shopt -s nullglob
+	echo "$ATL_APPDIR_BASE"/database_views/*
+); do
+	if ! grep -q RUNASSUPERUSER "$f"; then
+		echo "Loading $f ..."
+		cat "$f" | atl_psql
+	else
+		cat "$f" | sudo su - postgres -c "psql -tAXq $ATL_SHORTNAME"
+	fi
+done
+
+# vim:set tw=120:

@@ -1,0 +1,27 @@
+#!/bin/bash -eu
+# Return 0 if the app is running, and should be (i.e. not a standby). See also atl_pid
+
+# shellcheck source=../lib/logging.sh
+source "$ATL_MANAGE"/lib/logging.sh
+
+atl_runstatus_correct() {
+	local ppid
+	if ppid="$(atl_pid)"; then
+		if [[ "$ATL_ROLE" == standby ]]; then
+			log "$ATL_SYSTEMD_SERVICENAME is running (pid $ppid), and shouldn't be as this is a standby"
+			return 1
+		else
+			return
+		fi
+	else
+		if [[ "$ATL_ROLE" == standby ]]; then
+			log "$ATL_SYSTEMD_SERVICENAME is not running as it is a standby"
+			return
+		else
+			log "$ATL_SYSTEMD_SERVICENAME is not running"
+			return 1
+		fi
+	fi
+}
+
+atl_runstatus_correct "$@" || exit $?

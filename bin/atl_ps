@@ -1,0 +1,15 @@
+#!/bin/bash -eu
+# Prints the ps lines for the app. Returns nonzero if the app isn't running. See also atl_pid with similar semantics
+
+fail() {
+	echo >&2 "$*"
+	return 1
+}
+
+[ -n "$ATL_SHORTNAME" ] || error "No app selected. Use 'atl_profile' to pick one: \n$(atl_profile list)"
+# A wider username column than default.
+
+pid="$(atl_pid)"
+if [[ -n "$pid" ]]; then # If not e.g. a standby server, where we get a blank response
+	ps --no-headers -ww --format user:20,pid,cmd:50 --pid "$(atl_pid)"
+fi

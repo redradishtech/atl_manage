@@ -1,0 +1,37 @@
+#!/bin/bash
+# Javamelody Nagios plugin, allowing alerts on status like HTTP mean response time.
+# Usage: check_jmelody --role ROLE [args-for-javamelody-jar]
+# If ROLE is 'standby' then this is a no-op
+# 
+# E.g.: check_jmelody --role sandbox -r "$ATL_DATADIR/javamelody/$ATL_SHORTNAME" --httpmeantime 
+
+role=
+newargs=()
+
+main() {
+	setrole "$@"
+	set -- "${newargs[@]}"
+	if [[ $role = standby ]]; then echo "OK: standby has no JavaMelody output"; exit 0; fi
+	java -jar "$(dirname "$0")"/javamelody_plugin.jar "${newargs[@]}"
+}
+
+setrole() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+			--role)
+				if [[ -n $2 ]]; then
+					role=$2  # Set role to the value after "--role"
+					shift  # Shift past the role value
+				else
+					echo "Error: --role flag requires a value."
+					exit 1
+				fi
+				;;
+			*)
+				newargs+=("$1")  # Store non "--role" arguments
+				;;
+		esac
+		shift  # Move to the next argument
+	done
+}
+main "$@"

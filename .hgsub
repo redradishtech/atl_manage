@@ -1,0 +1,4 @@
+lib/versioned_directories = ssh://hg@hg.sr.ht/~redradishtech/versioned_directories
+lib/requiresort = ssh://hg@hg.sr.ht/~redradishtech/requiresort
+lib/activeobject_views = [git]https://github.com/redradishtech/activeobject_views
+.hgext/hg-prompt = ssh://hg@hg.sr.ht/~redradishtech/hg-prompt

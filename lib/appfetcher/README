@@ -1,0 +1,11 @@
+The `fetch` shell script downloads a copy of a URL or git repository, verifies it against a checksum, unzips/untars
+it if necessary, and stores the result in a cache.
+
+The design is of functions ('fetch', 'unarchive' etc) accepting a cache directory, and emitting the path to another
+cache directory containing somehow transformed source. This is vaguely inspired by Git's content-based addressing and
+ideas of content-addressable storage.
+
+Unfortunately there is no orchestrator - each function has to take care of checksum generation and cache invalidation
+itself. This makes writing each transforming function difficult and bug-prone. 
+
+This should be rewritten to either use Git plumbing ('git hash-object -w File') or NixOS ('nix-store --add File').

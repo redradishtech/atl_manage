@@ -1,0 +1,30 @@
+#!/bin/bash -eu
+## Checks the access logs to see whether batch.js / batch.css requests are taking too long (a JIRA bug).
+
+#shellcheck source=common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh
+
+main()
+{
+	logfile="/var/log/$ATL_WEBSERVER/$ATL_LONGNAME/access.log"
+	[[ -f $logfile ]] || error "Missing logfile: $logfile"
+	[[ -r $logfile ]] || error "Cannot read logfile: $logfile"
+	tmpfile=$(mktemp)
+	trap 'rm -f "$tmpfile"' EXIT TERM
+	case $ATL_WEBSERVER in
+		nginx)
+			sql="select distinct count(*), median(rt), sc_status, cs_method, cs_uri_stem, cs_uri_query from logline where cs_uri_stem like '%/batch.%' group by sc_status, cs_method, cs_uri_stem, cs_uri_query HAVING median(rt) > 4 and count(*) > 2 order by count(*)  desc;"
+			;;
+		apache2)
+			sql="create view logs AS select c_requesttime/1000000.0 AS rt, * from access_log;  select distinct count(*), median(rt), sc_status, cs_method, cs_uri_stem, cs_uri_query from logs where cs_uri_stem like '%/batch.%' group by sc_status, cs_method, cs_uri_stem, cs_uri_query HAVING median(rt) > 4 and count(*) > 2 order by count(*)  desc;"
+			;;
+		*) fail "Unhandled ATL_WEBSERVER";;
+	esac
+	"$ATL_MANAGE"/bin/lnav <(cat "$logfile" | grep -E '/batch\.(js|css)\?' | tail -5000)  -c ";$sql" -n > "$tmpfile"
+
+	if [[ -s "$tmpfile" ]]; then # size > 0
+		failcritical "Batch files are being served slowly: $(head -1 "$tmpfile")"
+	fi
+}
+
+main "$@"

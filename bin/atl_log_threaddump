@@ -1,0 +1,43 @@
+#!/bin/bash -eu
+
+#journalctl -o cat -u $ATL_SYSTEMD_SERVICENAME | tac | awk 'BEGIN { state=0; }  /Full thread dump/ { state = 1 } { if (state<=1) print; if (state==1) exit }' | tac | awk '/^2017/ {  exit; } { print }'
+
+journalctl -o cat -u "$ATL_SYSTEMD_SERVICENAME" | perl -nle '
+BEGIN {
+	print "{{{ Beginning shenanigans"
+}
+if (/^Started /) {
+	print "}}}";
+	print "Ending either a Started block or the initial block";
+	print "{{{ Restart";
+	$started=1;
+}
+if ($started == 1 && /^((?:\d\d-.*-2017|\d\d\d\d-\d\d-\d\d) \d\d:\d\d:\d\d)/) {
+	print "{{{ In started; first log $1\n";
+	$started = 0;
+}
+if (/Full thread dump/) {
+	$threaddump = 1;
+	print "}}}";
+	print "End normal logs";
+	print "{{{ In thread dump ";
+}
+if ($threaddump == 1 && /^((?:\d\d-.*-2017|\d\d\d\d-\d\d-\d\d) \d\d:\d\d:\d\d)/) {
+	print "\n}}}";
+	print "End thread dump";
+	print "{{{ Begin normal logs $1\n";
+	$threaddump = 0;
+}
+print;
+END {
+	print "}}}";
+	print "# vim: set filetype=log4j_syntax_highlighter foldmethod=marker formatoptions+=cro :";
+}
+
+'
+#journalctl -o cat -u $ATL_SYSTEMD_SERVICENAME | awk 'BEGIN { state=0; print "{{{ Logs:"; }
+#	/Full thread dump/ { state = 1; printf "}}}\n{{{"; }
+#	/^(2017-[^ ]+)/ { if (state==1) { state = 0; printf "}}}\n{{{\n"; } }
+#	{ print }
+#	 END { print "}}}\n# vim: set filetype=log4j_syntax_highlighter foldmethod=marker formatoptions+=cro :\n" }'
+#

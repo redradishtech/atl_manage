@@ -1,0 +1,23 @@
+# LOCKNAME			SCRIPTS					LOCKTYPE
+home				backup/rsnapshot			readlock
+				bin/atl_deploy				writelock (when undeploying)
+				backupmirror/restore_backup		writelock
+				replication/sync_filesystem		writelock
+backup				backup/rsnapshot			writelock
+				backup/tarsnap				readlock
+				events/install-post/backups-rsnapshot	writelock (on install-post)
+				lib/backup_database			readlock
+				$ATL_APPDIR/backups/backupmirror.healthcheck	writelock
+backup-tarsnap			backup/tarsnap				writelock
+database			lib/backup_database		readlock
+				backupmirror/restore_backup		writelock 
+backupmirror.home.lock		backupmirror/sync_backup		writelock
+				backupmirror/restore_backup		readlock
+backupmirror.database.lock	backupmirror/sync_backup		writelock
+				backupmirror/restore_backup		readlock
+monitoring			bin/atl_install_monitoring_services	writelock
+				events/install-pre/monitoring		writelock
+upgrade				bin/atl_upgrade				writelock
+app				bin/atl_workingcopy			writelock
+certbot				letsencrypt/renew			writelock
+nagios				monitoring/eventhandler			writelock

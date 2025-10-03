@@ -1,0 +1,180 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Note: validateperms() is implemented in .webserver-common.sh
+
+install-post() {
+	enable_webserver_site() {
+		if [[ $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then
+			log "Enabling Apache vhost: $ATL_LONGNAME"
+			a2ensite -q "$ATL_LONGNAME"
+			apachectl configtest || warn "Something is wrong with Apache's config files. Fix before restarting Apache"
+		else
+			warn "Our $ATL_APPDIR_BASE/current/ symlink does not point to \$ATL_VER ($ATL_VER). We expect it should, as we're in the POST install step. atl_install does not mess with current/ at all - that is the job for atl_upgrade. Please fix"
+		fi
+	}
+	fix_apache_servername_warnings() {
+		grep -q ^ServerName /etc/apache2/apache2.conf || {
+			sn="ServerName $(uname -n).${ATL_FQDN#*.}"
+			echo "$sn" >>/etc/apache2/apache2.conf
+			log "Setting '$sn' in /etc/apache2/apache2.conf to avoid annoying warnings"
+		}
+	}
+
+	fix_apache_logrotate() {
+		# Because we put logs in subdirs of /var/log, the default logrotate scripts don't rotate them
+		if [[ -f /etc/logrotate.d/apache2 ]]; then
+			if grep -q '^/var/log/apache2/\*.log {$' /etc/logrotate.d/apache2; then
+				log "Warning: apache2 log files are not being rotated. Fixing:"
+				set -x
+				perl -i -pe 's,^/var/log/apache2/\*.log \{$,/var/log/apache2/*.log /var/log/apache2/*/*.log {,g' /etc/logrotate.d/apache2
+				set +x
+			fi
+			if ! grep -q dateext /etc/logrotate.d/apache2; then
+				warn "FIXME: Use datestamps rather than counter for archived Apache logs"
+				#( cd /etc/logrotate.d; patch -p2 < "$ATL_MANAGE/templates/apache2.logrotate" )
+			fi
+
+			((logrotate_days = "$(perl -lne 'print $1 if /^\s+rotate (.*)$/' </etc/logrotate.d/apache2)"))
+			DAYS_OF_APACHE_LOGS_TO_KEEP=$((6 * 30))
+			if ((logrotate_days < DAYS_OF_APACHE_LOGS_TO_KEEP)); then
+				perl -i -pe 's/^(\s+rotate) +\d+$/\1 '$DAYS_OF_APACHE_LOGS_TO_KEEP'/' /etc/logrotate.d/apache2
+				((new_logrotate_days = "$(perl -lne 'print $1 if /^\s+rotate (.*)$/' </etc/logrotate.d/apache2)"))
+				log "Changed logrotate to keep $new_logrotate_days instead of $logrotate_days days' of Apache logs"
+			else
+				log "We are keeping $logrotate_days of Apache logs, which meets our $DAYS_OF_APACHE_LOGS_TO_KEEP minimum"
+			fi
+
+			# This should probably not be in webserver-apache, but it's all hacks anyway
+			# Ubuntu has separate rotate blocks for /var/log/syslog and all the other /var/log/*.log files. We don't care: if either is less than our ideal, change them both
+			mapfile -t logrotate_weeks < <(perl -lne 'print $1 if /^\s+rotate (.*)$/' </etc/logrotate.d/rsyslog)
+			DAYS_OF_GENERAL_LOGS_TO_KEEP=$((6 * 30))
+			WEEKS_OF_GENERAL_LOGS_TO_KEEP=$((DAYS_OF_GENERAL_LOGS_TO_KEEP / 7 + 1))
+			if ((${logrotate_weeks[0]} < WEEKS_OF_GENERAL_LOGS_TO_KEEP)); then
+				perl -i -pe 's/^(\s+rotate) +\d+$/\1 '$WEEKS_OF_GENERAL_LOGS_TO_KEEP'/' /etc/logrotate.d/rsyslog
+				log "Changing logrotate to keep $$WEEKS_OF_GENERAL_LOGS_TO_KEEP instead of ${logrotate_weeks[0]} days' of general logs (mail.log, etc)"
+				mapfile -t logrotate_weeks < <(perl -lne 'print $1 if /^\s+rotate (.*)$/' </etc/logrotate.d/rsyslog)
+				[[ ${logrotate_weeks[0]} = "$WEEKS_OF_GENERAL_LOGS_TO_KEEP" ]] || fail "Failed to change logrotate weeks in /etc/logrotate.d/rsyslog"
+			else
+				log "We are keeping $logrotate_weeks of /var/log/* logs, which meets our $DAYS_OF_GENERAL_LOGS_TO_KEEP minimum"
+			fi
+		else
+			error "Strange; We're post-install configuring Apache, but there is no /etc/logrotate.d/apache2 file"
+		fi
+	}
+
+	check_maxworkers() {
+		if ! chronic "$ATL_MANAGE/monitoring/plugins/check_apachestatus.pl" -H "$ATL_FQDN_INTERNAL"; then
+			warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+			warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+		fi
+	}
+
+	ubuntu_version_greaterthan() { version_greaterthan "$(lsb_release --release --short)" "$1"; }
+	apache2_version_greaterthan() { version_greaterthan "$(dpkg-query --showformat='${Version}' --show apache2)" "$1"; }
+
+	define_internal_interface # Define $ATL_SHORTNAME.internal (aka ATL_FQDN_INTERNAL)
+	create_logdir apache2
+	pkginstall apache2
+	a2enmod rewrite ssl
+	a2enmod headers            # Needed for the Strict-Transport-Security header
+	a2enmod remoteip           # For Cloudflare proxy, if used
+	install_webserver_listener # Make the webserver listen on $ATL_SHORTNAME.internal
+	a2dissite 000-default      # We need to do this otherwise multiple hosts don't seem to match properly
+	a2dismod mpm_worker mpm_prefork	|| fail "Some software on this server requires a non-event MPM."
+	a2enmod mpm_event   # Note we can't enable if prefork is enabled
+	a2enmod info				# Enables http://localhost/server-info, used by atl_check_appdeployment which calls  'atl_diagnostic server-info'
+	if [[ ${ATL_PRODUCT_RUNTIME_TECHNOLOGY:-} =~ php ]]; then
+		a2enmod proxy_fcgi setenvif
+		a2enconf "${ATL_PRODUCT_RUNTIME_TECHNOLOGY}"
+	else
+		a2enmod -q ssl rewrite proxy_ajp proxy_http proxy_wstunnel status info
+	fi
+	# Avoid mpm_event bug by insisting on httpd >= 2.4.25
+	local use_http2=true
+	if ! ubuntu_version_greaterthan 16.04; then
+		# Ubuntu 16.04 only has an old Apache, so don't bother
+		use_http2=false
+	fi
+	if $use_http2 && [[ ! -L /etc/apache2/mods-enabled/http2.load ]]; then
+		if ! apache2_version_greaterthan 2.4.25; then
+			fail "We want Apache >= 2.4.25 for http2. See https://www.claudiokuenzler.com/blog/948/apache-2.4-mpm-event-bug-freezing-up-scoreboard-full-after-reload"
+		fi
+		# http2 requires mpm_event, which means php-fpm rather than mod_php
+		php_mods_enabled | xargs --no-run-if-empty a2dismod
+		a2dismod mpm_prefork || :
+		a2enmod -q mpm_event http2
+		# A full restart is needed, not just a 'graceful' restart
+		apachectl configtest && apachectl restart
+	fi
+	conffile=/etc/apache2/conf-available/http2.conf
+	if [[ $use_http2 && ! -f "$conffile" ]]; then
+		# For some reason the apache http2 module doesn't include this conf file
+		echo -e "<IfModule http2_module>\n\tProtocols h2 h2c http/1.1\n\tH2Direct on\n</IfModule>" >"$conffile"
+		a2enconf http2
+	fi
+
+	fix_apache_servername_warnings
+	fix_apache_logrotate
+	install_webserver_config apache2
+	install_webserver_selfsigned_ssl
+	enable_webserver_site
+	validate_sslcert
+	validateperms
+	# FIXME: configtest fails here if the letsencrypt patch has added a RemoteIPHeader directive to apache2/apache2.conf
+	# That suggests we should do the Apache a2enmods in 'install-pre', and then the configtest in 'install-post'.
+	apachectl configtest && apachectl graceful
+	rotatelogs apache2
+	check_maxworkers
+}
+
+php_mods_enabled() (
+	shopt -s nullglob
+	for f in /etc/apache2/mods-enabled/php*.load; do
+		f="$(basename "$f")"
+		echo "${f%.load}"
+	done
+)
+
+validate_sslcert() {
+	[[ -v ATL_SSLCERTKEYFILE && -v ATL_SSLCERTFILE ]] || return 0
+	local pubkey_from_cert pubkey_from_priv
+	# https://stackoverflow.com/questions/47262671/any-openssl-command-line-to-verify-ecdsa-prime256v1-certificate-and-private-key
+	# Note, this works with rsa and newer ecdsa keys
+	pubkey_from_cert="$(openssl x509 -noout -pubkey -in "$ATL_SSLCERTFILE")"
+	pubkey_from_priv="$(openssl pkey -pubout -in "$ATL_SSLCERTKEYFILE")"
+	[[ "$pubkey_from_cert" == "$pubkey_from_priv" ]] || fail "Certificate ATL_SSLCERTFILE ($ATL_SSLCERTFILE) does not match private key ATL_SSLCERTKEYFILE ($ATL_SSLCERTKEYFILE)"
+	openssl x509 -in "$ATL_SSLCERTFILE" -checkend $((7 * 24 * 60 * 60)) -noout >/dev/null || warn "Certificate due to expire within 7 days"
+}
+
+uninstall-pre() {
+	disable_webserver_site() {
+		webserverconf="/etc/apache2/sites-available/$ATL_LONGNAME.conf"
+		if a2dissite -q "$ATL_LONGNAME" >/dev/null 2>&1; then
+			log "Removed Apache config file $webserverconf"
+		fi
+		apachectl configtest || warn "Something is wrong with Apache's config files. Fix before restarting Apache"
+	}
+	# If current/ does not exist, we're in some half-uninstalled state. Proceed with uninstalling probably-broken webserver symlinks
+	if [[ ! -e "$ATL_APPDIR_BASE/current" ||  $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then
+		uninstall_webserver_selfsigned_ssl
+		disable_webserver_site
+		undefine_internal_interface
+	else
+		if [[ -v ATL_NEWVER ]]; then 
+			: # ATL_VER equals ATL_NEWVER (this is faked in atl_uninstall). This is normal
+		else
+			error "Our $ATL_APPDIR_BASE/current/ symlink does not point to \$ATL_VER ($ATL_VER). We expect it should. Not disabling $ATL_WEBSERVER (which uses current/ symlinks) as we risk breaking things. Please fix current/ and try again"
+		fi
+	fi
+}
+
+enabled() {
+	[[ $ATL_WEBSERVER = apache2 ]]
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.webserver-common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.webserver-common.sh
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh

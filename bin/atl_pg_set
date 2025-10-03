@@ -1,0 +1,549 @@
+#!/bin/bash
+## SQL generator to tweak various things in the database, like baseurl, banners, applinks and plugin state.
+## This is primarily invoked from $ATL_MANAGE/events/start-pre/set_* scripts which run when the app is started, to ensure that
+## sandbox instances have appropriately customized baseurls, applinks and so forth
+# Script generally returns the value that was overwritten.
+
+usage() {
+	case "$(basename "$0")" in
+	atl_pg_get)
+		echo >&2 "Usage: atl_pg_get jira baseurl"
+		echo >&2 "Usage: atl_pg_get jira bannercolour"
+		echo >&2 "Usage: atl_pg_get jira bannertext"
+		echo >&2 "Usage: atl_pg_get jira buildnum"
+		echo >&2 "Usage: atl_pg_get jira serverid"
+		echo >&2 "Usage: atl_pg_get jira license"
+		echo >&2 "Usage: atl_pg_get jira pluginlicense <pluginkey>"
+		echo >&2 "Usage: atl_pg_get jira pluginlicense <pluginkey>"
+		echo >&2 "Usage: atl_pg_get jira setting <settingkey>"
+		echo >&2 "Usage: atl_pg_get jira crowd-server-urls"
+		echo >&2 "Usage: atl_pg_get jira applinks"
+		echo >&2 "Usage: atl_pg_get jira applink-rpc-url"
+		echo >&2 "Usage: atl_pg_get jira applink-display-url"
+		echo >&2 "Usage: atl_pg_get confluence baseurl"
+		echo >&2 "Usage: atl_pg_get confluence bannercolour"
+		echo >&2 "Usage: atl_pg_get confluence bannertext"
+		echo >&2 "Usage: atl_pg_get confluence crowd-server-urls"
+		echo >&2 "Usage: atl_pg_get confluence applinks"
+		echo >&2 "Usage: atl_pg_get confluence applink-rpc-url"
+		echo >&2 "Usage: atl_pg_get confluence applink-display-url"
+		echo >&2 "Usage: atl_pg_get confluence gadgetfeed-url"
+		echo >&2 "Usage: atl_pg_get confluence recommended-updates-email"
+		echo >&2 "Usage: atl_pg_get confluence setting <settingkey>"
+		echo >&2 "Usage: atl_pg_get confluence buildno"
+		;;
+	atl_pg_set)
+		echo >&2 "Usage: atl_pg_set jira baseurl [<oldbaseurl>] <newbaseurl>"
+		echo >&2 "Usage: atl_pg_set jira bannercolour <oldhexcolour> <hexcolour>"
+		echo >&2 "Usage: atl_pg_set jira bannertext <textmessage>"
+		echo >&2 "Usage: atl_pg_set jira serverid <oldserverid> <newserverid>"
+		echo >&2 "Usage: atl_pg_set jira license <newlicense>"
+		echo >&2 "Usage: atl_pg_set jira pluginlicense <pluginkey> <newlicense>"
+		echo >&2 "Usage: atl_pg_set jira crowd-server-url <directoryid> <oldurl> <newurl>"
+		echo >&2 "Usage: atl_pg_set jira applink-rpc-url <oldurl> <newurl>"
+		echo >&2 "Usage: atl_pg_set jira applink-display-url <oldurl> <newurl>"
+		echo >&2 "Usage: atl_pg_set confluence baseurl <oldbaseurl> <newbaseurl>"
+		echo >&2 "Usage: atl_pg_set confluence bannercolour <oldhexcolour> <hexcolour>"
+		echo >&2 "Usage: atl_pg_set confluence bannertext <textmessage>"
+		echo >&2 "Usage: atl_pg_set confluence crowd-server-url <directoryid> <oldurl> <newurl>"
+		echo >&2 "Usage: atl_pg_set confluence applink-rpc-url <oldurl> <newurl>		# If changing this, also change gadgetfeed-url"
+		echo >&2 "Usage: atl_pg_set confluence applink-display-url <oldurl> <newurl>		# If changing this, also change gadgetfeed-url"
+		echo >&2 "Usage: atl_pg_set confluence gadgetfeed-url <oldurl> <newurl>     # applink URL embedded in gadget feed. Uses the same oldurl/newurl as 'applink-rpc-url'"
+		echo >&2 "Usage: atl_pg_set confluence recommended-updates-email <true|false>"
+		echo >&2 "Usage: atl_pg_set jira disableanalytics"
+		echo >&2 "Usage: atl_pg_set jira enableplugin <pluginkey>"
+		echo >&2 "Usage: atl_pg_set jira disableplugin <pluginkey>"
+		;;
+	esac
+	exit 1
+}
+
+#https://stackoverflow.com/questions/12873682/short-way-to-escape-html-in-bash
+htmlEscape() {
+	local s
+	s=${1//&/&amp;}
+	s=${s//</&lt;}
+	s=${s//>/&gt;}
+	s=${s//'"'/&quot;}
+	printf -- %s "$s"
+}
+
+fail() {
+	echo >&2 "$*"
+	exit 1
+}
+
+validations() {
+	case "$(basename "$0")" in
+	atl_pg_set)
+		case $2 in
+		baseurl)
+			if [[ $# = 3 ]]; then
+				[[ $3 =~ ^https?:// ]] || fail "Usage: atl_pg_set $1 baseurl [<oldbaseurl>] <newbaseurl>"
+			elif [[ $# = 4 ]]; then
+				[[ $3 =~ ^https?:// && $4 =~ ^https?:// ]] || fail "Usage: atl_pg_set $1 baseurl <oldbaseurl> <newbaseurl>"
+			fi
+			;;
+		bannercolour)
+			if [[ $# != 4 || ! $3 =~ ^\#?[0-9A-Za-z]{6}$ || ! $4 =~ ^\#?[0-9A-Za-z]{6}$ ]]; then
+				echo >&2 "Usage: atl_pg_set $1 bannercolour <oldhexcolour> <hexcolour>   	where hexcolour is #[0-9a-f]{6} "
+				exit 1
+			fi
+			;;
+		bannertext)
+			:
+			;;
+		enableplugin | disableplugin)
+			if [[ $# != 3 || ! $3 =~ ^(com|net|org)\..*$ ]]; then
+				echo >&2 "Usage: atl_pg_set $1 $2 <pluginkey>"
+				exit 1
+			fi
+			;;
+		crowd-server-url*)
+			if [[ $# != 5 ]]; then
+				echo >&2 "Usage: atl_pg_set $1 $2 <directoryid> <oldurl> <newurl>"
+				exit 1
+			fi
+			;;
+
+			# The 'applink-url' variation is for backwards-compat - remove once start-pre events are updated to all use applink-*-url
+		applink-url | applink-*-url | gadgetfeed-url)
+			if [[ $# != 4 ]]; then
+				echo >&2 "Usage: atl_pg_set $1 $2 <oldurl> <newurl>"
+				exit 1
+			fi
+			;;
+		license)
+			[[ $# = 3 ]] || fail "Usage: atl_pg_set $1 <newlicensekey>"
+			# https://stackoverflow.com/questions/12524308/bash-strip-trailing-linebreak-from-output
+			local newlicense="$(echo "$3" | tr -d '\n' | xargs echo -n)"
+			[[ $newlicense =~ ^[a-zA-Z0-9\+/=]+$ ]] || fail "newlicensekey characters invalid"
+			# Doesn't seem to be true (any more?)
+			#[[ ${#newlicense} = 573 ]] || fail "new license is expected to be 573 characters"
+			;;
+		pluginlicense)
+			[[ $# = 4 ]] || fail "Usage: atl_pg_set $1 <pluginkey> <newlicensekey>"
+			# https://stackoverflow.com/questions/12524308/bash-strip-trailing-linebreak-from-output
+			local newlicense="$(echo "$4" | tr -d '\n' | xargs echo -n)"
+			[[ $newlicense =~ ^[a-zA-Z0-9\+/=]+$ ]] || fail "newlicensekey characters invalid"
+			;;
+		serverid)
+			if [[ $# != 4 || (! $3 =~ ^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$ || ! $4 =~ ^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$) ]]; then
+				echo >&2 "Usage: atl_pg_set $1 serverid AAAA-BBBB-CCCC-DDDD  QQQQ-RRRR-SSSS-TTTT"
+				exit 1
+			fi
+			;;
+		recommended-updates-email)
+			if [[ $# != 3 ]]; then
+				echo >&2 "Usage: atl_pg_set $1 recommended-updates-email <true|false>"
+				exit 1
+			fi
+			[[ $3 = true || $3 = false ]] || {
+				echo >&2 "Usage: atl_pg_set $1 recommended-updates-email <true|false>"
+				exit 1
+			}
+			;;
+		*)
+			usage
+			;;
+		esac
+		;;
+	atl_pg_get)
+		case $2 in
+		setting)
+			if [[ $# != 3 ]]; then
+				echo >&2 "Usage: atl_pg_get $1 $2 <settingkey>"
+				case "$1" in
+				confluence)
+					echo >&2 "e.g. $0 $1 $2 gzippingResponse"
+					;;
+				jira)
+					echo >&2 "e.g. $0 $1 $2 jira.option.web.usegzip"
+					;;
+				esac
+				exit 1
+			fi
+			;;
+		esac
+		;;
+	esac
+
+}
+
+jira_applinkview_sql="$(cat <<-END
+		CREATE OR REPLACE TEMP VIEW applinks AS WITH applinkprops AS 
+  (SELECT regexp_replace(property_key, '^applinks\.admin\.([^.]+).*', '\1', 'g')::varchar AS applink,
+          regexp_replace(property_key, '^applinks\.admin\..*?\.(.+)', '\1')::varchar k,
+          propertyvalue::varchar v
+   FROM propertyentry pe
+   JOIN propertystring ps USING (id)
+   WHERE property_key~'^applinks.admin'
+     AND propertyvalue !~ 'java\.util')
+SELECT *
+FROM applinkprops
+ORDER BY applink,
+         k;
+END
+)"
+
+if [ $# -eq 0 ]; then
+	usage "$@"
+fi
+
+validations "$@"
+
+cmd="$(basename "$0")"
+
+if [[ ($1 = jira || $1 = confluence) && $2 =~ crowd-server-url* ]]; then
+	if [[ $cmd = atl_pg_get ]]; then
+		echo "select directory_id, attribute_value AS crowd_url from cwd_directory_attribute where attribute_name='crowd.server.url';"
+	else
+		# This is used by events/start-pre/set_crowd_server_url
+		echo "update cwd_directory_attribute set attribute_value='$5' where attribute_name='crowd.server.url' and directory_id='$3' and attribute_value='$4' returning attribute_value as old_crowd_url;"
+	fi
+fi
+
+case "$1" in
+jira)
+	case "$2" in
+	baseurl)
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select propertyvalue AS baseurl from propertystring JOIN propertyentry ON propertystring.id = propertyentry.id WHERE propertyentry.property_key='jira.baseurl' and propertyentry.entity_name='jira.properties';"
+		else
+			if [[ $# = 3 ]]; then
+				echo "update propertystring set propertyvalue='$3' where id = (select id from propertyentry pe  where property_key='jira.baseurl' and entity_name='jira.properties' AND NOT EXISTS (select * from propertystring where id=pe.id AND propertyvalue='$3') );"
+			elif [[ $# = 4 ]]; then
+				echo "update propertystring set propertyvalue='$4' where id in (select ps.id from (select * from propertyentry where property_key='jira.baseurl' and entity_name='jira.properties') pe JOIN (select * from propertystring where propertyvalue='$3') ps  ON pe.id=ps.id  );"
+			fi
+		fi
+		;;
+	bannercolour)
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select propertyvalue AS bannercolour from propertyentry pe JOIN propertystring ps USING (id) WHERE pe.entity_name='jira.properties' and pe.property_key='jira.lf.top.bgcolour';"
+		else
+			if [[ $# = 4 ]]; then
+				echo "update propertystring set propertyvalue='$4' where id in (select ps.id from (select * from propertyentry where property_key='jira.lf.top.bgcolour' and entity_name='jira.properties') pe JOIN (select * from propertystring where propertyvalue='$3') ps  ON pe.id=ps.id  );"
+			fi
+		fi
+		;;
+	bannertext)
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select propertyvalue AS bannertext from propertytext pt JOIN propertyentry pe USING (id) WHERE pe.entity_name='jira.properties' and pe.property_key='jira.alertheader';"
+		else
+			sqltext=${3//\'/\'\'} # SQL wants 's escaped by doubling
+			echo "update propertytext set propertyvalue='${sqltext}' where id in (select ps.id from (select * from propertyentry where property_key='jira.alertheader' and entity_name='jira.properties') pe JOIN propertystring ps  ON pe.id=ps.id  );"
+			echo "update propertytext set propertyvalue='${sqltext}' where id=(select id from propertyentry where entity_name='jira.properties' and property_key='jira.alertheader');"
+		fi
+		;;
+	disableanalytics)
+		echo "> INSERT INTO propertyentry VALUES (83313, 'jira.properties', 1, 'com.atlassian.analytics.client.configuration..analytics_enabled', 5);
+				> INSERT INTO propertyentry VALUES (83314, 'jira.properties', 1, 'com.atlassian.analytics.client.configuration..analytics_disabled_username', 5);
+				> INSERT INTO propertyentry VALUES (83315, 'jira.properties', 1, 'com.atlassian.analytics.client.configuration..analytics_disabled_date', 5);
+				> INSERT INTO propertystring VALUES (83313, 'false');
+				> INSERT INTO propertystring VALUES (83314, 'sysadmin');
+				> INSERT INTO propertystring VALUES (83315, '2017-08-12 11:21:05');
+				"
+		fail "Not implemented yet"
+		;;
+	disableplugin)
+		echo "insert into pluginstate (pluginkey, pluginenabled) (select pluginkey, 'false' from pluginversion where pluginkey='$3') on conflict (pluginkey)  do update set pluginenabled='false';"
+		;;
+	enableplugin)
+		echo "delete from pluginstate where pluginkey='$3';"
+		;;
+	serverid)
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select propertyvalue AS serverid from propertystring JOIN propertyentry USING (id) where property_key='jira.sid.key';"
+		else
+			echo "update propertystring set propertyvalue='$4' where propertyvalue='$3' and id=(select id from propertyentry where property_key='jira.sid.key') returning propertystring as old_serverid;"
+		fi
+		;;
+	buildnum)
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select propertyvalue AS buildnum from propertystring JOIN propertyentry USING (id) where property_key='jira.version.patched';"
+		else
+			echo "update propertystring set propertyvalue='$4' where propertyvalue='$3' and id=(select id from propertyentry where property_key='jira.version.patched') returning propertystring as old_buildnum;"
+		fi
+		;;
+
+	license)
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select license AS license from productlicense;"
+		else
+			newlicense="$(echo "$3" | tr -d '\n' | xargs echo -n)"
+			echo "update productlicense set license='$newlicense' where license!='$newlicense' returning license as old_license;"
+		fi
+		;;
+	pluginlicense)
+		key="$3"
+		case "$key" in
+		# To find these codes, check the propertytext record for an installed plugin with a license, e.g.:
+		# select * from propertyentry JOIN propertytext USING (id) WHERE property_key ~ 'com.atlassian.upm.license.internal.impl.PluginSettingsPluginLicense' and propertyvalue ~ 'p4X02h1';
+		"com.onresolve.jira.groovy.groovyrunner") code="R853c13464c051d6a25fc22dbdbd4ab7b" ;;
+		"com.googlecode.jira-suite-utilities") code="R9d8d30362f5e664e988f9e8e9f18fe1c" ;;
+		"com.fca.jira.plugins.workflowToolbox.workflow-toolbox") code="Racaee208bfe326ce1b6e167c39ca55a5" ;;
+
+		*) fail "Unhandled plugin: $key" ;;
+		esac
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select propertyvalue AS license from propertyentry JOIN propertytext USING (id) WHERE property_key='com.atlassian.upm.license.internal.impl.PluginSettingsPluginLicense$code';"
+		else
+
+			newlicense="$(echo "$4" | tr -d '\n' | xargs echo -n)"
+			echo "update propertytext set propertyvalue='$newlicense' where id = (select id from propertyentry where property_key='com.atlassian.upm.license.internal.impl.PluginSettingsPluginLicense$code') and propertyvalue!='$newlicense' returning propertyvalue;"
+		fi
+		;;
+	setting)
+		echo "select propertyvalue from propertynumber JOIN propertyentry USING (id) WHERE propertyentry.property_key='jira.option.web.usegzip';"
+		;;
+	applinks)
+		echo "$jira_applinkview_sql"
+		echo "SELECT * 
+		FROM crosstab('select applink, k,v from applinks order by 1,2') AS ct(applink varchar, url varchar, name varchar, \"primary\" varchar, rpcurl varchar, TYPE varchar);
+"
+		;;
+	applink-url | applink-rpc-url | applink-display-url)
+		applinks_sql="WITH applinks_raw AS
+			  (SELECT id,
+					  regexp_replace(property_key, '^applinks\.admin\.(.+?)\..*$', '\1') AS uuid,
+					  regexp_replace(property_key, '^applinks\.admin\.(.+?)\.(.+)$', '\2') AS key,
+					  propertyvalue AS value
+			   FROM propertyentry pe JOIN propertystring ps USING (id)
+			   WHERE entity_name='jira.properties' and pe.propertytype=5
+				 AND property_key ~ '^applinks.admin.'),
+				 applinks AS
+			  (SELECT uuid,
+					  max(CASE
+							  WHEN KEY='name' THEN value
+						  END) AS name,
+					  max(CASE
+							  WHEN KEY='type' THEN value
+						  END) AS value,
+					  max(CASE
+							  WHEN KEY='rpc.url' THEN value
+						  END) AS rpcurl,
+					  max(CASE
+							  WHEN KEY='display.url' THEN value
+						  END) AS displayurl,
+					  max(CASE
+							  WHEN KEY='type' THEN value
+						  END) AS TYPE,
+					  max(CASE
+							  WHEN KEY='primary' THEN value
+						  END) AS isprimary,
+					  max(CASE WHEN key='rpc.url' THEN id 
+						end) AS rpc_entry_id,
+					  max(CASE WHEN key='display.url' THEN id 
+						end) AS display_entry_id
+			   FROM applinks_raw
+			   GROUP BY uuid)"
+		if [[ "$2" = applink-url ]]; then
+			linktype=rpc
+		elif [[ $2 =~ applink-(rpc|display)-url ]]; then
+			linktype="${BASH_REMATCH[1]}" # 'rpc' or 'display'
+		fi
+
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "$applinks_sql
+				SELECT ${linktype}url
+					FROM applinks
+					WHERE type='confluence'
+						AND isprimary='true';"
+		else
+			# Typically used to change 'http://confluence.internal:8090' to 'http://confluence-sandbox.internal:8090'
+			# This is used by events/start-pre/set_applink_url
+			echo "$applinks_sql
+				UPDATE propertystring
+				SET propertyvalue='$4'
+				WHERE propertyvalue='$3' 
+					AND id=(select ${linktype}_entry_id from applinks where type='confluence' and isprimary='true') returning propertyvalue"
+		fi
+		;;
+	esac
+	;;
+confluence)
+	case "$2" in
+	baseurl)
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select regexp_replace(bandanavalue, '.*<baseUrl>([^<]*)</baseUrl>.*', '\1', 'g') AS baseurl from bandana where bandanacontext='_GLOBAL' and bandanakey='atlassian.confluence.settings' and bandanavalue ~ '<baseUrl>.*</baseUrl>';"
+			echo "select regexp_replace(bandanavalue, '.*<string>([^<]*)</string>.*', '\1', 'g') AS synchrony_baseurl from bandana where bandanacontext='_GLOBAL' and bandanakey='synchrony_collaborative_editor_app_base_url' and bandanavalue ~ '<string>.*</string>';"
+		else
+			if [[ $# = 3 ]]; then
+				# Confluence
+				echo "update bandana set bandanavalue=regexp_replace(bandanavalue, '<baseUrl>[^<]*</baseUrl>', '<baseUrl>$3</baseUrl>', 'g') where bandanacontext='_GLOBAL' AND  bandanakey='atlassian.confluence.settings' and bandanavalue ~ '<baseUrl>.*</baseUrl>' and bandanavalue !~ '<baseUrl>$3</baseUrl>';"
+				# Synchrony
+				# The correct value looks like:
+				# <string>https://confluence.example.com/synchrony,https://confluence.example.com/synchrony-proxy</string>
+				echo "update bandana set bandanavalue='<string>$3/synchrony,$3/synchrony-proxy</string>' where bandanacontext='_GLOBAL' AND  bandanakey='synchrony_collaborative_editor_app_base_url' and bandanavalue ~ '^<string>.*,.*</string>$' and bandanavalue != '<string>$3/synchrony,$3/synchrony-proxy</string>';"
+			elif [[ $# = 4 ]]; then
+				# Confluence
+				echo "update bandana set bandanavalue=regexp_replace(bandanavalue, '<baseUrl>$3</baseUrl>', '<baseUrl>$4</baseUrl>', 'g') where bandanacontext='_GLOBAL' AND  bandanakey='atlassian.confluence.settings' and bandanavalue ~ '<baseUrl>$3</baseUrl>';"
+				# Synchrony
+				echo "update bandana set bandanavalue='<string>$4/synchrony,$4/synchrony-proxy</string>' where bandanacontext='_GLOBAL' AND  bandanakey='synchrony_collaborative_editor_app_base_url' and bandanavalue = '<string>$3/synchrony,$3/synchrony-proxy</string>';"
+			fi
+		fi
+		;;
+	applinks)
+		echo "select unnest(xpath('/list/string/text()', bandanavalue::xml)) from bandana where bandanacontext='_GLOBAL' and  bandanakey='applinks.global.application.ids';"
+		;;
+	applink-url | applink-rpc-url | applink-display-url)
+		# Produces records like:
+		# 
+		# ┌─[ RECORD 1 ]─────┬───────────────────────────────────────────────────────────┐
+		# │ uuid             │ 144880e9-a353-312f-9412-ed028e8166fa                      │
+		# │ name             │ Create and track feature requests for Atlassian products. │
+		# │ value            │ jira                                                      │
+		# │ rpcurl           │ https://jira.atlassian.com                                │
+		# │ displayurl       │ https://jira.atlassian.com                                │
+		# │ type             │ jira                                                      │
+		# │ isprimary        │ false                                                     │
+		# │ rpc_entry_id     │ 334856196                                                 │
+		# │ display_entry_id │ 334856195                                                 │
+		# ├─[ RECORD 2 ]─────┼───────────────────────────────────────────────────────────┤
+		# │ uuid             │ 5138e2e3-db83-3ac2-97c5-865ba911b7bd                      │
+		# │ name             │ Red Radish JIRA                                           │
+		# │ value            │ jira                                                      │
+		# │ rpcurl           │ http://redradish-jira.localhost:8080                      │
+		# │ displayurl       │ https://issues.redradishtech.com                          │
+		# │ type             │ jira                                                      │
+		# │ isprimary        │ true                                                      │
+		# │ rpc_entry_id     │ 327090180                                                 │
+		# │ display_entry_id │ 327090179                                                 │
+		# └──────────────────┴───────────────────────────────────────────────────────────┘
+		applinks_sql="WITH applinks_raw AS
+			  (SELECT bandanaid,
+					  regexp_replace(bandanakey, '^applinks\.admin\.(.+?)\..*$', '\1') AS uuid,
+					  regexp_replace(bandanakey, '^applinks\.admin\.(.+?)\.(.+)$', '\2') AS key,
+					  regexp_replace(bandanavalue, '^<string>(.+)</string>$', '\1') AS value
+			   FROM bandana
+			   WHERE bandanacontext='_GLOBAL'
+				 AND bandanakey ~ '^applinks.admin.'),
+				 applinks AS
+			  (SELECT uuid,
+					  max(CASE
+							  WHEN KEY='name' THEN value
+						  END) AS name,
+					  max(CASE
+							  WHEN KEY='type' THEN value
+						  END) AS value,
+					  max(CASE
+							  WHEN KEY='rpc.url' THEN value
+						  END) AS rpcurl,
+					  max(CASE
+							  WHEN KEY='display.url' THEN value
+						  END) AS displayurl,
+					  max(CASE
+							  WHEN KEY='type' THEN value
+						  END) AS TYPE,
+					  max(CASE
+							  WHEN KEY='primary' THEN value
+						  END) AS isprimary,
+					  max(CASE WHEN key='rpc.url' THEN bandanaid 
+						end) AS rpc_entry_id,
+					  max(CASE WHEN key='display.url' THEN bandanaid 
+						end) AS display_entry_id
+			   FROM applinks_raw
+			   GROUP BY uuid)"
+
+		if [[ "$2" = applink-url ]]; then
+			linktype=rpc
+		elif [[ $2 =~ applink-(rpc|display)-url ]]; then
+			linktype="${BASH_REMATCH[1]}" # 'rpc' or 'url'
+		fi
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "$applinks_sql
+				SELECT ${linktype}url
+				FROM applinks
+				WHERE TYPE='jira'
+				  AND isprimary='true';"
+		else
+			# Typically used to change 'http://jira.internal' to 'http://jira-sandbox.internal'
+			# This is used by events/start-pre/set_applink_url
+			echo "$applinks_sql
+update bandana set bandanavalue=regexp_replace(bandanavalue, '<string>$3</string>', '<string>$4</string>', 'g') where bandanaid=(select ${linktype}_entry_id from applinks where type='jira' and isprimary='true')  returning bandanavalue;"
+		fi
+		;;
+	gadgetfeed-url)
+		if [[ $cmd = atl_pg_get ]]; then
+			# FIXME: replace regexp_replace with xpath()
+			echo "select regexp_replace(bandanavalue, '<string>$3/rest/gadgets/1.0/g/feed</string>', '<string>$4/rest/gadgets/1.0/g/feed</string>', 'g') AS gadgetfeed_url FROM bandana where bandanacontext='_GLOBAL' AND  bandanakey='confluence.SubscribedGadgetFeedStore.feeds';"
+		else
+			# Confluence spontaneously uses the applink URL in the definition of a gadget feed, so if you're changing the applink-url you probably should also change gadgetfeed-url
+			# This is used by events/start-pre/set_gadgetfeed_url
+			# Note this value is not set in all Confluences I've seen
+			echo "update bandana set bandanavalue=regexp_replace(bandanavalue, '<string>$3/rest/gadgets/1.0/g/feed</string>', '<string>$4/rest/gadgets/1.0/g/feed</string>', 'g') where bandanacontext='_GLOBAL' AND  bandanakey='confluence.SubscribedGadgetFeedStore.feeds' and bandanavalue ~ '<string>$3/rest/gadgets/1.0/g/feed</string>' returning bandanavalue;"
+		fi
+		;;
+	bannercolour)
+		if [[ $cmd = atl_pg_get ]]; then
+			# TODO: when we can assume postgres 10, replace this with XMLTABLE
+			echo "select unnest(xpath('/colourScheme/colours/entry[string=\"property.style.topbarcolour\"]/string[2]/text()', bandanavalue::xml)) AS bannertext from bandana where bandanacontext='_GLOBAL' AND  bandanakey='atlassian.confluence.colour.scheme';"
+		else
+			echo "-- Note: this will only work if a colour scheme had been previously set in the GUI"
+			echo "update bandana set bandanavalue=regexp_replace(bandanavalue, '(property.style.topbarcolour</string>\s*<string>)(#[^<]{6})(</string>)', '\1#${3}\3', 'g') where bandanacontext='_GLOBAL' AND  bandanakey='atlassian.confluence.colour.scheme';"
+		fi
+		;;
+	bannertext)
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select xpath('/settings/customHtmlSettings/beforeBodyEnd/text()', bandanavalue::xml) AS bannertext from bandana where bandanacontext='_GLOBAL' AND  bandanakey='atlassian.confluence.settings';"
+		else
+			cat - <<"EOF"
+update bandana set bandanavalue=regexp_replace(bandanavalue, '(<beforeBodyEnd>)([^<]*)(</beforeBodyEnd>)', '\1
+&lt;script&gt;&#x0D;
+AJS.toInit(function() {&#x0D;
+  var msgContainer = AJS.$(&quot;#messageContainer&quot;).length ? AJS.$(&quot;#messageContainer&quot;) : AJS.$(&quot;&lt;ul id=&apos;messageContainer&apos;&gt;&lt;/ul&gt;&quot;).appendTo(AJS.$(&quot;#header-precursor &gt; .cell&quot;));&#x0D;
+    html = `&lt;li id=&quot;confluence-message-websudo-message&quot; class=&quot;confluence-messages noteMessage&quot;&gt; &lt;div class=&quot;aui-message warning &quot;&gt;&#x0D;
+EOF
+			# escape single quotes that upset SQL. FIXME: this is why SQL in bash is a bad idea..
+			htmlEscape "${3//\'/\'\'}"
+			cat - <<"EOF"
+&#x0D;
+ &lt;/div&gt; &lt;/li&gt;`;&#x0D;
+    AJS.$(html).appendTo(msgContainer);&#x0D;
+  }&#x0D;
+  );&#x0D;
+&lt;/script&gt;
+\3', 'g') where bandanacontext='_GLOBAL' AND  bandanakey='atlassian.confluence.settings';
+EOF
+			#AJS.toInit(
+			#function() {
+			#var msgContainer = AJS.$("#messageContainer").length ? AJS.$("#messageContainer") : AJS.$("<ul id='messageContainer'></ul>").appendTo(AJS.$("#header-precursor > .cell"));
+			#  html = `<li id="confluence-message-websudo-message" class="confluence-messages noteMessage"> <div class="aui-message warning "> Confluence is being upgraded. </div> </li>`;
+			#  AJS.$(html).appendTo(msgContainer);
+			#}
+			#);
+			#</script>
+		fi
+		;;
+	setting)
+		echo "WITH settings AS (select xmltable.* from bandana, XMLTABLE('/settings/*' PASSING (bandanavalue::xml) COLUMNS key text PATH 'name()', value text PATH '.' ) where bandanacontext='_GLOBAL' and bandanakey='atlassian.confluence.settings') select value from settings where key='$3';"
+		;;
+	buildno)
+		echo 'select buildnumber from confversion JOIN (select max(installdate) installdate from confversion) x USING (installdate);';
+		;;
+	recommended-updates-email)
+		if [[ $cmd = atl_pg_get ]]; then
+			echo "select regexp_replace(bandanavalue, '<string>(.+)</string>', '\1') from bandana where bandanacontext='_GLOBAL' and bandanakey='atl.confluence.plugins.confluence-daily-summary-email:admin.defaultEnabled';"
+		else
+			echo "update bandana set bandanavalue='<string>$3</string>' where bandanacontext='_GLOBAL' and bandanakey='atl.confluence.plugins.confluence-daily-summary-email:admin.defaultEnabled'"
+		fi
+		;;
+	esac
+
+	;;
+crowd)
+	case "$2" in
+	baseurl)
+		if [[ $cmd = atl_pg_get ]]; then
+			fail "Not implemented"
+		elif [[ $cmd = atl_pg_set ]]; then
+			echo ""
+		fi
+		;;
+	esac
+	;;
+*)
+	echo >&2 "Unknown app: $1"
+	exit 1
+	;;
+esac

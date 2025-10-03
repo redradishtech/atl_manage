@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -u
+
+# shellcheck source=../lib/jeventutils.sh
+. "$(dirname "${BASH_SOURCE[0]}")"/../lib/jeventutils.sh
+
+main()
+{
+	local logname="$1"; shift
+
+	while inotifywait -qq -e close_write "$JLOGDIR/$logname.log.json"
+	do
+		echo
+		echo "────────────────────────────────────────────"
+		jevents "$logname"
+	done
+}
+
+usage()
+{
+	echo "Streams JSON lines from stdin to a log file."
+	echo 'Usage: jeventwatch logname'
+	echo 
+	echo 'where logname is a logical name for the lock ("app", "database", "home")'
+
+}
+
+fail()
+{
+	echo >&2 "$@"
+	exit 1
+}
+
+if [[ $* =~ -h || $# -lt 1 ]]; then
+	usage
+else
+	main "$@"
+fi

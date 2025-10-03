@@ -1,0 +1,15 @@
+#!/bin/bash -eu
+## Nuke obsolete hipchat plugin, which causes nothing but trouble if left around
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+require_app jira
+
+if atl_running; then # Check the app isn't somehow running - deleting its plugin from under it would be bad
+	warn "App should not be running when '$ATL_EVENT' is invoked"
+	exit 0
+fi
+
+# https://unix.stackexchange.com/questions/34011/the-best-way-to-expand-glob-pattern
+rm -rf "$ATL_DATADIR"/plugins/installed-plugins/*hipchat*.jar

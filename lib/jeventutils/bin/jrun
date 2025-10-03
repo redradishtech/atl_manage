@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -u
+
+
+# shellcheck source=../lib/jeventutils.sh
+. "$(dirname "${BASH_SOURCE[0]}")"/../lib/jeventutils.sh
+
+jrun "$@"

@@ -1,0 +1,7 @@
+[extensions]
+# The /etc/cron.d/$app-config_applied crontab runs 'hg qnext' as this user, so we need the mq extension
+mq =
+[trusted]
+# Trust root, who owns the .hg/hgrc file of the app
+users = root
+

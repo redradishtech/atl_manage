@@ -1,0 +1,60 @@
+#!/bin/bash -eu
+set -o pipefail
+## Run a command in a working copy of $ATL_APPDIR, and then copy the (presumably modified) working copy back to $ATL_APPDIR, but only if the new/modified files would not interfere with the running Tomcat application in $ATL_APPDIR.
+# For instance, if a user wants to modify some patchqueue-derived change, it wouldn't be safe to 'hg qpop' in $ATL_APPDIR because that would certainly break the running app. Instead, 'atl_workingcopy bash', then hg qpop, qpush as needed, and when bash exits the results will be applied.
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	local PARSED
+	PARSED=$(getopt --options 'h' --longoptions 'help' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	# }}}
+	if (($# > 0)); then
+		action="$1"
+		shift
+	else action=none; fi
+	case "$action" in
+	rsnapshot) "$ATL_MANAGE"/backup/rsnapshot "$@" ;;
+	tarsnap) "$ATL_MANAGE"/backup/tarsnap "$@" ;;
+	none)
+		atl_logstats backup-rsnapshot
+		atl_logstats backup-tarsnap "$@"
+		;;
+	esac
+}
+
+usage() {
+	cat <<EOF
+Purpose: Run a command in a working copy of $ATL_APPDIR, and then copy the (presumably modified) working copy back, but only if the new/modified files would not interfere with the running Tomcat application.
+
+Usage:
+$(basename "$0") <command>
+
+E.g.:
+$(basename "$0")			# Show backup run state
+$(basename "$0") rsnapshot	# Generate a rsnapshot backup
+$(basename "$0") tarsnap		# Generate a tarsnap backup
+
+
+EOF
+	exit 2
+}
+
+main "$@"

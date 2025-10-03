@@ -1,0 +1,27 @@
+#!/bin/bash
+## If Jira delegates to Postfix to send emails, and JETI is installed, this allows users to send quite huge emails with attachments. This can exceed Postfix's default 10Mb size limit, in which case such emails will stick in the error queue and eventually be lost on next reboot. This nagios check ensures that Postfix's size limit has been increased from the 10Mb default
+
+
+# exit codes
+e_ok=0
+e_warning=1
+e_critical=2
+e_unknown=3
+
+which postconf >/dev/null || { echo "Postfix not installed"; exit $e_unknown; }
+limit=$(( $(postconf -h message_size_limit 2>/dev/null) ))
+default=10240000
+
+if ((limit <= default))
+then
+	echo "Postfix message_size_limit should be increased from $default"
+	exit $e_critical
+else
+	exit $e_ok;
+fi
+
+if [[ -v ATL_SERVER_ROLE && $ATL_SERVER_ROLE != prod ]]; then
+	if [[ "$(postconf -h virtual_alias_maps 2>/dev/null)" = '$virtual_maps' ]]; then
+		echo "Postfix emails should be blackholed on this $ATL_SERVER_ROLE server. https://wiki.redradishtech.com/display/TECH/How+to+blackhole+customer+emails"
+	fi
+fi

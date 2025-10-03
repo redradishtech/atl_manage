@@ -1,0 +1,18 @@
+#!/bin/bash -eu
+
+sourcedir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
+destdir=/etc/ssh/ssh_for_atlassianapps
+keyfile="$destdir"/host_ed25519_key
+conf="$destdir"/sshd_config
+
+apt install openssh-server
+mkdir -p "$destdir"
+if [[ ! -f "$keyfile" ]]; then
+    ssh-keygen -q -f "$keyfile" -N '' -t ed25519
+    chmod go-r "$keyfile"
+fi
+ln -sf "$sourcedir"/sshd_config "$destdir"
+ln -sf "$sourcedir"/README "$destdir"
+touch "$destdir"/authorized_keys
+systemctl enable "$sourcedir"/ssh_for_atlassianapps.service
+systemctl start ssh_for_atlassianapps

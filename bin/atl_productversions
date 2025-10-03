@@ -1,0 +1,13 @@
+#!/bin/bash -eu
+## Prints recent build numbers and versions for our product
+#
+# https://confluence.atlassian.com/jirakb/jira-server-build-and-version-numbers-reference-347341143.html
+#shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE"/lib/common.sh --
+#shellcheck source=/opt/atl_manage/lib/http.sh
+source "$ATL_MANAGE"/lib/http.sh --
+
+cat "$(geturlfile 'https://marketplace.atlassian.com/rest/2/applications/'"$ATL_PRODUCT"'/versions')" \
+	"$(geturlfile 'https://marketplace.atlassian.com/rest/2/applications/'"$ATL_PRODUCT"'/versions?offset=10')" \
+	"$(geturlfile 'https://marketplace.atlassian.com/rest/2/applications/'"$ATL_PRODUCT"'/versions?offset=20')" |
+	jq -rs '.[] | ."_embedded".versions | .[] | [.buildNumber, .version, .releaseDate] | @tsv'

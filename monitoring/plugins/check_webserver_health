@@ -1,0 +1,11 @@
+#!/bin/bash -eu
+
+# Invoked from Nagios - get passed the webserver value as a 'custom object variable' _atl_webserver. See /opt/atl_manage/monitoring/templates/atlmanage.nagios.cfg
+ATL_WEBSERVER=${ATL_WEBSERVER:-${NAGIOS__SERVICEATL_WEBSERVER:-${ICINGA__SERVICEATL_WEBSERVER:?Could not find ATL_WEBSERVER, NAGIOS__SERVICEATL_WEBSERVER or ICINGA__SERVICEATL_WEBSERVER variables. }}}
+
+scriptpath="$(realpath "$(dirname "${BASH_SOURCE[0]}")/../..")"
+
+case "$ATL_WEBSERVER" in
+	apache2) "$scriptpath/monitoring/plugins/check_apachestatus.pl" "$@";;
+	nginx) :   # FIXME: use check_nginx_status.pl;;
+esac

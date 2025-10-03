@@ -1,0 +1,173 @@
+#!/bin/bash -eu
+## Command-line nagios/icinga client that will show the status of the current app. Also has commands to manipulate the monitoring system.
+
+#shellcheck source=../lib/logging.sh
+. "$ATL_MANAGE/lib/logging.sh"
+#shellcheck source=../lib/monitoring.sh
+. "$ATL_MANAGE/lib/monitoring.sh"
+set_monitoring_vars
+
+nagios-cli() {
+	local clihome="$ATL_MANAGE/monitoring/cli"
+	export PYTHONPATH=$clihome/lib/python
+	"$clihome/bin/nagios-cli" -q -c "$clihome"/"$ATL_MONITORING".cfg "$@"
+}
+
+fail() {
+	echo >&2 "$@"
+	exit 2
+}
+
+notifications_enabled() {
+	if [[ ${ATL_MONITORING_REQUIRED:-} != false ]]; then
+		local enabled_str='enable_notifications=1'
+		if [[ ! -e "$monitoring_statusfile" ]]; then
+			echo >&2 "Missing monitoring status file: $monitoring_statusfile"
+			return 1
+		elif grep -q "$enabled_str" "$monitoring_statusfile"; then
+			echo >&2 "Notifications are enabled"
+			return 0
+		else
+			echo >&2 "Notifications are disabled. Run 'atl_monitoring enable-notifications' to enable"
+			return 1
+		fi
+	fi
+}
+
+main() {
+	[[ -v ATL_MONITORING ]] || error "ATL_MONITORING is undefined"
+	if [[ ${1:-} = --help ]]; then
+		echo >&2 "Usage:"
+		echo -e "\tatl_monitoring        # $ATL_MONITORING check results for $ATL_LONGNAME" >&2
+		echo -e "\tatl_monitoring all        # $ATL_MONITORING check results for all apps on this server" >&2
+		echo -e "\tatl_monitoring enable-notifications|disable-notifications|notifications-enabled|check|reload|start|stop|install" >&2
+		echo -e "\tatl_monitoring cli $ATL_LONGNAME -e acknowledge    # Ack that app is offline" >&2
+		echo -e >&2
+		echo -e "plus underlying nagios-cli args:" >&2
+		echo -e >&2
+		nagios-cli --help
+		exit 2
+	fi
+	if [[ ${1:-} = install ]]; then
+		atl_install_monitoring
+		exit
+	fi
+
+	isinstalled || error "$ATL_MONITORING is not installed. Please run 'atl_monitoring install'"
+	if [[ $ATL_MONITORING = none ]]; then
+		echo >&2 "ATL_MONITORING=none, so this is a no-op"
+		exit 0
+	fi
+
+	case "${1:-}" in
+	disable-notifications)
+		monitoring_active || fail "Monitoring is not running"
+		echo "Disabling notifications"
+		disable_notifications
+		exit
+		;;
+	enable-notifications)
+		monitoring_active || fail "Monitoring is not running"
+		echo "Enabling notifications"
+		enable_notifications
+		exit
+		;;
+	notifications-enabled)
+		# Warning: if you 'atl_monitoring disable-notifications' there will be a delay of about 5s before 'atl_monitoring notifications-enabled' notices. We used to restart Nagios to pick up this change, but nagios4 hangs annoyingly, so let's not do that
+		#sudo systemctl restart "$ATL_MONITORING"   # The retention file is only reliable immediately after a restart. This is an ugly hack, but so is icinga
+		notifications_enabled
+		exit $?
+		;;
+	recheck)
+		shift # Swallow the 'recheck'
+		# E.g. invokes nagios-cli wiki.redradishtech.com "redradish_confluence-editor-online" -e check
+		set -- cli "$ATL_LONGNAME" "${1// /-}" -e check
+		;;
+	check | validate)
+		# 'check' is deprecated'
+		[[ $EUID = 0 ]] || fail "Must be root"
+		chronic $ATL_MONITORING -v "$monitoring_mainconf"   # chronic suppresses output unless there is an error
+		log "Validated correctness of $monitoring_mainconf" # chronic suppresses output unless there is an error
+		if monitoring_active; then
+			sudo -u www-data -g www-data test -w "$monitoring_commandfile" || error "www-data unable to write to $monitoring_commandfile. Command: sudo -u www-data -g www-data test -w \"$monitoring_commandfile\""
+		else
+			warn >&2 "$ATL_MONITORING is configured but not running"
+		fi
+		if grep -P 'use\s+generic-service' "${monitoring_staticconfs[@]}"; then
+			error "atl_install_monitoring has not been run recently (generic-host is not replaced by atl-service in services in $ATL_MONITORING config files)"
+		fi
+		if [[ ${ATL_OPSGENIE:-} = true ]] && ! grep -q opsgenie "${monitoring_confdir}"/*; then
+			error "ATL_OPSGENIE=true is set, but opsgenie is not configured in $ATL_MONITORING config files"
+		fi
+
+		if [[ ! -v ATL_NO_ROOT_EMAIL_ALIAS ]] && [[ -r /etc/aliases ]] && ! grep -q 'root:.*@' /etc/aliases; then
+			warn "Warning: email to root@ does not go to any real email address. Nagios alert emails won't be noticed"
+		fi
+
+		# Ensure monitoring system email notifications are enabled, unless ATL_MONITORING_REQUIRED indicates we don't care
+		if notifications_enabled; then
+			exit
+		else
+			fail "Either turn on notifications with 'atl_monitoring enable-notifications' or set ATL_MONITORING_REQUIRED=false"
+		fi
+		;;
+
+	reload | restart | start | stop)
+		pgrep --full "$ATL_MANAGE/monitoring/notify_nagios4" | xargs --no-run-if-empty kill || :
+		# The file won't even exist if 'atl_monitoring restart' is called from events/install-pre/monitoring
+		if [[ -f "$ATL_APPDIR/monitoring/nagios.cfg" ]]; then
+			sudo -u nagios test -r "$ATL_APPDIR"/monitoring/nagios.cfg || warn "Nagios cannot read $ATL_APPDIR/monitoring/nagios.cfg"
+		fi
+		systemctl "$1" "$ATL_MONITORING"
+		exit $?
+		;;
+	is-active)
+		# Used to just do the following, but it doesn't catch the 'active (exited)' state that 'atl_monitoring reload' easily sends nagios into.
+		#systemctl is-active --quiet "$ATL_MONITORING.service"
+		# Ensure we're loaded, active and actually running
+		monitoring_active && exit 0 || exit 1
+		;;
+	esac
+
+	printbanner() {
+		echo -e "====   ${GREEN}${1}${RESET}   ===="
+	}
+
+	printhostservices() {
+		local host="$1"
+		shift
+		# If we wanted to support passing flags through to nagios-cli, then use the next line. I don't use it any more as mostly the text was entered in error, and caused nagios-cli to emit 'Server xyz not found' and go interactive.
+		#nagios-cli "$(uname -n)" ${*:--e service}
+		#nagios-cli "$(uname -n)" --e service | grep -v '[0-9]\+ services for this host'
+		nagios-cli "$host" --e status | grep -P '(current state|plugin output)'
+		nagios-cli "$host" --e service | grep -v '[0-9]\+ services for this host' | grep -v '^\S$'
+	}
+
+	printcommonservices() {
+		echo
+		printbanner "$(uname -n)"
+		nagios-cli "$(uname -n)" --e service | grep -v '[0-9]\+ services for this host'
+	}
+
+	if [[ ${1:-} == all || ! -v ATL_LONGNAME ]]; then # Print all profile statuses if requested, or no particular profile is loaded
+		# shift   # What was this for? It breaks 'atl mon' when no profile is loaded
+		echo
+		# List all hosts, then for each one, print services. Exclude 'OK' services since otherwise it's a wall of text
+		nagios-cli -e ls | grep -v "Loading " | xargs echo | sed -e 's/ /\n/g' | while read -r host; do
+			out=$(printhostservices "$host" | grep -v OK)
+			if [[ -z $out ]]; then out="✓"; fi
+			printf "${GREEN}%-40s${RESET} %s\n" "$host:" "${out//$'\n'/$'\n'  }"
+		done
+		printcommonservices
+	elif [[ ${1:-} == cli ]]; then
+		shift # Everything after 'cli' is fed to nagios-cli
+		nagios-cli "$@"
+	else
+		printbanner "$ATL_LONGNAME"
+		printhostservices "$ATL_LONGNAME"
+		printcommonservices
+	fi
+	echo
+}
+
+main "$@"

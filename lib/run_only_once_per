@@ -1,0 +1,56 @@
+#!/bin/bash
+## Run a command only if it hasn't been run within <period> of the last successful <period>'ly run.
+# E.g. we only want remote tarsnap backups done once per day, but tarsnap backups are triggered as a side-effect of redeployments, which slows them down. Wrapping tarsnap in 'run_only_once_per "1 day"' makes all backups after the first a no-op.
+# Note: last *successful* run. If a past run has a non-zero exit code, it will be run again.
+
+#shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
+
+main() {
+	cmdhash="$(echo "$*" | md5sum | cut -f1 -d" ")" # Note we hash the period too, so that if the interval changes (e.g. is reduced) the script runs immediately
+	period="$1"
+	shift
+	#shellcheck disable=SC2119
+	cachedir="$(cachedir)/run_only_once_per/$cmdhash"
+	# $cmdfile is a marker file whose date will be (or has been) set to some period in the future when our command ($@) may next be run
+	cmdfile="$cachedir/cmd"
+	mkdir -p "$cachedir"
+	if [[ -f $cmdfile ]]; then
+		local runafter
+		local current_time
+		runafter=$(stat --printf='%Y' "$cmdfile")
+		current_time=$(date +%s)
+		local time_remaining=$((runafter - current_time)) || true # let returns 1 if the result is 0
+		if ((time_remaining <= 0)); then
+			rm "$cmdfile"
+		else
+			local runafter_humanreadable=$(stat --printf='%y' "$cmdfile")
+			warn "Already ran recently. Next run is allowed in $time_remaining seconds. To override this, delete (or set last modification date) on markerfile $cmdfile"
+			exit
+		fi
+	fi
+	# We had no $cmdfile (indicating a prior run) or $cmdfile
+	if "$@"; then
+		# Only record the run if it succeeded. Things like backups should be retried, i.e. caching a failure would be bad
+		echo "$*" >"$cmdfile"
+		touch --date="$period" "$cmdfile"
+	else
+		exit $?
+	fi
+}
+
+usage() {
+	cat <<EOF
+Purpose: Limit a command to running only once per <period>, assuming it is successful.
+
+Usage:
+$(basename "$0") <period> <command>
+
+E.g.:
+$(basename "$0") '1 day' backup-tarsnap
+EOF
+	exit 2
+}
+
+if [[ $* =~ --help || $# -lt 2 ]]; then usage; fi
+main "$@"

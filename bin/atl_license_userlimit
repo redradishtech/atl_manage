@@ -1,0 +1,66 @@
+#!/bin/bash -eu
+
+## Check that we are not exceeding or about to exceed our license limit
+PATH=$PATH:$ATL_MANAGE/monitoring/plugins
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+# shellcheck source=/opt/atl_manage/lib/http.sh
+source "$ATL_MANAGE/lib/http.sh" --
+
+main() {
+	#[[ "$#" -eq 0 || $# -gt 3 ]] && usage
+	local warnpercent=90
+	local criticalpercent=100
+
+	local activecount=$(getactivecount)
+	local totalcount=$(gettotalcount)
+	# https://stackoverflow.com/questions/12722095/how-do-i-use-floating-point-division-in-bash
+	local activepercent=$(bc -l <<<"scale=0; 100* $activecount/$totalcount")
+	if ((activepercent > criticalpercent)); then
+		failcritical "Critical: ${activepercent}% of license slots used ($activecount / $totalcount), over our maximum ${criticalpercent}%"
+	elif ((activepercent > warnpercent)); then
+		failwarn "Warning: ${activepercent}% of license slots used ($activecount / $totalcount), over our maximum ${warnpercent}%"
+	else
+		echo "All good: $activecount / $totalcount used (${activepercent}%)"
+	fi
+}
+
+getactivecount() {
+	case $ATL_PRODUCT in
+	jira) cat "$(geturlfile "/rest/plugins/applications/1.0/installed/$ATL_PRODUCT_FULL")" | jq .accessDetails.activeUserCount ;;
+	confluence) cat "$(geturlfile /rest/license/1.0/license/remainingSeats)" | jq .count ;;
+	esac
+}
+gettotalcount() {
+	case $ATL_PRODUCT in
+	jira) cat "$(geturlfile "/rest/plugins/applications/1.0/installed/$ATL_PRODUCT_FULL")" | jq .accessDetails.licensedUserCount ;;
+	confluence) cat "$(geturlfile /rest/license/1.0/license/maxUsers)" | jq .count ;;
+	esac
+}
+
+usage() {
+	cat <<-EOF
+		$*
+		Purpose: Checks that the product's used license seats are safely within their license limit.
+		Usage:
+		check_license_userlimit [warn% | warncount] [critical% | criticalcount]
+
+	EOF
+	exit 255
+}
+
+failcritical() {
+	echo "$1"
+	exit 2
+}
+failwarn() {
+	echo "$1"
+	exit 1
+}
+
+fail() {
+	echo "$@"
+	exit 1
+}
+main "$@"

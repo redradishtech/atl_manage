@@ -1,0 +1,162 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="5f66c345-5274-48fb-a8e0-23ec53d8e524" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.hgext/hg-prompt" beforeDir="true" afterPath="$PROJECT_DIR$/.hgext/hg-prompt" afterDir="true" />
+      <change beforePath="$PROJECT_DIR$/lib/activeobject_views" beforeDir="true" afterPath="$PROJECT_DIR$/lib/activeobject_views" afterDir="true" />
+      <change beforePath="$PROJECT_DIR$/lib/profile.sh" beforeDir="false" afterPath="$PROJECT_DIR$/lib/profile.sh" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/lib/requiresort" beforeDir="true" afterPath="$PROJECT_DIR$/lib/requiresort" afterDir="true" />
+      <change beforePath="$PROJECT_DIR$/lib/versioned_directories" beforeDir="true" afterPath="$PROJECT_DIR$/lib/versioned_directories" afterDir="true" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="ComposerSettings">
+    <execution />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$/lib/activeobject_views" />
+  </component>
+  <component name="GitSEFilterConfiguration">
+    <file-type-list>
+      <filtered-out-file-type name="LOCAL_BRANCH" />
+      <filtered-out-file-type name="REMOTE_BRANCH" />
+      <filtered-out-file-type name="TAG" />
+      <filtered-out-file-type name="COMMIT_BY_MESSAGE" />
+    </file-type-list>
+  </component>
+  <component name="HighlightingSettingsPerFile">
+    <setting file="file://$PROJECT_DIR$/bin/test.sh" root0="FORCE_HIGHLIGHTING" />
+    <setting file="file:///tmp/threaddump.txt" root0="FORCE_HIGHLIGHTING" />
+    <setting file="file://$PROJECT_DIR$/lib/http.sh" root0="FORCE_HIGHLIGHTING" />
+    <setting file="file://$PROJECT_DIR$/lib/profile.sh" root0="FORCE_HIGHLIGHTING" />
+  </component>
+  <component name="MarkdownSettingsMigration">
+    <option name="stateVersion" value="1" />
+  </component>
+  <component name="PhpWorkspaceProjectConfiguration" interpreter_name="PHP 7.4" />
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 2
+}</component>
+  <component name="ProjectId" id="2YsI7UPW0jmC0Eh8hiWnN8Lj4Gi" />
+  <component name="ProjectLevelVcsManager" settingsEditedManually="true" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Input arguments&quot;: &quot;true&quot;,
+    &quot;WebServerToolWindowFactoryState&quot;: &quot;false&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/etc/atlassian_app_profiles/easyjethro/*.easyjethro.com.au&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.sourceCode.BashSupport Pro&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  }
+}</component>
+  <component name="RunManager" selected="BashSupport Pro.test.sh">
+    <configuration name="activate" type="BashProRunConfiguration" temporary="true">
+      <option name="scriptPath" value="$PROJECT_DIR$/activate.sh" />
+      <RunnerSettings bashdbVersion="BashV5" bashPathMapper="Automatic" RunnerId="pro.bashsupport.shDebugRunner" />
+      <method v="2" />
+    </configuration>
+    <configuration name="test.sh" type="BashProRunConfiguration" temporary="true">
+      <option name="scriptPath" value="$PROJECT_DIR$/bin/test.sh" />
+      <RunnerSettings bashdbVersion="Automatic" bashPathMapper="Automatic" RunnerId="pro.bashsupport.shDebugRunner" />
+      <method v="2" />
+    </configuration>
+    <configuration name="test.php" type="PhpLocalRunConfigurationType" factoryName="PHP Console" temporary="true" path="$PROJECT_DIR$/test.php">
+      <method v="2" />
+    </configuration>
+    <list>
+      <item itemvalue="BashSupport Pro.activate" />
+      <item itemvalue="BashSupport Pro.test.sh" />
+      <item itemvalue="PHP Script.test.php" />
+    </list>
+    <recent_temporary>
+      <list>
+        <item itemvalue="BashSupport Pro.test.sh" />
+        <item itemvalue="PHP Script.test.php" />
+      </list>
+    </recent_temporary>
+  </component>
+  <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="5f66c345-5274-48fb-a8e0-23ec53d8e524" name="Changes" comment="" />
+      <created>1701307693659</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1701307693659</updated>
+      <workItem from="1701307694973" duration="23000" />
+      <workItem from="1701307727279" duration="1541000" />
+      <workItem from="1701309788904" duration="1774000" />
+      <workItem from="1701311575062" duration="1298000" />
+      <workItem from="1701313736925" duration="343000" />
+      <workItem from="1701318356198" duration="22000" />
+      <workItem from="1701318383455" duration="44000" />
+      <workItem from="1701318743615" duration="129000" />
+      <workItem from="1701319062235" duration="597000" />
+      <workItem from="1701319667064" duration="612000" />
+      <workItem from="1701320295557" duration="1605000" />
+      <workItem from="1701341781590" duration="180000" />
+      <workItem from="1701341990604" duration="324000" />
+      <workItem from="1701342322191" duration="583000" />
+      <workItem from="1701342912596" duration="1621000" />
+      <workItem from="1701389829067" duration="1343000" />
+      <workItem from="1701393203217" duration="396000" />
+      <workItem from="1701393666222" duration="5000" />
+      <workItem from="1701393793760" duration="82000" />
+      <workItem from="1701393892459" duration="12000" />
+      <workItem from="1701393980502" duration="73000" />
+      <workItem from="1701397404029" duration="716000" />
+      <workItem from="1701826186217" duration="7078000" />
+      <workItem from="1701860200592" duration="33000" />
+      <workItem from="1701860241674" duration="33837000" />
+      <workItem from="1702274962570" duration="1192000" />
+      <workItem from="1702276706605" duration="1747000" />
+      <workItem from="1702362659180" duration="7000" />
+    </task>
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State />
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+  <component name="XDebuggerManager">
+    <breakpoint-manager>
+      <breakpoints>
+        <line-breakpoint enabled="true" type="bashpro.debug.shLine">
+          <url>file://$PROJECT_DIR$/bin/test.sh</url>
+          <line>2</line>
+          <option name="timeStamp" value="6" />
+        </line-breakpoint>
+      </breakpoints>
+    </breakpoint-manager>
+  </component>
+  <component name="XSLT-Support.FileAssociations.UIState">
+    <expand />
+    <select />
+  </component>
+  <component name="hg4idea.settings">
+    <option name="RECENT_HG_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+</project>

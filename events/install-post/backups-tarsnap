@@ -1,0 +1,114 @@
+#!/bin/bash -eu
+## Install rsnapshot backup crontab and ensure required packages are installed.
+
+install-post() {
+	set -euo pipefail
+
+	update_tarsnap_conf() {
+		oldtarsnapconf="/etc/tarsnap.conf"
+		tarsnapconf="$ATL_APPDIR/backups/tarsnap.conf"
+		if [[ -f $oldtarsnapconf ]]; then
+			warn "There is a Tarsnap tarsnap.conf is in the old location, '$oldtarsnapconf'. Moving it to the new location, '$tarsnapconf'"
+			mv "$oldtarsnapconf" "$tarsnapconf"
+			if ! grep -q "^keyfile ${ATL_BACKUP_TARSNAP_KEYFILE}$" "$tarsnapconf" || ! grep -q "^cachedir ${ATL_BACKUP_TARSNAP_CACHEDIR}$" "$tarsnapconf"; then
+				warn "Modifying '$tarsnapconf' with correct'er settings."
+				perl -i -pe "s,^keyfile .*,keyfile $ATL_BACKUP_TARSNAP_KEYFILE," "$tarsnapconf"
+				perl -i -pe "s,^cachedir .*,cachedir $ATL_BACKUP_TARSNAP_CACHEDIR," "$tarsnapconf"
+				perl -i -pe "s,^print-stats,," "$tarsnapconf"
+			else
+				log "$tarsnapconf already using keyfile: $ATL_BACKUP_TARSNAP_KEYFILE"
+			fi
+			warn "Your $tarsnapconf is now customized, but good to go. Please check if the customization are needed ('hg diff'), and if not, revert to the unmodified file"
+		fi
+	}
+	install_tarsnap_key() {
+
+		oldkeyfile=/etc/"tarsnap-$(uname -n).key"
+		if [[ -f $oldkeyfile ]] && [[ ! -f $ATL_BACKUP_TARSNAP_KEYFILE ]]; then
+			warn "Tarsnap keyfile is in the old location, '$oldkeyfile'. Moving it to the new location, '$ATL_BACKUP_TARSNAP_KEYFILE'"
+			mv "$oldkeyfile" "$ATL_BACKUP_TARSNAP_KEYFILE"
+		fi
+
+		if [[ ! -f $ATL_BACKUP_TARSNAP_KEYFILE ]]; then
+			echo "Generating root tarsnap key '$ATL_BACKUP_TARSNAP_KEYFILE' associated with Tarsnap account '$ATL_BACKUP_TARSNAP_USER'. This has no passphrase, so backups are vulnerable should root ever be compromised. It must be backed up safe but accessible should the server ever melt down."
+			tarsnap-keygen --keyfile "$ATL_BACKUP_TARSNAP_KEYFILE" --user "$ATL_BACKUP_TARSNAP_USER" --machine "$(uname -n)"
+			log "Generated root keyfile: $ATL_BACKUP_TARSNAP_KEYFILE"
+			email_tarsnap_key
+		else
+			log "Root keyfile already exists, and is presumed to be remotely backed up: $ATL_BACKUP_TARSNAP_KEYFILE"
+		fi
+	}
+
+	email_tarsnap_key() {
+		set -vx
+		gpg --import "$ATL_MANAGE"/lib/jeff@redradishtech.com.gpg
+		echo -e 'trust\n5\ny\n' | gpg --command-fd 0 --edit-key C4EDBF49
+
+		read -rp "Email tarsnap private key to jeff@redradishtech.com? (y/N): " emailpass
+		if [[ $emailpass = y ]]; then
+			pkginstall bsd-mailx # 'mail' command
+			gpg -ea -r jeff@redradishtech.com -o - "$ATL_BACKUP_TARSNAP_KEYFILE" | mail -s "$ATL_BACKUP_TARSNAP_KEYFILE" jeff@redradishtech.com
+			log "Tarsnap passphrase emailed"
+		else
+			log "Please back up the following passphrase and gpg-encrypted key:"
+			gpg -ea -r jeff@redradishtech.com -o - "$ATL_BACKUP_TARSNAP_KEYFILE"
+		fi
+		if [[ $ATL_BACKUP_TARSNAP_USER != admin@redradishtech.com ]]; then
+			warn "Tarsnap account is owned by '$ATL_BACKUP_TARSNAP_USER'. Please ensure that they have a copy of '$ATL_BACKUP_TARSNAP_KEYFILE'"
+		fi
+		set +vx
+	}
+
+	pkginstall tarsnap tarsnapper
+	update_tarsnap_conf
+	install_tarsnap_key
+	mkdir -p "$ATL_BACKUP_TARSNAP_CACHEDIR"
+	# https://superuser.com/questions/352289/bash-scripting-test-for-empty-directory
+	if [[ -z $(ls -A "$ATL_BACKUP_TARSNAP_CACHEDIR") ]]; then
+		log "Tarsnap's cache dir is empty. Running a --fsck"
+		atl_tarsnap --fsck
+		log "fsck complete"
+	fi
+	atl_install_monitoring_services "$ATL_APPDIR"/backups/backup-tarsnap.healthcheck
+	[[ ! -f "$ATL_APPDIR"/backups/backup-tarsnap-fresh.nagioscheck.sh ]] || fail "Deadnaming backup-tarsnap-fresh.nagioscheck.sh"
+	atl_install_monitoring_services "$ATL_APPDIR"/backups/backup-tarsnap-fresh.healthcheck
+}
+
+uninstall-pre() {
+	atl_uninstall_monitoring_services "$ATL_APPDIR"/backups/backup-tarsnap.healthcheck
+	if [[ -f "$ATL_APPDIR"/backups/backup-tarsnap-fresh.healthcheck ]]; then
+		atl_uninstall_monitoring_services "$ATL_APPDIR"/backups/backup-tarsnap-fresh.healthcheck
+	fi
+	if [[ -f "$ATL_APPDIR"/backups/backup-tarsnap-fresh.nagioscheck.sh ]]; then
+		# The old name for this service, which when uninstalling we don't care to fix
+		atl_uninstall_monitoring_services "$ATL_APPDIR"/backups/backup-tarsnap-fresh.nagioscheck.sh
+	fi
+}
+
+deactivate() {
+	uninstall-pre
+}
+
+cleanup() {
+	:
+}
+
+enabled() {
+	# ATL_BACKUP_TYPES=tarsnap is typically set explicitly in the app profile
+	[[ ${ATL_BACKUP_TYPES:-} =~ tarsnap ]] || {
+		echo "ATL_BACKUP_TYPES does not contain 'tarsnap'"
+		return 1
+	}
+	# It's safe to assume we never want to run tarsnap backups from a non-prod instance
+	[[ -v ATL_BACKUP_TARSNAP_ENABLED_OVERRIDE && $ATL_BACKUP_TARSNAP_ENABLED_OVERRIDE = true ]] || [[ $ATL_ROLE =~ prod || $ATL_ROLE =~ preprd ]] || {
+		echo "ATL_ROLE is '$ATL_ROLE', not prod or preprd, and ATL_BACKUP_TARSNAP_ENABLED_OVERRIDE is not set"
+		return 1
+	}
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.backups-common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.backups-common.sh
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh
+
+# vim: set ft=sh:

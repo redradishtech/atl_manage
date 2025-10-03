@@ -1,0 +1,17 @@
+#!/bin/bash -eu
+## Runs curl on a baseurl-relative path, logged in as $ATL_USER
+## E.g. atl_curl /rest/plugins/1.0/ | jq '.plugins[] | .key'
+# E.g. atl_curl -s $ATL_BASEURL_INTERNAL'/rest/api/user/current' 
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+# shellcheck source=/opt/atl_manage/lib/http.sh
+source "$ATL_MANAGE/lib/http.sh" --nolog
+
+main() {
+
+	__curl "$@"
+}
+
+main "$@"

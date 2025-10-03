@@ -1,0 +1,16 @@
+#!/bin/bash -eu
+# Checks that $ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT has what looks like an up-to-date backup
+
+#shellcheck source=common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh
+PATH=$PATH:$ATL_MANAGE/monitoring/plugins
+
+[[ $EUID = 0 ]] || failcritical "Unexpectedly running without sudo/root. This should have been invoked with 'sudo -E' by the source (see above) or in sync_backup_auto"
+
+
+ATL_BACKUPMIRROR_MAX_FILESYSTEM_UNMODIFIED_PERIOD_WARNING=${ATL_BACKUPMIRROR_MAX_FILESYSTEM_UNMODIFIED_PERIOD:-2}
+ATL_BACKUPMIRROR_MAX_FILESYSTEM_UNMODIFIED_PERIOD=${ATL_BACKUPMIRROR_MAX_FILESYSTEM_UNMODIFIED_PERIOD:-5}
+{
+echo check_file_freshness "$ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT/hourly.0/home" "$ATL_BACKUPMIRROR_MAX_FILESYSTEM_UNMODIFIED_PERIOD_WARNING" "$ATL_BACKUPMIRROR_MAX_FILESYSTEM_UNMODIFIED_PERIOD"
+echo check_file_freshness "$ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT/hourly.0/database" "$ATL_BACKUPMIRROR_MAX_FILESYSTEM_UNMODIFIED_PERIOD_WARNING" "$ATL_BACKUPMIRROR_MAX_FILESYSTEM_UNMODIFIED_PERIOD"
+} | check-many

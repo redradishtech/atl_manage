@@ -1,0 +1,88 @@
+#!/bin/bash
+## Checks that there is at least 1 file matching <basedir> younger than <warningage> or <criticalage>
+
+#shellcheck source=common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh
+
+main()
+{
+	[[ "$#" -eq 0 || $# -gt 3 || $1 =~ help ]] && usage
+
+	basedir="$1"
+	warndelay="${2:-2}"
+	criticaldelay="${3:-5}"
+
+	# http://stackoverflow.com/questions/12199631/convert-seconds-to-hours-minutes-seconds-in-bash
+	function show_time () {
+		# Note that this script won't work with bash -eu or $ATL_MANAGE/lib/logging.sh stacktraces, as the ((...)) expressions may return nonzero
+	    num=$1
+	    min=0
+	    hour=0
+	    day=0
+	    if((num>59));then
+		((sec=num%60))
+		((num=num/60))
+		if((num>59));then
+		    ((min=num%60))
+		    ((num=num/60))
+		    if((num>23));then
+			((hour=num%24))
+			((day=num/24))
+		    else
+			((hour=num))
+		    fi
+		else
+		    ((min=num))
+		fi
+	    else
+		((sec=num))
+	    fi
+	    echo "$day"d "$hour"h "$min"m
+	}
+
+        # HACK: the exclude of ./log and ./logs is here on the assumption that log file changes are irrelevant (e.g. not synced data), but it destroys the generality of the script. Add --exclude flag in future
+	foundfile=$(find -L "$basedir" -type f ! -path ./log ! -path ./logs -mtime "-${warndelay}" -print -quit)
+	# shellcheck disable=SC2181
+	if (( $? != 0 ))
+	then
+		# When run from icinga $USER isn't set. 
+		failcritical "Error finding files below ${basedir} as user ${USER:-$UID}"
+	fi
+	if test -n "$foundfile"
+	then
+		# Everything is fine - we found a file within our warning interval
+		#tstamp=$(stat --format="%y" "$foundfile")
+		seconds_since_foundfile_modified=$(( $(date +%s) - $(date +%s -r "$foundfile") ))
+		echo "OK; found representative file $foundfile last modified $(show_time $seconds_since_foundfile_modified) ago"
+	else
+		# Problems: no files within our warning interval. Perhaps within our critical interval?
+		foundfile=$(find -L "$basedir" -type f -mtime "-${criticaldelay}" -print -quit)
+		youngest_file=$(find "$basedir" -type f -printf '%T@ %p\n' | sort -n | tail -1 | cut -f2- -d" ")
+		test -z "$youngest_file" && failcritical "No files found within $basedir"
+		seconds_since_youngest_file_modified=$(( $(date +%s) - $(date +%s -r "$youngest_file") ))
+		txt="$(test -f "$basedir" && echo "The file $basedir" || echo "${youngest_file}, the youngest file below $basedir")"
+		if test -n "$foundfile"
+		then
+			failwarn "$txt is $(show_time $seconds_since_youngest_file_modified) old, over the warning threshold of $warndelay days."
+		else
+			failcritical "$txt is $(show_time $seconds_since_youngest_file_modified) old, over the critical threshold of $criticaldelay days."
+		fi
+	fi
+}
+
+
+usage()
+{
+	echo
+	echo >&2 "Description:  Checks in the specified directory that there is at least 1 file matching <basedir> younger than <warningage> or <criticalage>"
+	echo >&2 "Usage:        $0 BASEDIR WARNDAYS CRITICALDAYS [rsyncopts]"
+	echo >&2 "Where:"
+	echo >&2 "- BASEDIR is the root path to check below"
+	echo >&2 "- WARNDAYS is the age in days over which to trigger WARNING"
+	echo >&2 "- CRITICALDAYS is the age in days over which to trigger CRITICAL erro"
+	echo >&2 "- rsyncopts are rsync options, like --exclude, --include and --merge"
+	echo
+	exit 255
+}
+
+main "$@"

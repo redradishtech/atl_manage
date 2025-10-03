@@ -1,0 +1,36 @@
+#!/bin/bash -eu
+# Invokes the generic 'check_http' Nagios check if some condition (from a hardcoded list) is true.
+# Currently our only use-case is doing a check_http of the Synchrony Confluence editor if the database indicates it is enabled.
+# We let the user pass in all the standard check_http flags to avoid making any assumptions (e.g. of the Synchrony path, use of http/https, or acceptable warning/error delayh)
+
+# Code smell: hardcode the ATL_MANAGE path here, because our caller, nagios.cfg, doesn't know it. I guess we could pass it as an env var
+PATH=$PATH:/opt/atl_manage/bin
+
+#shellcheck source=/opt/atl_manage/lib/logging.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh --no_profile_needed
+
+condition="${1?Missing arg: $0 confluence_editor_online}"; shift
+
+case "$condition" in
+	# This is unused, superceded by check_http_app 
+	not_standby)
+		if [[ $ATL_ROLE != standby ]]; then
+			exec /usr/lib/nagios/plugins/check_http "$@"
+		else
+			# We're on standby - ATL_HOSTNAME_INTERNAL should time out
+			exec negate -t1 -T OK /usr/lib/nagios/plugins/check_http "$@"
+		fi
+		;;
+
+	confluence_editor_online)
+		# If synchrony is disabled, exit normally
+		if [[ $(atl_psql -tAXqc "select true from bandana where bandanacontext='_GLOBAL' and bandanakey='synchrony_collaborative_editor_app_registered' and bandanavalue='<string>true</string>';") = t ]]; then
+			# Synchrony is running. Check its heartbeat URL
+			exec check_http "$@"
+		else
+			echo "OK; Collaborative editor is disabled"
+		fi
+		;;
+	*) failcritical "Unknown condition"
+esac
+

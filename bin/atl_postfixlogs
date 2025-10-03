@@ -1,0 +1,107 @@
+#!/bin/bash -eu
+
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	if [[ $# = 0 ]]; then usage; fi
+	PARSED=$(getopt --options 'h' --longoptions 'help,comment:,change:,issue:,user:' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	comment=
+	change=
+	while true; do
+		case "$1" in
+		--comment)
+			shift
+			id=$1
+			table=jiraaction
+			log "Searching for emails for comment $comment"
+			;;
+		--change)
+			shift
+			id=$1
+			table=changegroup
+			log "Searching for emails for change $change"
+			;;
+		--issue)
+			shift
+			id=$1
+			table=jiraissue
+			log "Searching for emails for new issue $change"
+			;;
+		--user)
+			shift
+			email=$1
+			log "Searching for emails to $email"
+			;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage "Invalid option: $1" ;;
+		esac
+		shift
+	done
+	if [[ -z email && -n $email ]]; then
+		tmpfile=/tmp/postfixlogs
+		grep -F "to=<$email>" "$@" | perl -pe 's/.*: ([A-ZE0-9]{9,11}): .*/\1/g' >"$tmpfile"
+		pageids=$(zgrep -f "$tmpfile" "$@" | grep -F '<JIRA.' | grep -Po '(?<=message-id=<JIRA\.)[0-9]+' | paste -s -d ',')
+		if [[ -n "$pageids" ]]; then
+			if [[ $ATL_PRODUCT = jira ]]; then
+				echo "select updated, issuekey,summary from queries.jiraissue where id in ($pageids);" | atl_psql
+			else
+
+				log "$(echo "$pageids" | wc -l) jira notifications were sent. Please switch to jira to see page titles"
+			fi
+		fi
+		contentids=$(zgrep -f "$tmpfile" "$@" | grep -F '<CONFLUENCE.' | grep -Po '(?<=message-id=<CONFLUENCE\.)[0-9]+' | paste -s -d ',' || :)
+		if [[ -n "$contentids" ]]; then
+			if [[ $ATL_PRODUCT = confluence ]]; then
+				echo "select lastmoddate, title from content where contentid in ($contentids);" | atl_psql
+			else
+				log "$(echo "$contentids" | wc -l) confluence notifications were sent. Please switch to confluence to see page titles"
+			fi
+		fi
+		exit
+	fi
+	if [[ $table = jiraissue ]]; then
+		issueid=$id
+	else
+		issueid=$(echo "select jiraissue.id from jiraissue JOIN $table ON $table.issueid = jiraissue.id WHERE $table.id = $id;" | atl_psql -tAXq)
+	fi
+	log "Searching for JIRA.$issueid"
+	# For each JIRA.$issueid line, print the Postfix ID, then search again for all lines containing the ID.
+	# The perl expression prints the timestamp embedded in the Message-ID. See ./jira-project/jira-components/jira-core/src/main/java/com/atlassian/jira/mail/threading/EmailHeaderBuilders.java
+	tmpfile=/tmp/postfixlogs
+	set -x
+	zgrep -F "JIRA.$issueid" "$@" | perl -pe 's/.*: ([A-ZE0-9]{9,11}): .*/\1/g' >$tmpfile
+	# 9-11 is the expected length of a postfix queue identifier
+	zgrep -f $tmpfile "$@" | perl -pe 's~(JIRA\.\d+\.\d+\.\d+\.)(\d+)(@.*)~$1 .  $2 . $3 . " CREATED " . localtime($2/1000)~eg'
+}
+
+usage() {
+	cat <<EOF
+$*
+Purpose: Find Postfix logs related to a particular JIRA change.
+Usage:
+atl_postfixlogs [--change|--comment] <logfiles>
+
+Where <logfiles> is typically /var/log/mail.log*
+
+Options:
+	--change	The ID of the changegroup. This is visible in the JIRA HTML.
+	--comment	The ID of the comment. This is visible in the permalink.
+	--issue		The ID of the issue.
+	--user		The email address of the user.
+EOF
+	exit
+}
+
+main "$@"

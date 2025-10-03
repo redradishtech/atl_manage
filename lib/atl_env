@@ -1,0 +1,132 @@
+#!/bin/bash -eu
+# Runs <command> with ATL_* variables, or exports ATL_* variables into the current shell, providing application-specific context (version, directory locations, etc). Also includes some systemd vars, like the current status (active, failed, etc), PID (alas, not the java PID but the shell wrapper) and start time"
+# Usage:   . $0     		# Called from bash, this sources the variables
+# Usage:   $0 <command>		# Invokes <command> with ATL_ variables defined
+#
+# $ATL_MANAGE/lib/atl_env script may be symlinked to an app-specific /opt/atlassian/$app/.env/atl_env, in which case the --envdir is implicitly the containing directory.
+
+main() {
+	local envdir k v scriptdir
+	#local t0=$(date +%s%N)    # for profiling - see t1 at the end
+	local envdirs=()
+	# Is atl_env a symlink in a .env directory? If so, source variables from it
+	# The 'realpath' is to get the absolute path without resolving the symlink (as atl_env is links to /opt/atl_manage). https://stackoverflow.com/a/41901945/7538322
+	scriptdir="$(dirname "$(realpath --no-symlinks "${BASH_SOURCE[0]}")")"
+	if [[ $(basename "$scriptdir") = .env ]]; then
+		envdirs+=("$scriptdir")
+	fi
+	declare -A preserved
+	while [[ $# -gt 0 && $1 =~ --([^=]+)=(.+) ]]; do
+		k="${BASH_REMATCH[1]}"
+		v="${BASH_REMATCH[2]}"
+		case "$k" in
+		envdir)
+			[[ -e $v ]] || fail "envdir '$v' (passed in via --envdir) does not exist"
+			[[ -d $v && -r "$v" && -x "$v" ]] || fail "envdir '$v' (passed in via --envdir) is not readable by us ($USER)"
+			envdirs+=("$v")
+			;;
+		preserve)
+			fail "--preserve is not yet implemented (not needed?)"
+			declare -p "$v" || fail "--preserve variable '$v' does not exist" # https://stackoverflow.com/questions/3601515/how-to-check-if-a-variable-is-set-in-bash
+			preserved[$v]="${!v}"                                             # E.g. given '--preserve=ATL_TENANT', this stores the value of $ATL_TENANT
+			;;
+		esac
+		shift
+	done
+
+	# Note we may have ATL_* variables exported from our caller. This may be intentional, e.g. 'ATL_DATABASE=foo atl_psql ...' or undesirable, e.g. where the caller's env pollutes atl_cronrun. Specific scripts like atl_cronrun must unset ATL* from the caller in this case.
+
+	for envdir in "${envdirs[@]}"; do
+		#log "Sourcing vars in $envdir"
+		loadvars "$envdir"
+	done
+
+	load_systemd_vars
+	#local t1=$(date +%s%N)
+	#local waittime=$(((t1 - t0)/1000000))
+	#echo >&2 $waittime
+
+	# Make atl_* commands available.  This allows invocations like '/opt/atlassian/jira/current/bin/atl_env atl_plugins'
+	# Make the monitoring/notify_all_monitoring command available.
+	# Also make our custom check_* nagios plugins available for use in monitoring/nagios.cfg
+	export PATH="$ATL_MANAGE/bin:$ATL_APPDIR/bin:$ATL_MANAGE/monitoring:$ATL_MANAGE/monitoring/plugins:$PATH"
+	# Source jeventutils.sh to make jlock etc available as functions. We used to put lib/jeventutils/bin in our PATH. However sourcing it seems better. This declares all the functions, and also lets it manipulate PATH to add the 'jo' command its function needs. Without the path manipulation atl_cronrun backup-rsnapshot-fresh was breaking with 'jo: command not found' errors
+	. "$ATL_MANAGE/lib/jeventutils/lib/jeventutils.sh"
+
+	if (($#)); then
+		#log "Sourcing vars from ${envdirs[*]}"
+		#log "Now running $(which "$1"): $*"
+		exec "$@"
+	fi
+}
+
+usage() {
+	echo >&2 "$*"
+	echo >&2 "Usage: $0 --envdir=ENVDIR [--envdir=ENVDIR2 ...] COMMAND"
+	exit 1
+}
+
+loadvars() {
+	[[ -d "$1" ]] || {
+		echo >&2 "Missing or unreadable env dir '$1'"
+		exit 1
+	}
+	#echo >&2 "Loading vars from $1"
+	for vfile in "$1"/*; do
+		[[ -f "$vfile" ]] || continue   # Ignore bin/
+
+		if [[ -x "$vfile" ]]; then
+			if [[ $vfile =~ ATL_ ]]; then
+				# If would be nice if we could assume all executable files are scripts, not variables. However some ATL_APPDIR_BASEs dumb inherited permissions like:
+				# root@jturner-desktop:/home/easyjethro/code/2.34.1/.env# getfacl -d .
+				## file: .
+				## owner: root
+				## group: root
+				## user::rwx
+				# user:jturner:rwx
+				# group::r-x
+				# mask::rwx
+				# other::---
+				#
+				# and so ATL_* files might be executable as a side-effect. The proper fix is to complain if any dumb default acls are set.
+				: #warn "$vfile should not be executable!"
+			else
+				continue
+			fi
+		fi
+		#[[ ! -x "$vfile" ]] || continue # Ignore executables, like atl_env itself
+		#log "Considering $vfile"
+		[[ $vfile =~ [A-Z]+ ]] || echo >&2 "Warning: variable $1/$vfile is expected to be capitalized"
+		v="${vfile##*/}" # Isolate the filename, which will be the variable name
+		[[ -r "$vfile" ]] || {
+			unset "$v"
+			continue
+		}                      # If we don't have permission for a variable, unset it to prevent it being set accidentally from the caller.
+		read -r vval <"$vfile" # Reads just one line! Avoid cat for speed
+		export "$v"="$vval"
+	done
+}
+
+load_systemd_vars() {
+	#[[ -z ATL_MANAGE ]] || ATL_MANAGE="$(realpath -m "$(dirname "${BASH_SOURCE[0]}")/..")"   # Normally set by the caller, but ad-hoc scripts might include common.sh without bothering
+	# We can't infer ATL_MANAGE if BASH_SOURCE[0] is atl_env symlinked to .env/atl_env
+	[[ -v ATL_SYSTEMD_SERVICENAME ]] || { echo >&2 "Warning: atl_env command running without systemd env vars since ATL_SYSTEMD_SERVICENAME is not defined. Normally it would be loaded earlier by sourcing a .env/ directory."; return 0; }
+	#shellcheck source=/opt/atl_manage/lib/systemd.sh
+	. "${ATL_MANAGE?}/lib/systemd.sh"
+	systemdvars "$ATL_SYSTEMD_SERVICENAME" ExecMainStartTimestamp ExecMainPID ActiveState
+}
+
+fail() {
+	echo >&2 "$*"
+	exit 1
+}
+
+warn() {
+	echo >&2 "$*"
+}
+
+log() {
+	echo >&2 "$*"
+}
+
+main "$@"

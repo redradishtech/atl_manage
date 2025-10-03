@@ -1,0 +1,3 @@
+#!/bin/bash -eu
+
+echo "select 'mutt -R -f ' || CASE protocol WHEN 'pop3s' THEN 'pops://' WHEN 'pop3' THEN 'pop://' WHEN 'imaps' THEN 'imaps://' WHEN 'imap' THEN 'imap://' END || mailusername || ':''' || CASE cipher_type WHEN 'Base64Cipher' THEN convert_from(decode(mailpassword, 'base64'), 'UTF8') ELSE mailpassword END || '''@' || servername || ':' || smtp_port from mailserver where exists (select * from propertyentry pe JOIN propertystring ps USING (id) WHERE pe.entity_name='ServiceConfig' and pe.property_key='popserver' and ps.propertyvalue::integer=mailserver.id);"

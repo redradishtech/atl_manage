@@ -1,0 +1,9 @@
+#!/bin/bash -eu
+# shellcheck source=/opt/atl_manage/events/install-pre/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh
+
+# Only modify .hg/patches/guards in production. If prod doesn't use ZFS but dev does, we don't want an install on dev modifying .hg/patches/guards
+if [[ -v ATL_ZFS && $ATL_ZFS = true && $ATL_ROLE =~ prod ]]; then
+	log "Enabling ZFS health monitoring"
+	addguard zfs
+fi

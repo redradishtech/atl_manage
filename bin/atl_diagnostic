@@ -1,0 +1,142 @@
+#!/bin/bash -eu
+## Generates a diagnostic snapshot of a running instance, containing Java thread dumps, webserver and system states. Generally invoked as a symlink in a $ATL_MANAGE/events/*/ directory.
+# TODO: Perhaps each part should be broken into a separate $ATL_MANAGE/events/servicedown/* script, writing to $eventdir (which is set in .common.sh). That would allow 'atl_event slowness threaddump', for instance.
+# Upsides: on 'highload' we could do lightweight stuff (no jfr) just by symlinking only some of the scripts.
+# Downsides: no ordering. No setting vars before calling subcommands
+
+PATH="$PATH:$ATL_MANAGE/lib/redo/bin"
+#shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+
+# Don't generate a dump if we're below this-many Gb of free disk space on the ATL_APPDIR partition
+MINIMUM_FREE_DISKSPACE_GB=10
+# If a log file we're interested in preserving is over this many Mb (uncompressed), then only store the last this-many-Mb (compressed)
+LOGFILE_TOOLARGE_MB=50
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	local PARSED
+	PARSED=$(getopt --options 'h' --longoptions 'help' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	# }}}
+
+	(($# >= 1)) || usage "Must give 1 or more args"
+	local cmd="$1"
+	shift
+	case "$cmd" in
+	snapshot)
+		[[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ java ]] || fail "Cannot take diagnostic snapshot of non-Java $ATL_PRODUCT app"
+		local event
+		event="$(safe_eventname "$@")" # 'responsetime' or 'slowness' if invoked from nagios, or e.g. 'server_unexpectedly_hung' if 'atl_diagnostic_snapshot "Server unexpectedly hung"' given
+		eventdir="$ATL_LOGDIR"/events/$(date +%Y%m%d-%H%M)_"$event"
+		cout="$ATL_LOGDIR"/catalina.out
+
+		definevars
+		preconds
+		mkdir -p "$eventdir"
+		ln -sf "$(basename "$eventdir")" "$(dirname "$eventdir")/latest"
+		cd "$eventdir"
+		cp -rs "$ATL_MANAGE/diagnostics/"*.do .
+		local do_target="all"
+		if [[ -f "./$event.do" ]]; then
+			do_target="$event"
+		else
+			warn "atl_diagnostic was triggered with event '$event', but there is no $PWD/$event.do script. Using all.do instead"
+		fi
+		redo --keep-going --jobs 10 "$do_target" || :
+		rm -- ./*.do
+		echo "A ${ATL_EVENT:-} event was logged at $(date). Thread dumps and Apache status were logged. Our service started at ${ExecMainStartTimestamp:-}" >"$eventdir"/README
+		echo "Generated diagnostic snapshot: $eventdir"
+		;;
+
+	*)
+		local docmd
+		docmd="$ATL_MANAGE/diagnostics/$cmd.do"
+		[[ -f "$docmd" ]] || usage "No command file: $docmd"
+		if [[ $docmd =~ default.*.do ]]; then
+			bash "$docmd" "$cmd" "$@" "/dev/stdout"
+		else
+			bash "$docmd" "$cmd" "$cmd" "/dev/stdout"
+		fi
+		;;
+	esac
+}
+
+# Assuming $* is a short description of the 'event', convert it to a valid, cron-friendly filename. E.g. 'Everything blew up!' yields 'Everything_blew_up_'
+safe_eventname() {
+	# "Files must conform to the same naming convention as used by run-parts(8): they must consist solely of upper- and lower-case letters, digits, underscores, and hyphens. " - https://bugs.launchpad.net/ubuntu/+source/cron/+bug/706565
+	cronfriendlyname() {
+		sed -e 's/[^a-zA-Z0-9_-]/_/g' | cut -b1-254
+	}
+
+	{
+		if [[ -v ATL_EVENT ]]; then
+			echo "$ATL_EVENT"
+		else
+			echo "$*"
+		fi
+	} | cronfriendlyname
+}
+
+preconds() {
+	# Invoked twice in same minute
+	if [[ -d $eventdir ]]; then
+		echo "$eventdir exists; not running twice in same minute"
+		exit
+	fi
+	if [[ ${ActiveState:-} != active ]]; then
+		echo "$ATL_SYSTEMD_SERVICENAME is in state ${ActiveState:-}; not taking diagnostic snapshot"
+		exit
+	fi
+
+	if [[ ! -f $cout ]]; then
+		echo >&2 "Can't find log file: $cout"
+		exit 1
+	fi
+
+	# If we're in an infinite loop or something, don't use up the last of the disk space
+	local free=$(($(stat -f --format="%a*%S" "$ATL_APPDIR")))
+	MINIMUM_FREE_DISKSPACE_BYTES=$((MINIMUM_FREE_DISKSPACE_GB * 1024 * 1024 * 1024))
+	if ((free < MINIMUM_FREE_DISKSPACE_BYTES)); then
+		echo "Not taking diagnostics; free disk is below ${MINIMUM_FREE_DISKSPACE_GB}Gb minimum ($((free / 1024 / 1024 / 1024))Gb)"
+		exit 1
+	fi
+}
+
+definevars() {
+	#shellcheck source=/opt/atl_manage/lib/systemd.sh
+	. "$ATL_MANAGE/lib/systemd.sh"
+	systemdvars "$ATL_SYSTEMD_SERVICENAME" ExecMainStartTimestamp ExecMainPID ActiveState
+}
+
+usage() {
+	local cmd=("${CMD:-$0}")
+	cat <<EOF
+	$*
+Purpose: $(grep -m1 '##' "$0" | sed -e 's/## //')
+Usage: ${cmd[*]}
+Commands: $(
+		cd "$ATL_MANAGE/diagnostics"
+		echo *.do | sed 's/.do/\n/g'
+	)
+EOF
+	exit 2
+
+}
+
+main "$@"

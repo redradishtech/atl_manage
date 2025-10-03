@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+# encoding: UTF-8
+require_relative '../lib/atl_common'
+require_relative '../lib/jiradb'
+require 'atl_config'
+require 'pry'
+require 'sequel'
+
+puts "Objects available:"
+CFG = AtlConfig.dbinfo(ATL_PRODUCT, ATL_APPDIR, ATL_DATADIR) 
+puts "CFG	#{CFG}"
+DB = Sequel.connect(CFG.dburl, :user =>  CFG.user, :password => CFG.password)
+puts "DB	#{DB}"
+if ATL_PRODUCT =~ /jira/ then
+	JIRA = JIRADB::JIRADB.new(CFG)
+	puts "JIRA	#{JIRA}"
+end
+
+version = ">= 0.a"
+
+gem 'pry', version
+load Gem.bin_path('pry', 'pry', version)

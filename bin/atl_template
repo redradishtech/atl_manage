@@ -1,0 +1,16 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+usage() {
+	echo >&2 "Purpose: Renders a template for the currently selected profile. This is mostly a debugging aid."
+	echo >&2 "Usage: $0 templatefile"
+}
+
+if [[ $# = 0 || -z "${ATL_SHORTNAME}" ]]; then
+	usage
+	exit
+fi
+
+cat "$1" | replace_tokens

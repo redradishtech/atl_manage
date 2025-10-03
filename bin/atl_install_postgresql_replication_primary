@@ -1,0 +1,87 @@
+#!/bin/bash -eu
+
+# Set up Postgres slot-based streaming replication based on https://www.slideshare.net/denishpatel/out-of-the-box-replication-in-postgres-94pg-con
+
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
+
+main() {
+	[[ $# == 0 ]] || usage "$@"
+	set -x
+	pgver="${ATL_DATABASE_VERSION:?}"
+	pgcluster="${ATL_DATABASE_CLUSTER:?}"
+	pgport="${ATL_DATABASE_PORT:?}"
+	interface="${ATL_REPLICATION_PRIMARY_HOST:?}"
+	client="${ATL_REPLICATION_STANDBY_HOST:?}"
+	validate_service
+	sanitychecks
+	server_settings "$@"
+}
+
+usage() {
+	echo >&2 "Usage: $0 <interface> <client>"
+	echo >&2
+	echo >&2 "Where:"
+	echo >&2 "    <interface> is the IP or hostname of the interface that Postgres should listen on for replication connections. Generally a non-localhost IP is needed"
+	echo >&2 "    <client> is the IP or hostname of the Postgres standby, to grant access from in the server's pg_hba.conf file"
+	echo >&2 "E.g. atl_install_postgresql_replication_primary 9.5 main usw-db01 usw-db02"
+	echo >&2
+	exit 1
+}
+
+validate_service() {
+	test -d /etc/postgresql/"$pgver/$pgcluster" || error "No such directory: /etc/postgresql/$pgver/$pgcluster"
+}
+
+sanitychecks() {
+	version_greaterequalthan "$pgver" 9.4 || error "Slot-based replication is only available on Postgres 9.4 and above (not $pgver)"
+}
+
+getpgport() {
+	pg_lsclusters | grep "$pgver \+$pgcluster\s" | awk '{print $3}' || error "No such cluster: $pgver $pgcluster "
+}
+
+server_settings() {
+	set -x
+	echo "create role replication password 'replication' login replication;" | atl_psql --super
+	hba=$(echo "show hba_file" | atl_psql --super -tAXq)
+	if ! $SUDO egrep -q '^host\s+replication\s+replication' "${hba}"; then
+		log "Adding replication entry to $hba"
+		#echo "host	replication	replication	127.0.0.1/32	md5" | $SUDO tee -a "$hba"
+		echo "host	replication	replication	$client	md5" | $SUDO tee -a "$hba"
+		$SUDO pg_ctlcluster "$pgver" "$pgcluster" reload
+	else
+		log "Replication entry already exists in $hba"
+	fi
+	maxwal=$(echo 'show max_wal_senders' | atl_psql --super -tAXq)
+	if [[ $maxwal = 0 ]]; then
+		log "Enabling archiving on Postgres server"
+		echo "alter system set wal_level = hot_standby;
+		alter system set max_replication_slots = 2;
+		alter system set max_wal_senders = 8;     -- Number of concurrent connections from standby servers or streaming base backup clients.
+		alter system set max_standby_streaming_delay=-1; -- Propagated to standbys, this is needed for pg_dump not to fail
+		 " | atl_psql --super -tAXq
+		# This script used to set these vars, based on the slides, but actually they are a very bad idea, as pg_xlog quickly fills up.
+		#echo "alter system set archive_mode = on;
+		#alter system set archive_timeout = 60;
+		#alter system set wal_keep_segments = 100;
+		#alter system set logging_collector = on;" | _psql
+		$SUDO pg_ctlcluster "$pgver" "$pgcluster" restart
+	else
+		log "Archiving is already enabled in Postgres"
+	fi
+
+	slotcount="$(echo "select count(*) from pg_replication_slots where slot_name='standby1';" | atl_psql --super -tAXq)"
+	if [[ $slotcount == 0 ]]; then
+		log "Creating replication slot"
+		echo "select * from pg_create_physical_replication_slot('standby1')" | atl_psql --super -tAXq
+	else
+		log "Replication slot already exists"
+	fi
+	netstat -nap | grep "$interface:$pgport" || true
+	log "Please ensure Postgres to listen on a public interface, by setting «listen_addresses = '$interface'» in /etc/postgresql/$pgver/$pgcluster/postgresql.conf. Do NOT use 'alter system listen_addresses' as this gets propagated to the standby"
+}
+
+main "$@"

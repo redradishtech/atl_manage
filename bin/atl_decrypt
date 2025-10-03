@@ -1,0 +1,25 @@
+#!/bin/bash
+## Decrypt stdin previously encrypted with atl_encrypt.
+
+[[ -v ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE ]] || { echo -e >&2 "The private key file to enable decrypt as must be set in ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE."; }
+
+# 'kpget' fetches a password from KeepassXC. Use it so support a keepass://passwordentryurl format.
+if [[ $ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE =~ ^keepass:// ]]; then
+	if [[ $ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE =~ ^keepass://(.+)/(.+) ]]; then
+		database="${BASH_REMATCH[1]}"
+		keyfileurl="${BASH_REMATCH[2]}"
+		echo "Checking keepass file $database for key $keyfileurl"
+		ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE="$(mktemp)"
+		touch "$ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE"
+		chmod 600 "$ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE"
+		echo "Fetching private key from Keepass, for entry with URL $keyfileurl"
+		kpget "$keyfileurl" > "$ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE"
+		trap 'rm -fr "$ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE"' EXIT TERM
+	else
+		echo "${ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE@Q} has invalid format. Should be keepass://keepassfile/urlidentifier"
+		exit 1
+	fi
+fi
+
+# Note: if decryption fails, check you have the correct database open!
+"$ATL_MANAGE/lib/age" --decrypt -i "$ATL_ENCRYPTION_AGE_PRIVATE_KEYFILE" "$@" || echo >&2 "Private key for $ATL_ENCRYPTION_AGE_PUBLIC_KEY did not work"

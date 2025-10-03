@@ -1,0 +1,94 @@
+#!/bin/bash -eu
+# Installs Postgres from the pgdg repo, and (if postgres is running on a separate server to the apps) grants remote TCP access to indicated clients
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+main() {
+	if [[ $# = 1 && $1 =~ -h ]]; then usage; fi
+	[[ $ATL_DATABASE_TYPE =~ postgresql ]] || fail "ATL_DATBASE_TYPE set to '$ATL_DATABASE_TYPE'"
+	add_pgdg_repo
+
+	if [[ $ATL_DATABASE_HOST = localhost ]]; then
+		pkginstall postgresql-"$ATL_DATABASE_VERSION"
+		grant_clients_access "$@"
+		[[ $LANG =~ UTF-8 ]] || fail "Please correct the locale (LANG=$LANG), so the database cluster is created with the correct encoding"
+		pg_lsclusters "$ATL_DATABASE_VERSION" "$ATL_DATABASE_CLUSTER" >/dev/null || pg_createcluster -p "$ATL_DATABASE_PORT" "$ATL_DATABASE_VERSION" "$ATL_DATABASE_CLUSTER" --start
+		set_superuser_password
+	else
+		pkginstall postgresql-client-"${ATL_DATABASE_VERSION}" postgresql-common
+	fi
+	if [[ $ATL_PRODUCT = postgresql ]]; then
+		if [[ -v ATL_REPLICATION_PRIMARY ]]; then
+			atl_install_postgresql_replication_primary "$@"
+		elif [[ -v ATL_REPLICATION_STANDBY ]]; then
+			atl_install_postgresql_replication_standby "$@"
+		fi
+	fi
+}
+
+usage() {
+	echo >&2 "Purpose: Installs $ATL_DATABASE_TYPE $ATL_DATABASE_VERSION. If the database is running on a separate server to clients, we optionally grant remote TCP access to indicated clients"
+	echo >&2 "Usage: $0 [<remoteclient> ...]"
+	echo >&2
+	echo >&2 "Where:"
+	echo >&2 "    <client> is the IP or hostname of a remote client to allow access from in pg_hba.conf. This is not needed for local connections"
+	echo >&2
+	exit 1
+}
+
+add_pgdg_repo() {
+	# Note, this seems to install http:// on 22.04 and https:// on 25.04, so we don't specify the scheme
+	add-apt-repository --list | grep -qF '//apt.postgresql.org/pub/repos/apt' || {
+		pkginstall postgresql-common
+		sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+	}
+}
+
+grant_clients_access() {
+	while [[ $# -gt 0 ]]; do
+		remoteclient="$1"
+		shift
+		hbafile="/etc/postgresql/$ATL_DATABASE_VERSION/$ATL_DATABASE_CLUSTER/pg_hba.conf"
+		extraline="host    all             all             $remoteclient		md5"
+		if grep -qF "$extraline" "$hbafile"; then
+			log "Already added pg_hba line for '$remoteclient'"
+		else
+			log "Editing pg_hba.conf to grant '$remoteclient' access"
+			echo "# Grant appserver client '$remoteclient' access" >>"$hbafile"
+			echo "$extraline" >>"$hbafile"
+			modified=true
+		fi
+	done
+	if [[ -v modified ]]; then
+		systemctl reload "postgresql@${ATL_DATABASE_VERSION}-$ATL_DATABASE_CLUSTER"
+	fi
+}
+
+set_superuser_password() {
+	local sourcedprofiles
+	# Convert space-separated string to array
+	#[[ -v ATL_DATABASE_SUPERUSER ]] || fail "ATL_DATABASE_SUPERUSER is unset. Please set ATL_DATABASE_SUPERUSER${ATL_REPLICATION_STANDBY:+ on the primary replication host ${ATL_REPLICATION_PRIMARY_HOST:-}}. E.g. { echo ATL_DATABASE_SUPERUSER=postgres >> '$best_profile_file'; }"
+	#[[ -v ATL_DATABASE_SUPERPASSWORD ]] || fail "ATL_DATABASE_SUPERPASSWORD is unset. Please set ATL_DATABASE_SUPERPASSWORD${ATL_REPLICATION_STANDBY:+ on the primary replication host ${ATL_REPLICATION_PRIMARY_HOST:-}}. E.g. { echo ATL_DATABASE_SUPERPASSWORD='$(pwgen -1s)' >> '$best_profile_file'; }"
+	[[ -v ATL_DATABASE_SUPERUSER ]] || fail "ATL_DATABASE_SUPERUSER is unset"
+	[[ -v ATL_DATABASE_SUPERPASSWORD ]] || fail "ATL_DATABASE_SUPERPASSWORD is unset"
+	while ! check_superuser_connection; do
+		if [[ $ATL_DATABASE_SUPERPASSWORD = "$ATL_DATABASE_USER" || $ATL_DATABASE_SUPERPASSWORD = "$ATL_DATABASE_SUPERUSER" ]]; then
+			fail "Sorry, '$ATL_DATABASE_SUPERPASSWORD' is a terrible password. Please: { echo ATL_DATABASE_SUPERPASSWORD=$(pwgen -1s) >> '$best_profile_file'; } and try again"
+		fi
+		if [[ ${ATL_DATABASE_HOST:-} = localhost ]]; then
+			warn "Please set ATL_DATABASE_SUPERPASSWORD${ATL_REPLICATION_STANDBY:+ on the primary replication host ${ATL_REPLICATION_PRIMARY_HOST:-}} for superuser $ATL_DATABASE_SUPERUSER. If this is currently unset, set it with: "
+			echo "sudo -u postgres PGPORT=$ATL_DATABASE_PORT psql -c '\\password'      # paste $ATL_DATABASE_SUPERPASSWORD"
+			"$SHELL"
+		else
+			warn "Please set ATL_DATABASE_SUPERPASSWORD, so we can connect to $ATL_DATABASE_SUPERUSER@$ATL_DATABASE_HOST."
+			"$SHELL"
+		fi
+	done
+
+}
+
+check_superuser_connection() {
+	atl_psql --super postgres -c 'select 1;' &>/dev/null
+}
+
+main "$@"

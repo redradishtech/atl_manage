@@ -1,0 +1,9 @@
+#!/bin/bash
+
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE"/lib/common.sh --nolog
+
+pid=$(atl_pid) || { echo >&2 "not running"; exit 1; }
+"$ATL_MANAGE/lib/jvmtop/jvmtop-current/jvmtop.sh" --threadnamewidth=$(($(tput cols) / 2)) --threadlimit=5 -p "$(atl_pid)"

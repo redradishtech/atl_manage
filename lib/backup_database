@@ -1,0 +1,187 @@
+#!/bin/bash -eu
+## Dumps the app's database ($ATL_DATABASE_TYPE $ATL_DATABASE) into the specified directory. Can also back up other (presumably auxiliary / related) databases by specifying their name. This script is typically called by rsnapshot (see $ATL_APPDIR/backups/rsnapshot.conf).
+set -o pipefail
+shopt -s extglob
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+export PATH="$ATL_MANAGE/bin:$PATH" # For atl_pg_dump
+# shellcheck source=/opt/atl_manage/lib/jeventutils/lib/jeventutils.sh
+. "$ATL_MANAGE/lib/jeventutils/lib/jeventutils.sh"
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	PARSED=$(getopt --options='hdn' --longoptions 'help,destination:' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	destination=
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		-d | --dest*)
+			shift
+			destination="$1"
+			;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage "Invalid options" ;;
+		esac
+		shift
+	done
+
+	[[ $destination ]] || error "--destination is required"
+	[[ ${destination:0:1} = / ]] || error "--destination must be an absolute path"
+	[[ "$destination" =~ /latest-database-dump ]] || fail "Out of paranoia: refusing to delete/dump to a directory not containing /latest-database-dump/ in the path"
+	#shellcheck disable=SC2001
+	destination="$(echo "$destination" | sed 's:/*$::')" # Trim trailing slashes
+	if [[ -v ATL_DATABASE && $destination =~ "${ATL_DATABASE}"$ ]]; then
+		destination="${destination%"$ATL_DATABASE"}" # Remove the database portion
+		log "Warning: Please do not include the database name ($ATL_DATABASE) in the --destination arg to $0. --destination has been rewritten to $destination"
+	fi
+	# }}}
+	# pg_dump expects the destination directory to not exist
+	#rm_dir_contents "$destination"
+	## Oct/19 Edit: we used to create the tstamp even if pg_dump failed. Why??
+	# The date format is relied upon by bin/atl_backupmirror_restore
+	#trap "date --iso-8601=seconds > $destination/tstamp" SIGINT SIGTERM EXIT
+
+	#local inprogress_marker
+	#inprogress_marker="$destination/.DATABASE_DUMP_IN_PROGRESS"
+	#echo "If this file exists, the database dump never completed" > "$inprogress_marker"
+
+	# The %-* converts 'postgresql-rds' to 'postgresql'
+	jreadlock database jrun "backup_${ATL_DATABASE_TYPE%-*}" "backup_${ATL_DATABASE_TYPE%-*}" "$@"
+
+	#rm "$inprogress_marker"
+}
+
+backup_postgresql() {
+	#http://www.aktau.be/2014/10/23/pg-dump-and-pigz-easy-rsyncable-backups-with-postgresql/
+	# pg_dump to somewhere in $ATL_BACKUP_TMP, ideally on the same filesystem as $destination, having lots of space
+	# Note that this assumes $TMPDIR is writable by postgres, as is true if TMPDIR=/tmp, but possibly not for other locations like $HOME/tmp. It is the caller's responsibility to ensure TMPDIR is writable.
+	local t0=$(date +%s)
+	local t0iso=$(date --iso-8601=seconds)
+	[[ ! -d "$destination" ]] || rm -r "$destination"
+	mkdir -p "$destination"
+
+	# $@ will contain 0 or more database names, and then args to postgres (e.g. --exclude-table-data=public."EVENTS" to exclude a particular huge table)
+	# We have the unpleasant job of separating databases from args, as we need to backup each database in a separate directory.
+	local pgopts
+	declare -A dbs
+	dbs[$ATL_DATABASE]=0
+	declare -a pgopts
+	while (($#)); do
+		if [[ ${1:0:1} = - ]]; then pgopts+=("$1"); else dbs["$1"]=0; fi # https://www.baeldung.com/linux/bash-unique-values-arrays
+		shift
+	done
+
+	#log "databases: ${!dbs[@]} ops ${pgopts[@]}"
+	for db in "${!dbs[@]}"; do
+		local dbdest="$destination/$db"
+		mkdir "$dbdest"
+		cmd=(atl_pg_dump --super -Z0 -Fd -f "$dbdest" "${pgopts[@]}")
+		# It seems 'set -e' is not in effect when called from jrun, so we have to exit explicitly
+		ATL_DATABASE="$db" "${cmd[@]}" || exit $?
+		# https://wiki.debian.org/ReproducibleBuilds/TimestampsInGzipHeaders
+		cd "$dbdest"
+		pigz --no-time --rsyncable !(toc).dat
+		dt=$(($(date +%s) - t0))
+		# Record the runtime in seconds, so that potentially we can monitor for over-long backups.
+		echo "$dt" >database_dump_runtime
+		# The tstamp is of the backup start time, not the finish time, but we only record it at the end so 'tstamp' can act as a did-the-backup-finish marker
+		echo "$t0iso" >tstamp
+
+		if (($# == 0)); then
+			cat >README <<-EOF
+				This $ATL_DATABASE_TYPE backup of the $ATL_LONGNAME app's $ATL_DATABASE database was made on $(date) with command:
+
+				${cmd[*]}
+
+				To generate SQL to stdout, run:
+
+				pg_restore -f - .
+
+				Table owners are set as '$ATL_DATABASE_USER', so that user must exist, or else pipe the SQL through pg_renameowner:
+
+				pg_restore -f - . | $ATL_MANAGE/bin/pg_renameowner <newowner>
+
+				This must be piped into an existing but empty database. The SQL does not contain CREATE DATABASE commands and does not contain DROP commands for tables.
+			EOF
+		elif (($# == 1)); then
+			cat >README <<-EOF
+				This $ATL_DATABASE_TYPE backup of a $ATL_LONGNAME database was made on $(date) with command:
+
+				${cmd[*]}
+
+				To generate SQL to stdout, run:
+
+				pg_restore -f - .
+
+				This must be piped into an existing but empty database. The SQL does not contain CREATE DATABASE commands and does not contain DROP commands for tables.
+			EOF
+		else
+			cat >README <<-EOF
+				This $ATL_DATABASE_TYPE backup for the $ATL_LONGNAME app database was made on $(date) with command:
+
+				${cmd[*]}
+
+				To generate SQL to stdout, run:
+
+				pg_restore -f - .
+			EOF
+		fi
+	done
+	# Backup non-database-specific things like user accounts. They are necessary if we ever need to rebuild from scratch.
+	# RDS doesn't let us see passwords in globals, so pass --no-role-password there.
+	# http://judepieries.blogspot.com/2017/12/how-to-backup-postgres-globals-without.html
+	if atl_psql -tAXqc 'select aurora_version();' >/dev/null 2>&1; then
+		atl_pg_dumpall --super --globals-only --no-role-password >"$destination"/globals.sql
+	else
+		atl_pg_dumpall --super --globals-only >"$destination"/globals.sql
+	fi
+	echo "$t0iso" >"$destination"/tstamp
+}
+
+backup_mysql() {
+	t0=$(date +%s)
+	t0iso=$(date --iso-8601=seconds)
+	[[ ! -d "$destination" ]] || rm -r "$destination"
+	mkdir -p "$destination"
+	cd "$destination"
+	#echo >&2 "destination: $destination"
+	# FIXME: Replace with mydumper: https://wplobster.com/extremely-fast-mysql-backup-restore-using-mydumpermyloader/?utm_source=cronweekly.com
+	# It seems 'set -e' is not in effect when called from jrun, so we have to exit explicitly
+	# Note that for multitenant instances ATL_DATABASE may be unset, in which case mysql_generate_dumps.sh generates dumps of all databases
+	# shellcheck source=mysql_generate_dumps.sh disable=SC2086
+	# FIXME: the postgresql version accepts pg_dump command-line args, and multiple databases. Should we do the same here?
+	#shellcheck source=/opt/atl_manage/lib/mysql_generate_dumps.sh
+	#shellcheck disable=SC2086
+	source "$(dirname "$(readlink -f "$0")")"/mysql_generate_dumps.sh ${ATL_DATABASE:-} || exit $?
+	dt=$(($(date +%s) - t0))
+	# Record the runtime in seconds, so that potentially we can monitor for over-long backups.
+	echo "$dt" >"$destination"/database_dump_runtime
+	# The tstamp is of the backup start time, not the finish time, but we only record it at the end so 'tstamp' can act as a did-the-backup-finish marker
+	echo "$t0iso" >"$destination"/tstamp
+}
+
+usage() {
+	cat <<EOF
+$*
+Purpose: Dumps the app's database ($ATL_DATABASE_TYPE $ATL_DATABASE) into the specified directory. Can also back up other (presumably auxiliary / related) databases by specifying their name.
+Usage:
+atl_backup <[options]> [databasename]
+
+Options:
+	--destination		Directory to write backups below
+
+
+EOF
+	exit
+}
+
+main "$@"

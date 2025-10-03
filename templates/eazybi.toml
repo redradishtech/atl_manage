@@ -1,0 +1,7 @@
+[database]
+adapter = "%{ATL_DATABASE_TYPE%-*}"
+database = "%{ATL_DATABASE_EAZYBI}"
+host = "%{ATL_DATABASE_HOST}"
+port = "%{ATL_DATABASE_PORT}"
+password = "%{ATL_DATABASE_EAZYBI_PASSWORD}"
+username = "%{ATL_DATABASE_EAZYBI_USER}"

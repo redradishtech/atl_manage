@@ -1,0 +1,24 @@
+#!/usr/bin/env php
+<?php
+# SYNOPSIS: Prints the value of a PHP configuration constant, if invoked in a Jethro instance.
+#
+
+if (count($argv) != 2) {
+	fwrite(STDERR, "Usage: " . $argv[0] . " CONSTANT" . PHP_EOL);
+	fwrite(STDERR, "E.g.: " . $argv[0] . " SMS_SEND_LOGFILE" . PHP_EOL);
+	fwrite(STDERR, "E.g.: " . $argv[0] . " DOCUMENTS_ROOT_PATH" . PHP_EOL);
+	exit(1);
+}
+$const = $argv[1];
+function _handleError($errno, $errstr, $errfile, $errline) {
+	fwrite(STDERR, $errstr . PHP_EOL);
+	exit(1);
+}
+set_error_handler("_handleError");
+require_once $_SERVER["ATL_APPDIR"].'/app/conf.php';
+if (defined($const)) { 
+	echo constant($const) . PHP_EOL;
+} else {
+	fwrite(STDERR, "No constant '" . $const . "' defined." . PHP_EOL);
+	exit(1);
+}

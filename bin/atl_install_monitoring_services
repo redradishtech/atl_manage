@@ -1,0 +1,423 @@
+#!/bin/bash
+# Note lack of -eu. We rely on ${arrays[@]} which may be empty
+set -o pipefail
+
+# shellcheck source=../lib/common.sh
+source "$ATL_MANAGE"/lib/common.sh --no_profile_needed --nolog
+# shellcheck source=../lib/monitoring.sh
+. "$ATL_MANAGE/lib/monitoring.sh"
+set_monitoring_vars
+
+# Store global variables as external files. We can't use variables because we need subshells for isolation, and subshells can't append to their parent's variables.
+installable=$(mktemp)
+runnable=$(mktemp)
+trap "rm \"$installable\" \"$runnable\"" TERM EXIT
+
+main() (
+	# Exclusive lock on monitoring.lock to ensure each script sees a consistent view of the monitoring config files
+	flock -x 200
+	if (($# < 1 || $# > 3)); then
+		echo >&2 "Usage: $0 [--no-health-checks-or-reload] [--prefix=PREFIX]  <nagiosfile | directory>"
+		exit 1
+	fi
+	if [[ $ATL_MONITORING = none ]]; then
+		log "ATL_MONITORING=none, so $0 is a no-op"
+		exit 0
+	fi
+	{ [[ -d $monitoring_confdir ]] && command -v "$ATL_MONITORING" >/dev/null; } || error "$ATL_MONITORING is not installed."
+	local no_health_checks=false
+	if [[ $1 = --no-health-checks-or-reload ]]; then
+		no_health_checks=true
+		shift
+	fi
+	# For multitenant instances we want to prefix /etc/cron.d/* scripts not only with ATL_SHORTNAME, but a tenant identifier, --prefix=$ATL_TENANT. See e.g. ej_create which uses this
+	if [[ $1 =~ --prefix=(.+) ]]; then
+		prefix="-${BASH_REMATCH[1]}"
+		shift
+	fi
+
+	if [[ -d $1 ]]; then
+		shopt -s nullglob
+		# The 'readlink -f' turns potentially relative paths to absolute
+		# We put nagios.cfg first, as it contains definitions the other .cfg files might need
+		if [[ $0 =~ atl_install ]]; then
+			servicefiles=("$(readlink -f "$1")"/{*.cfg,*.healthcheck})
+		else
+			# uninstall
+			servicefiles=("$(readlink -f "$1")"/{!(nagios).cfg,*.healthcheck,nagios*.cfg})
+		fi
+	elif [[ -f $1 ]]; then
+		servicefiles=($(readlink -m "$1")) # Absolutize so the path check below works
+	else
+		# This happens e.g. when /opt/atl_manage/events/uninstall-pre/backups-mirror uninstalls a service, but the app is in a half-uninstalled state where the .service file does not exist.
+		warn "$1 does not exist"
+		exit 0
+	fi
+	set_monitoring_vars # sets monitoring_confdir and monitoring_staticconfs
+
+	if [[ $0 =~ atl_uninstall ]]; then
+		process_servicefiles uninstall "${servicefiles[@]}"
+	elif [[ $0 =~ atl_install ]]; then
+		if [[ ! "${servicefiles[0]}" =~ ^"$ATL_APPDIR_BASE" ]] && [[ ! -v prefix ]]; then
+			fail "Trying to install a healthcheck ${servicefiles[0]} outside ATL_APPDIR_BASE ($ATL_APPDIR_BASE). Specify a --prefix to indicate what this service is related to"
+		fi
+		# Narrow $servicefiles down to those 'installable' i.e. where install_if: didn't evaluate to false
+		process_servicefiles installable "${servicefiles[@]}" # https://unix.stackexchange.com/questions/244913/reading-stdin-into-a-bash-array
+
+		uninstallable=($(echo "${servicefiles[@]}" "$(cat "$installable")" | tr ' ' '\n' | sort | uniq -u)) # https://stackoverflow.com/questions/2312762/compare-difference-of-two-arrays-in-bash
+
+		# We were asked to install services, but these one had 'install_if' evaluate to false, meaning the runtime environment indicates installation is inappropriate. Uninstall these.
+		process_servicefiles uninstall "${uninstallable[@]}"
+
+		# Install the installable services, and as a side-effect collect
+		# FIXME: if 'runnable' is declared local, a non-zero exit code is ignored. Bash is evil!
+		process_servicefiles install $(cat "$installable")
+		# We only check for monitoring happiness once all service files in a directory are installed, as e.g. javamelody.cfg might be sourced before nagios.cfg but rely on nagios.cfg service definitions
+
+		check_monitoring_happy "$@"
+
+		# This takes too long in the 80% case where we are atl_reinstall'ing an existing service.
+		#process_servicefiles run "${runnable[@]}"
+	fi
+
+) 200>"$(lockdir --global)/monitoring.lock"
+
+process_servicefiles() {
+	local action="$1"
+	shift
+	local servicefiles=("$@")
+	local exitcode=0
+
+	for servicefile in "${servicefiles[@]}"; do
+		# An unexpanded %{token} is usually an error, as when we have a patchqueue not fully applied (_replacetokens patch is unapplied).
+		# However sometimes the token is valid, as with curl's "%{http_code}" in monitoring/userdirectories.healthcheck
+		# In that case, our hacky solution is to require a '# notatoken' at the end of the offending line
+		if [[ $action = install ]] && grep '%{.*}' "$servicefile" | grep -v 'notatoken'; then
+			error "Refusing to install $ATL_MONITORING service that contains %{TOKENS}: $servicefile"
+		fi
+		#log "Considering $action $servicefile"
+		case "$servicefile" in
+		*.cfg)
+			active_nagios_service "$action" "$servicefile"
+			;;
+		*.cfg.install)
+			error "Please call $0 with the .cfg file, not .cfg.install"
+			;;
+		*.healthcheck | *.nagioscheck.sh)
+			passive_nagios_service "$action" "$servicefile"
+			exitcode=$(( exitcode | $? ))  # Normally we'd just fail() which exits
+			;;
+		*)
+			error "Unhandled type: $servicefile"
+			;;
+		esac
+	done
+	return $exitcode
+}
+
+check_monitoring_happy() {
+	if [[ $no_health_checks ]]; then return; fi
+
+	"$monitoring_exe" -v "$monitoring_mainconf" >/dev/null || {
+		"$monitoring_exe" -v "$monitoring_mainconf" || true
+		error "$ATL_MONITORING config failure"
+	}
+
+	activestate=$(systemctl show "$ATL_MONITORING".service | grep ActiveState)
+	if [[ $activestate = ActiveState=active ]]; then
+		[[ $no_health_checks ]] || systemctl reload "$ATL_MONITORING"
+	else
+		warn "$ATL_MONITORING is in state $activestate, not 'active'"
+	fi
+	# Note we only reload if we're installing, not uninstalling services. $ATL_MANAGE/events/install-post/monitoring uninstalls monitoring/ services including nagios.cfg which renders services from backups/ and letsencrypt/ temporarily invalid.
+	atl_monitoring check       # Reload fails silently if something is wrong
+	atl_monitoring reload || : # FIXME: 'nagios4 is configured but not running'
+}
+
+active_nagios_service() {
+	local action="$1"
+	local servicefile="$(realpath "$2")"
+	[[ $servicefile =~ \.cfg$ ]] || error "Not an active nagios service: $servicefile"
+	local service="$(basename "${servicefile}")"
+	local dest="$monitoring_confdir/${ATL_SHORTNAME}${prefix}-$service"
+	case "$action" in
+	installable)
+		echo "$servicefile" >> "$installable" # Always installable
+		;;
+	install)
+		#sudo -u nagios test -r "$servicefile" || error "$ATL_MONITORING cannot read '$servicefile'. Permissions on '$servicefile' should be set with setfacl, and stored in the relevant patch with 'hg acl save'. To fix, please 'cd $(dirname "$servicefile"); setfacl -m u:nagios:rx $(dirname "$servicefile"); setfacl -m u:nagios:r $servicefile; hg acl store'"
+		# The 'realpath' is incase $servicefile is a relative path
+		ln -sf "$servicefile" "$dest"
+		# Make the referent readable by nagios, since our umask means files aren't 'other' readable by default
+		setfacl -m user:nagios:rx "$(dirname "$servicefile")"
+		setfacl -m user:nagios:r "$servicefile"
+		validate_user_can_read_all nagios "$servicefile"
+		log "$ATL_MONITORING active service installed: $dest → $servicefile"
+		;;
+	uninstall)
+		rm -f "$dest"
+		;;
+	run)
+		:
+		;;
+	*)
+		error "Invalid action: $action"
+		;;
+	esac
+}
+
+# Returns true if a bash array contains an element
+# E.g. containsElement "foo" "${array[@]}"   # $? = 0 if foo is present
+# https://stackoverflow.com/questions/3685970/check-if-a-bash-array-contains-a-value
+containsElement() {
+	local e match="$1"
+	shift
+	for e; do [[ "$e" == "$match" ]] && return 0; done
+	return 1
+}
+
+passive_nagios_service() (
+	# Notice that this function runs in a subshell. That is because we 'source' headervars, and we want a clean new environment for each service we install. This was done after a horrible bug where 'lockfile' was set in one .healthcheck script and then inherited by later ones
+	# Our headerfile may not export ${writelock[@]}, in which case our reference to it mustn't fail
+	# This should be true of our caller, so we don't need to set again here, but we do rely on ${writelock[@]}  sometimes being empty
+	# set +eu
+
+	local action="$1"
+
+	local servicefile
+	local service
+	local host_name
+	local hostandservice
+	local nagiosfile
+	local cronfile
+
+	servicefile="$(realpath "$2")"
+	service="$(basename "${servicefile%.healthcheck}")"
+	host_name="${ATL_LONGNAME:-$(uname -n)}"
+	hostandservice="${ATL_SHORTNAME}${prefix}-$service"
+	nagiosfile="$monitoring_confdir/$hostandservice.cfg"
+	cronfile=/etc/cron.d/"$(echo "$hostandservice" | cronfriendlyname)"
+
+	case "$action" in
+	installable | install | run)
+		# Remove this once ATL_SERVICES_USER is in widespread use (>6/Jun/23)
+		if grep -q 'user: .*\$ATL_USER' "$servicefile"; then
+			fail "Please replace 'user: \$ATL_USER' with 'user: \$ATL_SERVICES_USER' in $servicefile"
+		fi
+
+		vars=(lockname lockfile logname isolation_level use service_description freshness_threshold notification_interval user writelock readlock)
+		for v in "${vars[@]}"; do
+			! [[ -v $v ]] || fail "The caller has $v (value '${!v}') defined. It has leaked from some earlier script, which should be fixed. In the context of $servicefile"
+		done
+
+		# Load bash vars from $servicefile header. Special processing to strip chars nagios doesn't like
+		# To see what is generated, add to the pipeline: | tee /dev/stderr
+		#shellcheck source=/opt/atl_manage/lib/headervars
+		varshellcode=$("$ATL_MANAGE/lib/headervars" "$servicefile" | perl -ne 'if (/^name|^service_description/) { my ($k,$v) = split("=", $_, 2); $v =~ s/[~!$%^&*\"|<>?,()=]//g; print "local $k=$v"; } else { print "local $_"; }') || fail "Error parsing headers: $servicefile"
+		eval "$varshellcode"
+
+		[[ ! -v lockname ]] || error "Please remove 'lockname' in $servicefile. The lock is now implicit"
+		[[ ! -v lockfile ]] || error "Please remove 'lockfile' in $servicefile. Replace with 'writelock: [-n] lockname' or 'readlock: [-n] lockname'"
+		[[ ! -v logname ]] || error "Please remove 'logname' in $servicefile. The log name is now implicit"
+		# The flag 'isolation_level: global' used to mean that 'jwritelock' got a -g ('global') flag passed, to ensure VM-level isolation rather then just per-app isolation. Important for e.g. zfs health checks.
+		[[ ! -v isolation_level ]] || error "Please replace 'isolation_level' in $servicefile with 'writelock: [-n] -g $service'"
+
+		if [[ ! -v use ]]; then # The Nagios template to use
+			if [[ -v ATL_SHORTNAME ]]; then
+				# Note: this used to be atl-passive-service (and before that, atlassian-${ATL_PRODUCT}-passive-service). This ATL_SHORTNAME-service service is defined in $ATL_APPDIR/monitoring/nagios.cfg, and crucially, defines the _atl_role variable that allows alerts to be tagged as 'prod', 'staging', etc.
+				use=$ATL_SHORTNAME-passive-service
+				nagios_host="$host_name"
+			else
+				use=atl-passive-service
+				nagios_host=
+			fi
+		fi
+
+		for var in service_description freshness_threshold user; do
+			[[ -v $var ]] || error "Missing '$var' variable in '$servicefile'"
+		done
+
+		locks=
+		for l in "${writelock[@]}"; do
+			# Allow -n, -g, -ng, -gn or nothing
+			[[ $l =~ ((-[ng]+ )*).**[^\ ]+ ]] || fail "Invalid writelock header: «$l». Format is [-n] LOCKNAME"
+			locks+=" jwritelock $l"
+		done
+		for l in "${readlock[@]}"; do
+			[[ $l =~ ((-[ng]+ )*).**[^\ ]+ ]] || fail "Invalid readlock header: «$l». Format is [-n] LOCKNAME"
+			locks+=" jreadlock $l"
+		done
+		if [[ ! -v locks ]]; then
+			# Default lock
+			locks=" jwritelock $service"
+		fi
+
+		if [[ -v envscript ]]; then
+			if [[ $ATL_ROLE = prod || $ATL_ROLE = preprd ]]; then
+				[[ -f $envscript ]] || fail "$servicefile 'envscript' file '$envscript' does not exist"
+				[[ -x $envscript ]] || fail "$servicefile 'envscript' file '$envscript' is not executable"
+			else
+				# envscript is often $ATL_DATADIR/.env/atl_env which may not exist in multitenant dev instances. Don't break atl_upgrade on that account. This check is done before 'install_if' could prevent it.
+				[[ -f $envscript ]] || warn "$servicefile 'envscript' file '$envscript' does not exist"
+				[[ -x $envscript ]] || warn "$servicefile 'envscript' file '$envscript' is not executable"
+			fi
+
+		else
+			envscript="$(realpath -m "$(dirname "${servicefile}")/..")/.env/atl_env"
+			[[ -f $envscript ]] || fail "Cannot find envscript at default location $envscript. Please run 'atl_freeze'"
+			[[ -x $envscript ]] || fail "Cannot execute envscript at default location $envscript"
+		fi
+
+		cmd=". $envscript;  $locks jlog $service jrun $service $servicefile 3> >(jeventlog -t $service | notify_all_monitoring \"$service\")"
+		;;
+	esac
+
+	case "$action" in
+	installable)
+		# E.g. # install_if: test $ATL_ROLE = prod
+		if [[ -v install_if ]]; then
+			{
+				export PATH=.:"$PATH"
+				cd "$(dirname "$servicefile")"
+				if ! eval "$install_if" >&2; then # The 'eval' is so that baredomain.healthcheck works with: # install_if: test ${ATL_FQDN#www\.} == $ATL_BASEDOMAIN. The redirect to stderr is in case the $install_if expression emits anything to stdout. We need to *only* emit $servicefile on stdout, not random other messages
+					log "Not installing $(basename "$servicefile"): condition '$install_if' evaluated to false"
+				else
+					log "$servicefile condition '$install_if' passed"
+					echo "$servicefile" >> "$installable"
+				fi
+			}
+		else
+			echo "$servicefile" >> "$installable"
+		fi
+		;;
+
+	install)
+		if [[ $servicefile =~ \.nagioscheck\.sh$ ]]; then
+			fail "Dead-naming script: $servicefile. Please remove the .sh extension"
+		elif [[ ! $servicefile =~ \.healthcheck$ ]]; then error "Not a passive nagios service: $servicefile (should have .healthcheck extension)"; fi
+		# This is the first moment at which the potential invalidity of $user becomes relevant
+		[[ -v user ]] || error "'user' variable must be set in $servicefile, preferably to \$ATL_SERVICES_USER or root"
+		id -u "$user" >/dev/null || error "User '$user', specified in $servicefile, does not exist on this system"
+		if [[ -v run_on_install ]]; then
+			{
+				export PATH=.:"$PATH"
+				cd "$(dirname "$servicefile")"
+				# FIXME: do we need an 'eval' here?
+				if ! $run_on_install; then
+					return
+				else
+					:
+					#log "$servicefile run_on_install command completed"
+				fi
+			}
+		fi
+		tmpfile="$(mktemp)"
+		cat >"$tmpfile" <<-EOF
+			# Service automatically derived from $servicefile at $(date). Edit that file and regenerate with '$(basename "$0")${prefix:+ --prefix=${prefix#-}}'
+			# See also the generated cron script at $cronfile
+			define service{
+			service_description  $service
+			# Not actually shown in the UI unfortunately
+			display_name		$service_description
+			use                    $use
+			${nagios_host:+host    $nagios_host}
+			freshness_threshold  $freshness_threshold
+			${notification_interval:+notification_interval	$notification_interval}
+		EOF
+		for allowedprop in max_check_attempts notifications_enabled; do
+			if [[ -v $allowedprop ]]; then
+				echo "$allowedprop		${!allowedprop}" >>"$tmpfile"
+			fi
+		done
+		cat >>"$tmpfile" <<-EOF
+			register   1
+			}
+		EOF
+		chmod 644 "$tmpfile" # File will be owned by root
+		mv "$tmpfile" "$nagiosfile"
+		sudo -u nagios test -r "$nagiosfile" # Verify nagios has read access
+
+		uninstall_pre_rename_service
+
+		# FIXME: At some point we should drop .env/ and instead set the $requiredvars variables explicitly in the crontab.
+		# This removes an external dependency, and lets use reuse this script to set non-ATL_MANAGE healthcheck scripts. However:
+		# - If the $ATL_MANAGE script is modified to require an extra dependency, the crontab needs regenerating to set the dep.
+		# - During testing, it would be easy to rely on the presence of a var not defined in $requiredvars. We need to figure out a way to strip down the environment at all times.
+		# 6/Dec/22: Added PATH, so PHP apps find the correct PHP version in ATL_APPDIR/bin
+		# 20/Apr/23: Replace ATL_APPDIR/bin with ATL_APPDIR/.appinfo/bin
+		# 2/May/23: Replace ATL_APPDIR/.appinfo/bin/ with ATL_APPDIR/.env
+		cat >"$cronfile" <<-EOF
+			# Cron job automatically derived from $servicefile at $(date). Edit that file and regenerate with '$(basename "$0")'
+			# See also the generated $ATL_MONITORING service definition at $nagiosfile
+			PATH=$ATL_APPDIR/.env:/bin:/usr/sbin:/usr/bin:/sbin:
+			SHELL=/bin/bash
+			$croninterval $user $cmd
+		EOF
+		chmod 644 "$cronfile" # cron won't run crontabs with g+w
+		# Update: .cfg files should have their permissions granted in a .hgpatchscript/* file, not here
+		if [[ $user != root ]]; then
+			# If the runtime user (typically $ATL_SERVICES_USER) isn't root, ensure it can access the .healthcheck script
+			setfacl -m user:"$user":rX "$servicefile"
+			setfacl -m user:"$user":rX "$(dirname "$servicefile")" # Typically monitoring/
+			setfacl -m user:"$user":rX "$ATL_APPDIR"
+			# Our script running as $user will need to write to the log and lock directories
+			setfacl -m user:"$user":rwX "$ATL_LOGDIR"
+			setfacl -m user:"$user":rwX "$ATL_LOCKDIR"
+		fi
+		validate_user_can_read_all "$user" "$servicefile"
+		# nagiosify may submit passive results via nsca-ng or may submit them directly to the $ATL_MONITORING/Icinga external command file. If the latter, our $user needs write access to the command file, which we grant here.
+		if [[ ! -v ATL_MONITORING_HOST ]] || [[ $ATL_MONITORING_HOST = localhost ]]; then
+			if [[ $user != root ]]; then
+				debug "nsca-ng: Ensuring $user can write to $ATL_MONITORING external command file"
+				setfacl -m u:"$user":rX "$(dirname "$monitoring_commanddir")" # In nagios4 the 'other' user cannot rx the directory
+				setfacl -R -m u:"$user":rwX "$monitoring_commanddir"
+				# The .cmd file is regenerated every time the nagios/icinga service is restarted. Therefore in addition to granting rwX to $user directly (above), we also set a default ACL on the directory, which the newly created .cmd file will use.
+				# Note that atl_install_monitoring also modifies the default ACL, granting u:www-data:rw so that Apache can submit changes. This change is additive.
+				setfacl -R -d -m u:"$user":rwX "$monitoring_commanddir"
+			fi
+		else
+			log "nsca-ng is assumed to be used to submit result"
+		fi
+		validate_user_can_read_all "$user" "$monitoring_commanddir"
+
+		# Note that atl_setup will ensure that all users can rX $ATL_MANAGE/monitoring (nagiosify, etc)
+
+		log "$ATL_MONITORING passive service installed: ($nagiosfile $cronfile)	(derived from $servicefile)"
+		echo "$servicefile" >> "$runnable" # To tell the caller we succeeded
+		;;
+	uninstall)
+		rm -f "$cronfile" "$nagiosfile"
+		;;
+	run)
+		# Run the service right now. As this does slow rsnapshot and tarsnap backups, do it only once per day to keep my sanity
+		# Run with sudo instead of su to avoid quoting nightmare. https://serverfault.com/questions/374182/bash-quoting-for-sudo-su-user-c
+		set -x
+		"$ATL_MANAGE"/lib/run_only_once_per day \
+			sudo --preserve-env=PATH,ATL_LOCKDIR,ATL_LOGDIR -u "$user" bash -c "$cmd"
+		set +x
+		;;
+	*)
+		error "Unknown action: $action"
+		;;
+	esac
+)
+
+# If a service is renamed (e.g. foo.healthcheck to bar.healthcheck), then the monitoring config snippet /etc/nagios4/conf.d/jira-foo.cfg and cron.d snippet /etc/cron.d/jira-foo need removing, to be replaced with artifacts derived from the new script. This function handles the removal, based on an 'old_name:' property in the healthcheck descriptor.
+uninstall_pre_rename_service() {
+	if [[ -v old_name ]]; then
+		for conffile in "$monitoring_confdir/${ATL_SHORTNAME}${prefix}-$old_name.cfg" "/etc/cron.d/${ATL_SHORTNAME}${prefix}-$old_name"; do
+			if [[ -f "$conffile" ]]; then
+				warn "$old_name service was renamed to $service. Deleting $conffile"
+				rm "$conffile"
+			fi
+		done
+	fi
+}
+
+nagiosfriendly() {
+	#
+	# https://assets.nagios.com/downloads/nagioscore/docs/nagioscore/3/en/configmain.html
+	sed -e "s/[~!$%^&*\"|'<>?,()=]//g"
+}
+
+main "$@"

@@ -1,0 +1,28 @@
+#!/bin/bash
+# Checks that the app is running on prod and *not* running on standby.
+#
+# Invoked from $ATL_APPDIR/replication/replication_app_running.healthcheck
+
+set -x
+if [[ -v ATL_REPLICATION_PRIMARY ]]; then
+	expected=up
+elif [[ -v ATL_REPLICATION_STANDBY ]]; then
+	expected=down
+else
+	expected=up
+fi
+
+if pgrep -f "java .*($ATL_APPDIR|$ATL_APPDIR_BASE/current)" > /dev/null;
+
+then
+	status=up
+else
+	status=down
+fi
+
+if [[ $status != "$expected" ]]; then
+	echo "$ATL_SHORTNAME is $status"
+	exit 2
+else
+	echo "OK; $ATL_SHORTNAME is $status (as expected)"
+fi

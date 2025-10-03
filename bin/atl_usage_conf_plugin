@@ -1,0 +1,30 @@
+#!/bin/bash -eu
+# Given a Confluence plugin key, a) finds recent usages of the plugin's macros, and then calculates the number of pageviews each containing page had. This gives an idea not only of whether the plugin is used, but whether the pages it is used in are viewed.
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+# shellcheck source=/opt/atl_manage/lib/http.sh
+source "$ATL_MANAGE/lib/http.sh" --
+
+main() {
+	pluginkey="$1"
+
+	macrolist=$(atl_plugin_macros "$pluginkey" | xargs -i echo "'{}'" | tr '\n', ',' | sed 's/,$/\n/')
+	if [[ -z $macrolist ]]; then
+		echo >&2 "No macros"
+	else
+		log "Searching for macros: $macrolist"
+		# HACK: geturlfile caches by URL, ignoring data-urlencode variations. Disable the cache with CACHETIMEOUT=0
+		cat "$(CACHETIMEOUT=0 geturlfile "/rest/api/content/search?limit=25" -G --data-urlencode "cql=(macro in ($macrolist)) order by created desc")" | jq -r '(.results[] | ._links.webui + "\t" + .title + "\t\t")'
+	fi
+}
+
+usage() {
+	echo >&2 "Usage: $0 <pluginkey>"
+	exit 1
+}
+
+if [[ $# -ne 1 ]]; then
+	usage
+else
+	main "$@"
+fi

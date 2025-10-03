@@ -1,0 +1,70 @@
+#!/usr/bin/env ruby
+## Nagios check that gets JSON from $ATL_BASEURL/status.php showing PHP settings relevant to Jethro, and ensures they are all correct.
+## Referenced in $ATL_APPDIR/monitoring/nagios.cfg
+
+require 'json'
+require 'uri'
+require 'net/http'
+require 'open-uri'
+
+NAGIOS_OK=0
+NAGIOS_WARNING=1
+NAGIOS_CRITICAL=2
+NAGIOS_UNKNOWN=3
+
+product = ENV["ATL_PRODUCT"] or raise "ATL_PRODUCT is unset"
+product == "jethro" or exit(NAGIOS_CRITICAL)
+# Check that the php-fpm pool is running as the correct user, and has had max_input_vars increased
+# 7/May/23: Also check the upload size is non-default >2Mb
+# 11/Jun/23: Upcreate post_max_size and upload_max_filesize to 20Mb to allow for Jethro's Mailchimp sender to send large attachments.
+baseurl=ENV["ATL_BASEURL"] or raise "ATL_BASEURL is unset"
+uri = baseurl+"/status.php"
+begin
+  # If we ever need to ignore the SSL cert, use:
+  # response = URI.open(uri, :ssl_verify_mode => OpenSSL::SSL::VERIFY_NONE).read
+  response = URI.open(uri).read
+rescue OpenURI::HTTPError => error
+  puts "HTTP Error: #{error.io.status}"
+  exit(NAGIOS_CRITICAL)
+end
+
+statusjson = JSON.parse(response)
+errs=[]
+MIV=10000
+val=statusjson["max_input_vars"]
+val >= MIV or errs << "max_input_vars is #{val} but must be over #{MIV}"
+PMS=20
+val=statusjson["post_max_size"]
+val >= PMS or errs << "post_max_size is #{val} but must be over #{PMS}"
+UMF=20
+val=statusjson["upload_max_filesize"]
+val >= UMF or errs << "upload_max_filesize is #{val} but must be over #{UMF}"
+DBCR="utf8mb4"
+val=statusjson["db_charset_results"]
+val == DBCR or errs << "db_charset_results is '#{val}' but must be '#{DBCR}'"
+val=statusjson["user"]
+if ENV["ATL_MULTITENANT"] and ENV["ATL_MULTITENANT"] == "true" then
+  USER=ENV["ATL_TENANT_USER"]
+  if USER then
+    val == USER or errs << ("Multitenant runtime user is #{val} but is expected to be '#{USER}' (ATL_TENANT_USER)")
+  else
+    errs << "ATL_TENANT_USER is not defined. We need to check if the actual PHP runtime user, '#{val}', is correct"
+  end
+else
+  USER=ENV["ATL_USER"]
+  val == USER or errs << ("Single tenant runtime user is #{val} but is expected to be '#{USER}' (ATL_USER)")
+end
+["gd", "xml", "curl", "json", "zip"].each { |req|
+  statusjson["extensions"].member? req or errs << "#{req} extension not installed"
+}
+val=statusjson["mod_unique_id_loaded"]
+val==true or errs << "mod_unique_id Apache module is not enabled (#{val})"
+
+if errs.empty? then
+  puts "OK;"
+else
+  puts errs.join(". ")
+  exit NAGIOS_WARNING
+end
+
+`/usr/lib/nagios/plugins/check_http "$@" --ssl --sni -H "${ATL_MULTITENANT:+admin.}$ATL_FQDN"  -u '/status.php' -e '200' -w 8 -c 20`

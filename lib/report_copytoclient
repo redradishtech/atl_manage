@@ -1,0 +1,38 @@
+#!/bin/bash -eu
+## RR-specific script (perhaps should be in another report), which copies a Confluence upgrade report to a client Confluence instance.
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+# Necessary for the 'grep -v's
+set -o pipefail
+
+main() {
+	local pagetitle
+	pagetitle="$(for profile in $ATL_DOC_PROFILES; do
+	log "Considering $profile"
+	(
+		atl load "$profile" # &>/dev/null
+		echo "$ATL_PRODUCT_CAPITALIZED $ATL_NEWVER, "
+	)
+	done  | xargs | perl -pe 's/,$//g') Upgrades"
+	log "Copying from space=«$ATL_DOC_SPACE» page=«$pagetitle» to $ATL_DOC_CONFLUENCE_PUBLISH_URL space=«ATL_DOC_CONFLUENCE_PUBLISH_SPACE»"
+	cmd=(redradish_confluence.sh --action copyPage --space "$ATL_DOC_SPACE" \
+		--title="$pagetitle" \
+		--targetServer "$ATL_DOC_CONFLUENCE_PUBLISH_URL")
+		if [[ -v ATL_DOC_CONFLUENCE_PUBLISH_TOKEN ]]; then
+			cmd+=(--targetToken "$ATL_DOC_CONFLUENCE_PUBLISH_TOKEN")
+		else
+			cmd+=(--targetUser "$ATL_DOC_CONFLUENCE_PUBLISH_USERNAME"
+			--targetPassword "$ATL_DOC_CONFLUENCE_PUBLISH_PASSWORD")
+		fi
+		cmd+=(--newSpace "$ATL_DOC_CONFLUENCE_PUBLISH_SPACE"
+		--parent "$ATL_DOC_CONFLUENCE_PUBLISH_UPGRADESPAGE"
+		--descendents --copyAttachments --copyLabels --findReplaceRegex 'name="include_annotated":name="include"' --findReplaceRegex 'name="Page":name=""' --replace)
+
+	log "${cmd[@]@Q}" "$@"
+	"${cmd[@]}" "$@"
+
+
+}
+
+main "$@"

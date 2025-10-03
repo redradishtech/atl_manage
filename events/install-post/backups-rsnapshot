@@ -1,0 +1,95 @@
+#!/bin/bash -eu
+shopt -s extglob
+## Install rsnapshot backup crontab and ensure required packages are installed.
+set -o pipefail
+
+install-post() {
+
+	validate_rsnapshot_version() {
+		rsnapshotver=$(dpkg-query -f='${Version}' -W rsnapshot)
+		if [[ ${rsnapshotver:0:1} -le 1 ]] && [[ ${rsnapshotver:2:1} -le 3 ]]; then
+			error "rsnapshot is too old (it is in 14.04.3 anyway). It requires a bugfix made in 1.3.1-7 (use 'apt-cache policy rsnapshot' to see what's available). See https://bugs.launchpad.net/ubuntu/+source/rsnapshot/+bug/1400283"
+
+		fi
+
+	}
+
+	pkginstall rsnapshot
+	validate_rsnapshot_version
+	create_backup_directories
+	check_backup_permissions
+
+	[[ $ATL_BACKUP_TYPES =~ rsnapshot ]] || exit 0 # Exit immediately if we don't want rsnapshot backups
+	atl_install_monitoring_services "$ATL_APPDIR"/backups/backup-rsnapshot.healthcheck
+	installcron "$ATL_APPDIR/backups/rsnapshot-rotations.cron"
+	[[ ! -f "$ATL_APPDIR"/backups/backup-rsnapshot-fresh.nagioscheck.sh ]] || fail "Deadnaming backup-rsnapshot-refresh.nagioscheck.sh"
+	# Install backup-rsnapshot-fresh.healthcheck, and any others (backup-rsnapshot-valid.healthcheck etc)
+	for hc in "$ATL_APPDIR"/backups/backup-rsnapshot-*.healthcheck; do
+		atl_install_monitoring_services "$hc"
+	done
+}
+
+uninstall-pre() {
+	log "Uninstalling rsnapshot (if previously installed)"
+	atl_uninstall_monitoring_services "$ATL_APPDIR"/backups/backup-rsnapshot.healthcheck
+	uninstallcron "$ATL_APPDIR/backups/rsnapshot-rotations.cron"
+	for hc in "$ATL_APPDIR"/backups/backup-rsnapshot-*.healthcheck; do
+		atl_uninstall_monitoring_services "$ATL_APPDIR"/backups/backup-rsnapshot-fresh.healthcheck
+	done
+}
+
+deactivate() {
+	uninstall-pre
+}
+
+# Ensure we have a valid rsnapshot backup before upgrading
+upgrade-running-pre() {
+	if [[ $ATL_ROLE =~ prod ]]; then
+		"$ATL_APPDIR"/backups/backup-rsnapshot-fresh.healthcheck || error "Our rsnapshot backups are STALE, and cannot be relied upon should this upgrade go wrong."
+	fi
+	if [[ -v ATL_ZFS ]] && [[ $(zfs get acltype -H -o value "$ATL_ZFSPOOL") != posix ]]; then
+		warn "FIXME: if the filesystem is ZFS, then atl_upgrade_database_backup will FAIL unless 'zfs get acltype \$ATL_ZFSPOOL' is 'posixacl'"
+	fi
+}
+
+upgrade-stopped-pre() {
+	final_backup() {
+		if [[ $ATL_ROLE =~ prod || $ATL_ROLE = preprd ]]; then
+			log "Tagging our most recent rsnapshot backup.."
+			cd "$ATL_BACKUP_ROOT"
+			# rsync instead of 'cp -al' because a past upgrade attempt might have created the destination directory
+			rsync -raHkl hourly.0/ "$ATL_VER"-before-upgrade-to-"$ATL_NEWVER" --link-dest=../hourly.0 --delete
+			log "Most recent rsnapshot backup is stored at \$ATL_BACKUP_ROOT/$ATL_VER-before-upgrade-to-$ATL_NEWVER"
+		else
+			log "Skipping pre-upgrade rsnapshot on non-prod ($ATL_ROLE) server"
+		fi
+	}
+	final_backup
+}
+
+enabled() {
+
+	if [[ -z $ATL_BACKUP_TYPES ]]; then
+		warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+		warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+		warn "ATL_BACKUP_TYPES is blank. It should be set, even on sandboxes, if prod does backups (which they always do)"
+		warn "Check the profile files to see if ATL_BACKUP_TYPES is being unset, and find out why, and see if it conflicts with backupmirror's need to see what ATL_BACKUP_TYPES is"
+		warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+		warn "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+	fi
+	# ATL_BACKUP_TYPES will be 'rsnapshot' even on sandbox servers that don't do rsnapshot backups. Thus, we check ATL_ROLE here. This is because backupmirrors need to know what BACKUP_TYPES are set even if they don't actively make the backups. See comment in lib/profile.sh
+	# HACK: A client wanted rsnapshot backups on a dev server, which broke the previous simple rule. Introduced the ATL_BACKUP_RSNAPSHOT_ENABLED_OVERRIDE override.
+	[[ ${ATL_BACKUP_TYPES:-} =~ rsnapshot ]] || {
+		echo "ATL_BACKUP_TYPES does not contain 'rsnapshot'"
+		return 1
+	}
+	[[ -v ATL_BACKUP_RSNAPSHOT_ENABLED_OVERRIDE && $ATL_BACKUP_RSNAPSHOT_ENABLED_OVERRIDE = true ]] || [[ $ATL_ROLE =~ prod || $ATL_ROLE =~ preprd || $ATL_ROLE =~ standby ]] || {
+		echo "ATL_ROLE is '$ATL_ROLE', not prod, preprd or standby, and ATL_BACKUP_RSNAPSHOT_ENABLED_OVERRIDE is not set"
+		return 1
+	}
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.backups-common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.backups-common.sh
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh

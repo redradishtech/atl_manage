@@ -1,0 +1,12 @@
+#!/bin/bash
+## Run check_appdeployment on startup, with non-fatal errors on prod
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+atl_check_appdeployment
+case $? in
+2) exit 2 ;; # errors
+1) exit 0 ;; # warnings
+*) exit 0 ;; # ok or unexpected
+esac

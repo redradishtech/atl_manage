@@ -1,0 +1,93 @@
+#!/bin/bash -eu
+# Restore a backup copied from production (by atl_primarybackup_fetch)
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+set -o pipefail
+
+main() {
+	# At some point we hardcoded this to 'hourly.0'. Why was that?
+	backup_instance="${1:-hourly.0}"
+	#if [[ ! $backup_instance =~ (hourly|daily|weekly|monthly)\.[0-9] ]]; then
+	#	error "Usage: $0 [rsnapshot_interval]\ne.g. $0 hourly.0"
+	#fi
+
+	# Dec/22: no longer used?
+	#[[ -v ATL_BACKUPMIRROR_SOURCE_UID ]] || error "Please define ATL_BACKUPMIRROR_SOURCE_UID"
+	[[ -v ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT ]] || error "Please define ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT"
+	[[ -v ATL_BACKUPMIRROR_SOURCE_DATABASE ]] || error "Please define ATL_BACKUPMIRROR_SOURCE_DATABASE"
+
+	[[ $ATL_ROLE != prod ]] || error "This script restores data from a production backup. It is intended to be run on dev servers, not $ATL_ROLE"
+	"$ATL_MANAGE/monitoring/plugins/check_backupmirror_freshness"
+	atl_maintenance check
+	atl_stop &
+	wait_for_stop
+	wait                                            # In case wait_for_stop completed before atl_stop (i.e. the server was already stopped)
+	[[ "$*" =~ --no-database ]] || restore_database # Restore the db first as it prompts the user for confirmation, which we want to get over and done with early so the invoker can then go do other things
+	[[ "$*" =~ --no-home ]] || restore_homedir
+	# Trigger an event. My use-case is when the backupmirror is taken from a standby (LO), which has a READONLY_STANDBY marker file that we want to remove locally after the restore.
+	# TODO: we might consider triggering a *-post event for every atl_* script (e.g. atl_upgrade). That could be done in a trap. Let's accumulate more actual use-cases before doing that.
+	atl_event backupmirror_restore-post
+}
+
+restore_database() {
+	log "Now restoring backup database"
+	set +x
+	atl_psql -tqAXc 'select 1' && atl_dropdb
+	atl_createdb
+	#
+	# An estimate of size of uncompressed SQL. Used in 'pv'
+	pkginstall pv
+	restoresize=$(($(du -s "${ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT:?}/$backup_instance/database/$ATL_BACKUPMIRROR_SOURCE_DATABASE" | awk '{print $1}') * 6740))
+	log "Latest database files: $(findlatest "${ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT:?}/$backup_instance/database/$ATL_BACKUPMIRROR_SOURCE_DATABASE")"
+	# Letting pg_restore do the database restore would be nice, as we could use -j to parallelize it, but that wouldn't let us interject pg_renameowner.sh. Also, it means 'postgres' has to have read access to the dir (hence the setfacl)
+	#cpucount=$(grep -c ^processor /proc/cpuinfo)
+	#$SUDO setfacl -m u:postgres:rX $ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT{,/hourly.0{,/database{,/**}}}
+	#atl_pg_restore --super -j $cpucount ${ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT:?}/$backup_instance/database/$ATL_BACKUPMIRROR_SOURCE_DATABASE -d "$ATL_DATABASE" || warn "Errors in the pg_restore. We **assume** they were harmless, and will proceed"
+	# Note: If pg_restore dies with a cryptic 'unsupported version (1.14)' error, add --host=localhost. See https://stackoverflow.com/questions/59455783/pg-restore-archiver-unsupported-version-1-14-in-file-header
+	(
+		set -x
+		flock --exclusive 200
+		flock --shared 201 # Lock to wait on $ATL_MANAGE/backupmirror/sync_backup
+		# The backup will be owned by 'root' but pg_restore runs as 'postgres' (regardless of who initiates it) so we need to grant permission first.
+		setfacl -R -m u:postgres:rX "${ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT:?}/$backup_instance/database"
+		atl_pg_restore -f - "${ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT:?}/$backup_instance/database/$ATL_BACKUPMIRROR_SOURCE_DATABASE" | "$ATL_MANAGE/lib/pg_renameowner.sh" "$ATL_DATABASE_USER" | pv --size "$restoresize" | atl_psql --super -tAXq
+		atl_pg_set "$ATL_PRODUCT" baseurl "$ATL_BASEURL" | atl_psql -tXAq
+		# Tstamp date is set in lib/backup_database
+		atl_pg_set "$ATL_PRODUCT" bannertext "Data last synced $(date -d "$(cat "${ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT:?}/$backup_instance/database/$ATL_BACKUPMIRROR_SOURCE_DATABASE/tstamp")"). ${ATL_BANNER:-}" | atl_psql -tXAq
+	) 200>"$ATL_LOCKDIR"/database.lock 201>"$ATL_LOCKDIR"/backupmirror.database.lock
+}
+
+restore_homedir() {
+	log "Now restoring home dir from backup.."
+	# I don't think ZFS can be treated any differently. We still just rsync
+	#if [[ -v ATL_ZFS ]]; then
+	#	error "Haven't yet figured out how to restore a backup on ZFS"
+	#fi
+	restore_homedir_rsync
+}
+
+restore_homedir_rsync() {
+	rsync=(rsync)
+	# Optionally hardlink to save space. Normally the backup mirror should be independent of test data
+	if [[ ${ATL_BACKUPMIRROR_HARDLINK:-} = true ]]; then rsync+=("--link-dest=${ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT}/$backup_instance/home"); fi
+	case "$ATL_PRODUCT" in
+	jira) rsync+=(--exclude \.jira-home.lock) ;;
+	esac
+	(
+		flock --exclusive 200 # Lock the home dir
+		flock --shared 201    # Lock to wait on $ATL_MANAGE/backupmirror/sync_backup
+		"${rsync[@]}" -raH "${ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT:?}/$backup_instance/home/" "$ATL_DATADIR_BASE/$ATL_VER" -v --delete
+		# Do a quick, shallow chown/chgrp so that the app can at least start. Then later, chown/chrp all files in the background
+		#warn "FIXME: these find checks should be obsolete now $ATL_MANAGE/backupmirror/sync_backup gives a usermap"
+		#set +x
+		#find $ATL_DATADIR/ -maxdepth 2 -uid $ATL_BACKUPMIRROR_SOURCE_UID  -ls -exec chown $ATL_USER {} \;
+		#find $ATL_DATADIR/ -maxdepth 2 -gid $ATL_BACKUPMIRROR_SOURCE_GID  -ls -exec chgrp $ATL_USER {} \;
+		#set -x
+		#find $ATL_DATADIR/ -uid $ATL_BACKUPMIRROR_SOURCE_UID -exec chown $ATL_USER {} \; &
+		#find $ATL_DATADIR/ -gid $ATL_BACKUPMIRROR_SOURCE_GID -exec chgrp $ATL_USER {} \; &
+		#set +x
+	) 200>"$ATL_LOCKDIR"/home.lock 201>"$ATL_LOCKDIR"/backupmirror.home.lock
+}
+
+main "$@"

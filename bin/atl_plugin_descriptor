@@ -1,0 +1,45 @@
+#!/bin/bash -eu
+
+#shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+
+if [[ $# -eq 0 ]]; then
+	echo >&2 "Usage: atl_plugin_descriptor <pluginkey> [--xpath=..]"
+	echo >&2 "Purpose: Prints the plugin descriptor containing the given text (e.g. the plugin key)"
+	exit 1
+fi
+
+findjar() {
+	if [[ $ATL_PRODUCT = confluence ]]; then
+		plugindir=plugins-cache
+	elif [[ $ATL_PRODUCT = jira ]]; then
+		plugindir=plugins/installed-plugins
+	else
+		error "Unhandled product: $ATL_PRODUCT"
+	fi
+	local found=
+	for j in "$ATL_DATADIR/$plugindir"/*.jar; do
+		if unzip -p "$j" atlassian-plugin.xml | grep -q "key=['\"]$1['\"]"; then
+			echo "$j"
+			found=true
+		fi
+	done
+	[[ $found ]] || error "Could not find $ATL_PRODUCT jar containing plugin '$1'"
+}
+
+main() {
+	command -v xmllint >/dev/null || pkginstall libxml2-utils
+
+	pluginkey="$1"
+	shift
+
+	jars="$(findjar "$pluginkey")"
+
+	for j in $jars; do
+		# https://stackoverflow.com/questions/13242469/how-to-use-sed-grep-to-extract-text-between-two-words
+		unzip -p "$j" atlassian-plugin.xml | xmllint -format "$@" -
+	done
+	echo
+}
+
+main "$@"

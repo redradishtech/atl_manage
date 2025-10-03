@@ -1,0 +1,30 @@
+#!/bin/bash -eu
+
+set -o pipefail
+
+install-post() {
+	[[ ! -v ATL_SERVICE_INSTALLED_EXTERNALLY ]] || return 0
+	installservice systemd/"$ATL_SYSTEMD_SERVICENAME".service
+}
+
+uninstall-pre() {
+	if [[ -v ATL_SERVICE_INSTALLED_EXTERNALLY ]]; then
+		# E.g. if we rely on the system'd php-fpm
+		log "Systemd service $ATL_SYSTEMD_SERVICENAME isn't managed by us; not uninstalling"
+		return 0
+	fi
+
+	uninstallservice systemd/"$ATL_SYSTEMD_SERVICENAME".service
+}
+
+# FIXME: should we implement uninstall-post(), removing the /etc/systemd/system/$ATL_SYSTEMD_SERVICENAME.service file? Currently we leave it present but disabled.
+
+upgrade-running-pre() {
+	atl_running || warn "$ATL_SYSTEMD_SERVICENAME is not running" # this will return nonzero exit code if the app is meant to be running (not a standby) and isn't
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh
+
+# Our systemd script now executes $ATL_APPDIR/bin/event, which in turn invokes $ATL_MANAGE/lib/event
+# vim: set ft=sh:

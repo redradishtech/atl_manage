@@ -1,0 +1,4 @@
+#!/bin/bash -eu
+
+[[ -v ATL_ENCRYPTION_AGE_PUBLIC_KEY ]] || fail "The public key to encrypt as must be set in ATL_ENCRYPTION_AGE_PUBLIC_KEY"
+"$ATL_MANAGE/lib/age" -r "$ATL_ENCRYPTION_AGE_PUBLIC_KEY" "$@"

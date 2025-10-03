@@ -1,0 +1,43 @@
+#!/bin/bash -eu
+
+# Invoke tarsnapper with configuration specific to the currently selected app
+
+# tarsnapper isn't so great at exit codes -- it succeeds even if the tarsnap cache is corrupt (https://github.com/miracle2k/tarsnapper/issues/39). Even --print-stats can succeed while creating/deleting a backup fails. So we have to capture the output and grep for output like this:
+
+# Something went wrong with backup job: 'redradish_website'
+# Traceback (most recent call last):
+#   File "/opt/atl_manage/venv/lib/python3.8/site-packages/tarsnapper/script.py", line 391, in run
+#     self.backend.make(job)
+#   File "/opt/atl_manage/venv/lib/python3.8/site-packages/tarsnapper/script.py", line 236, in make
+#     self.call(*args)
+#   File "/opt/atl_manage/venv/lib/python3.8/site-packages/tarsnapper/script.py", line 68, in call
+#     return self._exec_tarsnap(call_with)
+#   File "/opt/atl_manage/venv/lib/python3.8/site-packages/tarsnapper/script.py", line 88, in _exec_tarsnap
+#     raise TarsnapError("tarsnap failed with status {0}:{1}{2}".format(
+# tarsnapper.script.TarsnapError: tarsnap failed with status 1:
+# tarsnap: Sequence number mismatch: Run --fsck
+# tarsnap: Error creating new archive
+# tarsnap: Error exit delayed from previous errors.
+
+runtarsnap() {
+	"$ATL_MANAGE"/venv/bin/tarsnapper -o configfile "$ATL_APPDIR"/backups/tarsnap.conf -o v -c "$ATL_APPDIR/backups/tarsnapper.conf" "$@"
+}
+
+#https://stackoverflow.com/questions/13806626/capture-both-stdout-and-stderr-in-bash
+. <({
+	berr=$(
+		{
+			bout=$(runtarsnap "$@")
+			bret=$?
+		} 2>&1
+		declare -p bout bret >&2
+	)
+	declare -p berr
+} 2>&1)
+echo >&2 "$berr"
+echo "$bout"
+if [[ $bret != 0 ]]; then
+	return $bret
+elif [[ $berr =~ Traceback ]]; then
+	exit 1
+fi

@@ -1,0 +1,3 @@
+#!/bin/bash -eu
+
+tarsnap --configfile "$ATL_APPDIR/backups/tarsnap.conf" "$@"

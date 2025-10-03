@@ -1,0 +1,72 @@
+#!/bin/bash
+## SYNOPSIS: Validates that user directories (LDAP, Crowd, Jira) are working. Called from $ATL_APPDIR/monitoring/userdirectories.healthcheck
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+. "$ATL_MANAGE/lib/common.sh" --nolog
+
+export PATH=$ATL_MANAGE/bin:$PATH
+cd /tmp || exit 1 # $PWD may not be readable, which causes psql to complain with cryptic 'could not change directory to "/root": Permission denied' error
+
+installtablefunc() {
+	# https://stackoverflow.com/questions/24773603/how-to-find-if-a-function-exists-in-postgresql
+	if [[ $(atl_psql --quiet -tAXqc "select exists(select * from pg_proc where proname = 'crosstab');") != t ]]; then
+		echo "Installing tablefunc extension"
+		atl_psql --super -tAXc 'create extension if not exists tablefunc;'
+	fi
+	return $?
+}
+
+if [[ $* =~ --external-directory-used ]]; then
+
+	installtablefunc || {
+		ret=$?
+		echo >&2 "Failed to install crosstab extension"
+		exit $ret
+	}
+	dircount="$(echo "select count(*) from cwd_directory where directory_type != 'INTERNAL';" | atl_psql -tAXq)"
+	[[ $dircount -gt 0 ]] && exit 0 || exit 1
+
+elif [[ $* =~ --install ]]; then
+	installtablefunc || {
+		ret=$?
+		echo >&2 "Failed to install crosstab extension"
+		exit $ret
+	}
+	ldapcount="$(echo "select count(*) from cwd_directory where directory_type = 'CONNECTOR';" | atl_psql -tAXq)"
+	if [[ $ldapcount -gt 0 ]]; then
+		dpkg -s "ldap-utils" >/dev/null || apt-get install ldap-utils # For ldapsearch
+	fi
+	crowdcount="$(echo "select count(*) from cwd_directory where directory_type = 'CROWD';" | atl_psql -tAXq)"
+	if [[ $crowdcount -gt 0 ]]; then
+		dpkg -s "curl" >/dev/null || apt-get install curl
+	fi
+	exit
+fi
+
+# We don't actually want LDAP output filling our logs normally, so redirect stdin (not stdout) to /dev/null
+atl_ldap_users >/dev/null
+
+atl_crowd_userdirectories | while IFS='|' read -r directory_id directory_name url username password; do
+	password="$(decode_password "$password")"
+	# cookieurl gives a nullpointerexception recently.
+	#cookieurl="$url/rest/usermanagement/1/config/cookie"
+	url="${url%/services/}" # The Crowd URL in Jira 8.20.12 seems to append /services/ to the given URL, even though the REST API lives under /rest/, not /services/
+	testurl="$url/rest/usermanagement/1/search?entity-type=user&start-index=0&max-results=1&expand=none"
+	# Ignore output. This script runs very frequently, and errors would fill the log
+	cmd=(curl -sS -k --head -o /dev/null -u "$username:$password" -w "%{http_code}" "$testurl") #notatoken
+	logincode=$("${cmd[@]}")
+	[[ $logincode = 200 ]] || {
+
+		# I thought of putting ${cmd[*]} in the failmsg but it contains a password we don't want in the logs.
+		failmsg="Failed to contact user server URL $testurl (http code $logincode)."
+		if [[ $ATL_ROLE = standby ]]; then
+			failmsg+="; normal for standby"
+			echo >&2 "$failmsg"
+			exit 0
+		else
+			echo >&2 "$failmsg"
+			exit 1
+		fi
+	}
+done

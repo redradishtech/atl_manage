@@ -1,0 +1,31 @@
+#!/bin/bash -eu
+set -o pipefail
+## Assuming an app has been deployed (atl_deploy), 'activate' it by:
+#
+# - symlinking its systemd service definition to the right place, and reloading systemd
+# - symlinking its webserver config file to the right place, and reloading the webserver
+# - creating cron entries for backups, replication, backup mirrors, monitoring checks, log cleanup scripts, etc
+# - set up nagios/icinga monitors for the above
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+main() {
+	if [[ $* =~ --help ]]; then usage "$@"; fi
+	atl_event install-post "$@"
+}
+
+usage() {
+	cat <<EOF
+$*
+Purpose: Activates the current ($ATL_VER) deployed instance of the app: installs systemd, webserver, monitoring, cron scripts, etc.
+
+Possible sub-commands:
+EOF
+	atl_event install-post -- --help
+	exit
+}
+
+main "$@"
+
+# vim: set foldmethod=marker formatoptions+=cro :

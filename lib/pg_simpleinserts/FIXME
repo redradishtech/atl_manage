@@ -1,0 +1,18 @@
+The 'generate' script generates SQL to alter the default id of all non-AO tables:
+```
+insert into primarykeyinfo values ('workflowschemeentity', 'id', 'WorkflowSchemeEntity');
+alter table workflowschemeentity ALTER id SET DEFAULT nextid('workflowschemeentity');
+insert into primarykeyinfo values ('jiraworkflowstatuses', 'id', 'WorkflowStatuses');
+alter table jiraworkflowstatuses ALTER id SET DEFAULT nextid('jiraworkflowstatuses');
+insert into primarykeyinfo values ('worklog', 'id', 'Worklog');
+alter table worklog ALTER id SET DEFAULT nextid('worklog');
+```
+
+To support this, simpleinserts_prelude.plpgsql defines:
+- a 'primarykeyinfo' table
+- an 'updateseq' function
+- a 'nextid' function
+
+Various improvements are needed:
+- jira_print_sequencevalue_table_mappings.sql.sh parses entitymodel.xml to get a list of non-AO tables, then augments it with pk info from information_schema. Why not get the PKs from entitymodel.xml too? Granted, we couldn't go the other way (get the table names from information_schema) because we need the mapped sequence_value_item.seq_name from entitymode.xml
+- ./generate should let the user specify which schema's table to modify. I think we only need to modify rt.* tables usually.

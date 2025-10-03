@@ -1,0 +1,17 @@
+#!/bin/bash -eu
+# Nagios plugin for checking if Confluence's Synchrony editor is happy. Checks the database first to see if synchrony is even enabled, and uses $ATL_BASEURL_IS_AUTH_PROXIED (via check_http_app) to determine if internal or external URL should be checked.
+
+#shellcheck source=/opt/atl_manage/lib/logging.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh --no_profile_needed
+
+synchrony_enabled() {
+	[[ $(atl_psql -tAXqc "select true from bandana where bandanacontext='_GLOBAL' and bandanakey='synchrony_collaborative_editor_app_registered' and bandanavalue='<string>true</string>';") = t ]]
+}
+
+if synchrony_enabled; then
+	# Synchrony is running. Check its heartbeat URL
+	# If check_http_app decides to use the internal URL, it must be Synchrony's port
+	ATL_BASEURL_INTERNAL="${ATL_BASEURL_INTERNAL/:8090/:8091}" exec check_http_app /synchrony/heartbeat -s OK "$@"
+else
+	echo "OK; Collaborative editor is disabled"
+fi

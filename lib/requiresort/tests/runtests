@@ -1,0 +1,71 @@
+#!/bin/bash
+
+main()
+{
+	nofiles() 
+	{
+		out=$(../requiresort)
+		local exitcode=$?
+		local expected=''
+		(( exitcode == 0 )) || fail "Should have succeeded with no files, not with exit code $exitcode"
+		[[ "$out" = "$expected" ]] || fail "Expected «$expected», not «$out»"
+	}
+
+	loop() 
+	{
+		(
+		cd loop
+		../../requiresort -- *.txt
+		)
+		[[ $? != 0 ]] || fail "Should have errored out with self-reference"
+	}
+
+	noreq()
+	{
+		(
+		cd noreq
+		out=$(../../requiresort *.txt)
+		[[ $? == 0 ]] || fail "Expected nonzero exit code"
+		local expected="a.txt"
+		[[ "$out" = "$expected" ]] || fail "Expected «$expected», not «$out»"
+		) 
+	}
+
+	working()
+	{
+		(
+		cd working
+		out=$(../../requiresort *.txt)
+		[[ $? == 0 ]] || fail "Should have exited cleanly"
+		local expected=$'a.txt\nb.txt\nc.txt\nd.txt\nnone.txt'
+		[[ "$out" = "$expected" ]] || fail "Expected «$expected», not «$out»"
+		)
+	}
+
+	nofiles "$@"
+	loop "$@"
+	noreq "$@"
+	working "$@"
+
+
+}
+
+fail()
+{
+	printstacktrace "$@"
+	echo "$*"
+	exit 1
+}
+printstacktrace()
+{
+	set +x   # First turn off +x in case the caller left it on. The caller doesnt want to see the gory details of this function
+	for (( i=0; i<${#BASH_SOURCE[@]}; i++ ))
+	do
+		# Skip the stacktrace lines from this 'printstacktrace' function, or the 'fail' function, or the 'errhandler' ERR trap 
+		if [[ ${FUNCNAME[$i]} =~ ^(printstacktrace|fail|error|errhandler)$ ]]; then continue; fi
+		echo -e >&2 "\t${LO}${BASH_SOURCE[$i]}:${BASH_LINENO[$((i-1))]} ${FUNCNAME[$i]}${RESET}";
+	done
+}
+
+
+main "$@"

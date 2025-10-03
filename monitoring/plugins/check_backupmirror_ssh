@@ -1,0 +1,21 @@
+#!/bin/bash -eu
+## Checks whether the primary can SSH to the standby and SSH back again (with SSH credentials agent-forwarded)
+# This is a necessary prerequisite for filesystem replication to work
+
+#shellcheck source=common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh
+
+main()
+{
+	if [[ -v ATL_BACKUPMIRROR_SOURCE ]]; then
+                # Note, no 'ssh -q', since that suppresses errors
+		# LogLevel=Error suppressed banners but not auth errors (unlike -q). 
+		local hostname_via_ssh=$(sudo -E  -u "$ATL_BACKUPMIRROR_SOURCE_SYNCUSER" "$ATL_MANAGE/backupmirror/remoterun" 'set -x; $ssh_to_backupmirror_source backupmirror_source hostname')
+		[[ $(hostname) = "$hostname_via_ssh" ]] || failwarn "Replication ssh roundtrip failed"
+		echo "OK; SSH roundtrip works"
+	elif [[ -v ATL_BACKUPMIRROR_DESTINATION ]]; then
+		echo "OK; unable to test from standby"
+	fi
+}
+
+main "$@"

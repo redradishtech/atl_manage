@@ -1,0 +1,10 @@
+#!/bin/bash -eu
+# Triggered from systemd
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+[[ ${ATL_ROLE:-} = prod ]] || exit 0
+[[ ${ATL_PRODUCT_RUNTIME_TECHNOLOGY:-} =~ java ]] || exit 0
+
+atl_diagnostic snapshot stop-pre

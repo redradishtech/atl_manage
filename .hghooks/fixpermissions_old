@@ -1,0 +1,497 @@
+#!/usr/bin/env ruby
+#
+# Say you are using Mercurial to store files which must have very particular permissions on the destination server.
+# 
+# Mercurial does not store permissions beyond remembering the executable bit.
+# 
+# Also, if you set unusual permissions (o+r, or setfacl) and then need to 'hg merge', your changes will be lost. 
+#
+# This script stores such extra permissions in a .acls/ directory, with files inside containing setfacl(1) definitions.
+# 
+# For non-MQ, .acls/default stores all permissions.
+#
+# For MQ, .acls/$patch stores permissions for the current patch, and this file is part of the patch, making the patchfile portable.
+#
+# Originally this was intended to be two-way: we would examine the live ACLs, and if a superset of the saved ACL, save the live ACLs to disk.
+# However that didn't pan out, because under MQ:
+#
+# - With MQ, our only operation is 'commit'. We can't tell if we're pushing a change ('hg qrefresh') or pulling ('hg qpush'). So if the live ACL set is just different (neither a subset or subset) of the saved ACL set, we don't know what to do. At best we could cumulatively apply (saved -> live; live -> saved). This means we could never 'setfacl -b ..; hg qrefresh' to remove an ACL, since the 'saved -> live' step would obliterate our FACL change.
+# - With MQ, 'qpop' has no triggers, so we couldn't "unapply" the ACLs from the popped patch. This means if a later patch (issues.redradishtech.com) sets ACLS on atlassian-jira/, that ACL will still be set after qpopping, and would considered 'new' (part of the live set) in any subsequent operation (like qrefresh).
+# - With MQ, Mercurial bulk-applies changes, *then* only bulk-executes commits. So we have the problem of the 'systemd' patch creating systemd/%{ATL_SERVICENAME}.service, which the '_replacetokens' patch later renames. If we 'hg qpush systemd' on its own, this works. If we 'hg qpop -a; hg qpush -a', applying the systemd ACL fails, because systemd/%{ATL_SERVICENAME}.service no longer exists. Fundamentally, ***we cannot reliably know the 'live' ACL state for the commit we're triggered on***, so we cannot move ACLs live → saved.
+# 	To make the basic saved → live stuff work, inspect mercurial to figure out what the file was renamed to
+#
+# - As a commit hook, we can create .acl/* files, but we cannot 'hg add' or 'hg commit' them without risking deadlock with our caller, as the commit hook seems to be in a transaction. This means we can only ask the user to manually commit the acl changes. The UX will never be seamless. 
+# - Furthermore, we can't tell what patch we're on when invoked with 'qnew', so have to resort to an ugly .acl/_mystery_patch hack.
+#
+# 
+# In summary, under MQ we're utterly unable to tell whether we should be updating our saved ACLs, or what the correct 'live' ACLs are for a given patch.
+#
+# None of these problems affect the non-MQ case. We know if we should go saved → live (hg update) or live → saved (hg commit), and there is only one .acl/default file, so we don't have the problem of apportioning ACLs.
+#
+# Since the MQ case is hopeless, we restrict ourselves to treating .acls/* as read-only. 
+#
+
+require 'pp'
+require 'set'
+require 'pathname'
+require 'pry'
+require 'pry-byebug'
+require 'open3'
+
+# https://stackoverflow.com/questions/3264168/how-to-put-assertions-in-ruby-code
+class AssertionError < RuntimeError
+end
+
+def assert &block
+    binding.pry unless yield
+end
+def assertFalse &block
+    binding.pry if yield
+end
+
+def debug(msg)
+	#$stderr.puts "****** " + msg
+end
+
+def log(msg)
+	$stderr.puts "****** " + msg
+end
+
+
+def printenv()
+        puts ENV.each.select { |k,v| k=~/HG_/ }.map { |k,v| "#{k} → #{v}" }.join("\n")
+end
+
+class ACL
+	attr_accessor :file, :owner, :group, :perms
+
+	def initialize(str)
+		state=:init
+		assert { str }
+		@rawstr = str
+		lines = str.split("\n").reverse
+		while l = lines.pop do
+			next if /^\s*$/ =~ l
+			case state
+			when :init then
+				if /# file: (.*)/ =~ l then
+					@file=$1
+					state=:owner
+					next
+				end
+			when :owner then
+				if /# owner: (.*)/ =~ l then
+					@owner = $1
+					state=:group
+					next
+				end
+			when :group then
+				if /# group: (.*)/ =~ l then
+					@group = $1
+					state=:flags?
+					next
+				end
+			when :flags?
+				if /# flags: *(.*)/ =~ l then
+					@flags = $1
+				else
+					lines.push(l)
+				end
+				# Flags is optional
+				state = :perms
+				next
+			when :perms then
+				if /^(default:)?(user|group|mask|other):(.*):(.*)$/ =~ l then
+					@perms  ||= Set.new
+					@perms << {:default => $1, :type => $2, :owner => $3, :flags => $4}
+					next
+				end
+			end
+			raise "Unexpected input: Line «#{l}» is not appropriate for state «#{state}»"
+		end
+	end
+
+	def to_s
+		"#{@file} u:#{@owner} g:#{@group} #{@perms&.to_a&.join(", ")}"
+	end
+
+	def to_facl
+		"# file: "+@file +
+		"\n# owner: "+@owner +
+		"\n# group: "+@group +
+		(@flags ? "\n# flags: "+@flags : "") +
+		"\n" + @perms.collect{ |p| 
+			(p[:default] || "") + p[:type] + ":" + p[:owner] + ":" + p[:flags] }.join("\n")
+	end
+	
+	def merge!(other)
+		raise "Cannot merge ACLs where file is, respectively, #{@file} and @{other.file}" unless @file == other.file
+		raise "Cannot merge ACLs where owner is, respectively, #{@owner} and @{other.owner}" unless @owner == other.owner
+		raise "Cannot merge ACLs where group is, respectively, #{@group} and @{other.group}" unless @group == other.group
+		# This is equivalent to '@perms += other.perms; @perms.uniq!', except it keeps permission type order ('user', 'group', 'other')
+		@perms = @perms.group_by { |p| p[:type] }	# E.g. {:user → [[:type → "user", :owner → "joe", :flags → "r-x"], …], :group → [ … ] }
+			.merge(other.perms.group_by { |p| p[:type] }) { |key,a,b| a+b } # Merge hashes, union'ing permission grants where necessary
+			.transform_values { |perm_arr| perm_arr.uniq! }	# Eliminate dups
+			.values	 # Ignore the keys, which were just there to let us merge permissions of like types together
+			.flatten # One flat array
+			.to_set
+		self
+	end
+
+	def ==(other)
+		@file == other.file && @owner == other.owner && @group == other.group && @perms == other.perms
+	end
+
+	def eql?(other)
+		self==other
+	end
+
+	def hash
+		@file.hash ^ @owner.hash ^ @group.hash ^ @perms.hash
+	end
+
+
+	def <(other)
+		raise "ACLs are on different files, so cannot meaningfully compare" unless @file==other.file
+		assert { @owner == other.owner }
+		assert { @group == other.group }
+		@perms < other.perms
+	end
+	def >(other)
+		raise "ACLs are on different files, so cannot meaningfully compare" unless @file==other.file
+		assert { @owner == other.owner }
+		assert { @group == other.group }
+		@perms > other.perms
+	end
+end
+
+class ACLSet
+		
+	MYSTERYPATCH='.acl/_mystery_patch'
+
+	# Returns an ACLSet of the saved ACLs on disk, either .acl/default or .acl/$patch depending on the commit origin
+	# FIXME: this is not actually a good representation of 'the state of ACLs as it should be at this commit', because earlier patches might have set ACLs on the same files. We really need to find all sources applied to date ('.acl/default', '.acl/patch1') and merge them.
+	def ACLSet.saved_acls(commit_id)
+		if !Pathname(".hg/patches").exist? then
+			patchfile=".acl/default"
+		elsif !Pathname(".hg/patches/status").exist? then
+			patchfile = MYSTERYPATCH
+		else
+			# HACK: when we 'hg add foo; hg qnew -f foopatch', the commit hook fires, but we have no idea what the patch name ('foopatch') is. IT's not in the commit history, and only appears in .hg/patches/status after the commit hook. So the workaround is to save the ACL as .acl/_mystery_patch, and on the next operation rename it.
+			statusfile = Pathname('.hg/patches/status')
+			hash_to_patch = Hash[*statusfile.read.split(/[:\n]/)]
+			if hash_to_patch.key?(commit_id) then
+				patchfile = ".acl/" + hash_to_patch[commit_id]
+				mystery = Pathname(MYSTERYPATCH)
+				if mystery.exist? then
+					case `hg status #{MYSTERYPATCH}`[0]
+					when '?' then
+						mystery.rename(patchfile)
+						log "Now hg-adding #{patchfile}"
+						`hg add #{patchfile}`
+					when '' then
+						log "Now hg-renaming #{mystery} to #{patchfile}"
+						`hg mv #{mystery} #{patchfile}`
+					end
+				end
+			else
+				# Patchqueue exists, but no patches exist yet. probably first patch
+				patchfile = MYSTERYPATCH
+			end
+		end
+		if patchfile == MYSTERYPATCH then
+			log "We are unable to determine the patch name at this point. Please 'hg qrefresh' to fix"
+		end
+		ACLSet.new(patchfile)
+	end
+
+	def ACLSet.pathpermutations(path)
+		path.split('/').inject([]) { |arr,s| arr << (arr.empty? ? s : arr.last + "/" + s) }
+	end
+
+	# Mercurial will apply a set of patches, and only then run the commit hooks, one by one. This is a problem for the 'systemd' patch, whose 'systemd/%{ATL_SERVICENAME}.service' file is later renamed, meaning that the file in the ACL doesn't exist *if* the patches are applied in bulk.
+	# The solution here is to figure out the new filename, and substitute that instead.G
+	def ACLSet.trackrenames(files, commit_id)
+		files_exist = files.group_by { |f| File.exist?(f) }
+		if !files_exist[false] then return files; end
+		renamed_file_map = `hg log -r #{commit_id}..tip -T '{file_copies}'`.scan(/(.*) \((.*)\)/).map(&:reverse).to_h
+		renamedfiles = files_exist[false].collect { |f|
+			renamed_file_map[f] if renamed_file_map.key? f
+		}.compact
+		return files_exist[true] + renamedfiles
+
+	end
+
+	# Returns an ACLSet representation of live 'getfacl' output of files in a commit
+	def ACLSet.live_acls_for(commit_id)
+		if !commit_id.include? `hg id`.split.first then
+			debug "Warning: batch-applying. The ACLs applied to this commit's files may have been set by later ACL files. Also, the files may have been renamed or deleted by later patches"
+		end
+		# If hg tells us 'nagios/nagios.cfg' was added, we must consider both 'nagios' and 'nagios/nagios.cfg', as both may have ACLs
+		addedfiles=`hg status -amn0 --change #{commit_id}`.split(/\u0000/).collect { |path| ACLSet.pathpermutations(path) }.flatten.uniq
+		if addedfiles.empty? then return ACLSet.new("live", Set.new); end
+		debug "We added files: #{addedfiles}"
+		addedfiles = trackrenames(addedfiles, commit_id)
+		# https://medium.com/zendesk-engineering/running-a-child-process-in-ruby-properly-febd0a2b6ec8
+		stdout, status = Open3.capture2('getfacl', '-s', *addedfiles)
+		assert { status.success? }
+		acls = from_string(stdout)
+		debug "Got facls #{acls}"
+		ACLSet.new('live', acls)
+	end
+
+	# Returns the relevant subset of this ACLSet applicable to a commit.
+	# For an ACLSet based on .acl/$patch this will equal the original ACLSet, since commits derived from patches include all files
+	# For an ACLSet based on .acl/default this will be a real subset of .acl/default for the current commit's files
+	def for_commit(commit_id)
+		addedfiles=`hg status -amn0 --change #{commit_id}`.split(/\u0000/).collect { |path| ACLSet.pathpermutations(path) }.flatten.uniq
+		ACLSet.new(@src, @acls.group_by { |acl| acl.file }.slice(*addedfiles).values.flatten.to_set)
+	end
+
+	# Append new facls
+	def merge!(other)
+		debug "Merging #{other.acls} into our acl: #{acls}"
+		# Note that we retain our @src
+		@acls += other.acls   # Union of sets of facls; this eliminates simple overlaps, but not the case when an ACL on a file is a strict superset of another ACL on the same file -- we'd want to eliminate the second weaker ACL
+		@acls -= @acls.classify { |acl| acl.file }
+			.each_value { |aclhash| 
+				unnecessary = aclhash.to_a.combination(2).collect { |acl1, acl2|
+					if acl1 > acl2 then
+						acl2
+					elsif acl2 > acl1
+						acl1
+					end
+				}
+				unnecessary.compact
+			}
+			.values
+			.to_set
+	end
+
+	def save
+		# Serialize self.acls to self.src
+		log "Saving ACL #{@src}"
+		@src.dirname.mkdir unless @src.dirname.exist?
+		@src.write(to_facl)
+		log "ACL changes need to be saved"
+		log "Please run:\n\thg add #{@src}"
+		if /default$/ =~ @src.to_s then
+			log "\thg commit #{@src}"
+			#`hg commit -m "Updating ACLs"`
+		else
+			log "\thg qrefresh"
+			#`hg qrefresh`
+		end
+	end
+
+	def eql(other)
+		self == other
+	end
+
+	def hash
+		@acls.hash
+	end
+
+	include Comparable 
+
+	def <=> (other)
+		if @acls < other.acls; then 
+			return -1
+		elsif @acls == other.acls then
+			return 0
+		elsif @acls > other.acls then
+			return 1
+		end
+		# Our ACLs are not directly comparable
+		nil
+	end
+
+
+	def -(other)
+		ACLSet.new(@src, @acls - other.acls)
+	end
+
+	def initialize(src, acl = nil)
+		if src == "live" then
+			@src = src
+			if acl.is_a?(Set) then
+				@acls = acl
+			elsif acl.is_a?(String) then
+				@acls = ACLSet.from_string(acl)
+			elsif acl.is_a?(Hash) then
+				binding.pry
+			end
+			assert { @acls }
+		else
+			@src=Pathname.new(src)
+			if acl.is_a?(Set) then 
+				@acls = acl
+			else
+				assert { !acl }
+				if @src.exist? then
+					@acls = ACLSet.from_string(IO.read(@src))
+				else
+					# This happens when we have a patchqueue and 'hg update'
+					@acls = Set.new
+				end
+			end
+		end
+		assert { @src }
+		assert { @acls }
+	end
+
+	def to_s
+		"\n\t" + @src.to_s + "::\t«"+@acls.values.collect { |aclset| aclset.to_a.collect { |s|"\t"+s.gsub(/\n/,"\n\t")}.join "\n\n" }.join("\n\n") + "»"
+	end
+
+	def to_facl
+		@acls.collect { |acl| acl.to_facl }.join("\n\n")
+	end
+
+	def make_live
+		return if @acls.empty?
+		Open3.popen2('setfacl', '--restore=-') do |stdin, stdout, thread|
+			stdin.print to_facl
+			stdin.close
+			log "setfacl returned: #{stdout.read}"
+			status = thread.value
+			assert { status.success? }
+		end
+	end
+
+
+
+	attr_reader :src	# ".acl/default" or ".acl/$patch"
+	attr_reader :acls	# Set of ACLs
+
+	def ACLSet.from_string(str)
+		str.split("\n\n")
+			.reject(&:empty?)
+			.collect { |s| ACL.new(s) }   # Convert to array of ACLs
+			.group_by { |acl| acl.file }  # Convert to { f1 →  [f1acl1,f1acl2,…], … } hash
+			.transform_values { |aclarr|  # Merge to { f1 → f1mergedacl, f2 → f1mergedacl, … } hash
+				aclarr.inject { |all,acl|
+					all.merge!(acl)
+				}
+			}
+			.values				# Drop keys to yield [f1mergedacl, f2mergedacl, …] end
+			.to_set
+	end
+end
+
+foo="""# file: foo
+# owner: jturner
+# group: jturner
+user::rw-
+user:root:r--
+user:redradish_jira:r--
+group::rw-
+mask::rw-
+other::r--"""
+
+bar="""# file: bar
+# owner: jturner
+# group: jturner
+user::rw-
+user:root:r--
+group::rw-
+mask::rw-
+other::r--"""
+
+bar2="""# file: bar
+# owner: jturner
+# group: jturner
+user::rw-
+user:redradish_jira:r--
+group::rw-
+mask::rw-
+other::r--"""
+
+barcombo="""# file: bar
+# owner: jturner
+# group: jturner
+user::rw-
+user:root:r--
+user:redradish_jira:r--
+group::rw-
+mask::rw-
+other::r--"""
+
+
+f1="""# file: foo
+# owner: jturner
+# group: jturner
+user::rw-
+user:root:r--
+user:redradish_jira:r--
+group::rw-
+mask::rw-
+other::r--"""
+
+
+#f1acl = ACL.new(f1)
+#fooacl = ACL.new(foo)
+#baracl = ACL.new(bar)
+#bar2acl = ACL.new(bar2)
+#barcomboacl = ACLSet.new("live", bar + "\n\n" + bar2)
+#
+#f1set = ACLSet.new("live", Set[f1acl, baracl])
+#f2set = ACLSet.new("live", Set[f1acl])
+#
+#assert { f2set < f1set }
+#assert { f1set > f2set }
+#
+#### Test to_facl roundtripping of ACL and ACLSets
+#assert { foo == fooacl.to_facl }
+#assert { foo + "\n\n" + bar == ACLSet.new("live", foo + "\n\n" + bar).to_facl }
+#assert { barcombo == barcomboacl.to_facl }
+#
+#### Test that less-than/greater-than operators tell us correctly whether our ACL is a proper subset/superset of another
+#assert { baracl != bar2acl }
+#assertFalse {  bar2acl > baracl }
+#assertFalse {  bar2acl < baracl }
+#assert { barcombo > bar }
+#assert { barcombo >= bar }
+#assert { barcombo > bar2 }
+#assert { barcombo >= bar2 }
+#assert { bar < barcombo }
+#assert { bar2 < barcombo }
+#assert { bar2 <= barcombo }
+#assert { barcombo <= barcombo }
+#
+## For commits we'll have HG_NODE, and for updates we'll have HG_PARENT1
+commit_id = ENV['HG_NODE'] || ENV['HG_PARENT1']
+assert { commit_id }
+#printenv
+
+#case ENV['HG_HOOKTYPE'] 
+saved = ACLSet.saved_acls(commit_id)
+if saved.acls.empty? then exit; end
+live = ACLSet.live_acls_for(commit_id)
+saved_for_commit = saved.for_commit(commit_id)
+#when "commit" then
+case live <=> saved_for_commit
+when 1 then	# live > saved_for_commit
+	# The other happy case where our live ACLs are a strict superset of what we have saved. Merge our live ACLs into our patch
+	log "You might want to save ACLs: #{(live - saved_for_commit).to_facl}"
+	exit
+	saved.merge!(live)
+	saved.save
+when 0 then	# No change needed either way
+	log "No ACL changes needed"
+when -1 then	# saved_for_commit > live
+	# The happy case when our saved ACL is a proper superset of what is live. We can just make the new ACLs live
+	#log "Loading ACLs: #{(saved_for_commit - live).to_facl}"
+	log "Loading ACLs for #{saved_for_commit.acls.collect { |acl| acl.file }.join(', ')}"
+	saved_for_commit.make_live
+when nil then
+	log "Loading ACLs for #{saved_for_commit.acls.collect { |acl| acl.file }.join(', ')}"
+	saved_for_commit.make_live
+	log "You might want to save ACLs: #{(live - saved_for_commit).to_facl}"
+	exit
+	live = ACLSet.live_acls_for(commit_id)
+	saved.merge!(live)
+	saved_for_commit = saved.for_commit(commit_id)
+	log "-"*100 + "\nSaving ACLs: #{(live - saved_for_commit).to_facl}"
+	saved.save
+end

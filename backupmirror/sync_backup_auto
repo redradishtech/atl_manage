@@ -1,0 +1,21 @@
+#!/bin/bash -eu
+# Syncs filesystem from source to destination, logging to $ATL_APPDIR/logs/backupmirror.log, and using a lockfile.
+# Same as 'sync_backup', but intended to be called from cron (/etc/cron.d/$ATL_SHORTNAME-backupmirror) on the source.
+# Note: the lockfile is shared across all apps, so if Jira, Confluence and Crowd all invoke this at the same second, only one at a time will proceed.
+# The '-eu' above is important - we need to pass through our exit status, as when called (indirectly) from $ATL_APPDIR/backups/backupmirror.healthcheck we must return a realistic code.
+
+# We can rely on ATL_ variables being defined.
+
+# shellcheck source=/opt/atl_manage/backupmirror/common.sh
+. "$ATL_MANAGE/backupmirror/common.sh"
+
+if issource; then
+	"$ATL_MANAGE/backupmirror/remoterun" "$ATL_MANAGE/backupmirror/sync_backup_auto $@"
+elif isdestination; then
+	# We're being invoked over SSH by the source. Log output to backupmirror.log and stderr, so the source has a copy.
+	sudo -E "$ATL_MANAGE/backupmirror/sync_backup" "$@"
+	if (($? > 1)); then
+		# sync_backup's exit code will be that of rsync. We need to exit as 0 (OK), 1 (CRITICAL) or 2 (UNKNOWN), so here we interpret non-zero as critical
+		exit 1
+	fi
+fi

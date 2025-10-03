@@ -1,0 +1,19 @@
+Source: nagios-check-many
+Section: net
+Priority: extra
+Maintainer: Matija Nalis <mnalis-debian@axe.tomsoft.hr>
+Build-Depends: debhelper (>= 7.0.50~)
+Standards-Version: 3.8.4
+Homepage: http://debian.tomsoft.hr/
+#Vcs-Git: git://git.debian.org/collab-maint/nagios-check-many.git
+#Vcs-Browser: http://git.debian.org/?p=collab-maint/nagios-check-many.git;a=summary
+
+Package: nagios-check-many
+Architecture: all
+Depends: ${misc:Depends}, ${perl:Depends}, nagios-nrpe-server|icinga-common|icinga-cgi|nagios3
+Recommends: nagios-plugins-basic
+Description: nagios plugin to aggregate results of multiple other nagios
+ plugin checks, returning most critical status of them all and joining
+ performance data. Based on idea presented on 
+ https://nagios-plugins.org/doc/check-many.html as other two 
+ implementations on https://exchange.nagios.org were lacking.

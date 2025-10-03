@@ -1,0 +1,12 @@
+## Extra sshd needed to support replication and remote backups for Atlassian apps.
+# See description in /opt/atl_manage/lib/remote/sshd/ssh_for_atlassianapps.service
+ListenAddress localhost
+Port 1122
+HostKey /etc/ssh/ssh_for_atlassianapps/host_ed25519_key
+PermitRootLogin without-password
+PasswordAuthentication no
+AuthorizedKeysFile /etc/ssh/ssh_for_atlassianapps/authorized_keys
+ChallengeResponseAuthentication no
+UsePAM no
+PrintMotd no
+PrintLastLog no

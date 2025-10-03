@@ -1,0 +1,36 @@
+#!/bin/bash
+## RR-specific script which generates an upgrade report based on $ATL_VER, ATL_NEWVER and other variables.
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+# Necessary for the 'grep -v's
+set -o pipefail
+
+main() {
+	log "Doc Space: $ATL_DOC_SPACE"
+	local apps
+	# -t strips the newline, which is important
+	mapfile -t apps < <(for profile in $ATL_DOC_PROFILES; do
+		log "Considering $profile"
+		(
+			atl load "$profile" &>/dev/null
+			echo "$ATL_LONGNAME:$ATL_PRODUCT_FULL:$ATL_VER:$ATL_NEWVER"
+		)
+		# We used to have '| xargs' after done, but it breaks when 2 apps (jira.x.com, confluence.x.com) are being upgraded, and we want them each on separate lines. Perhaps it was needed for the single app case?
+	done)
+	pkginstall ruby-dev   # required for mkmf for bundle install for this code:
+	cd ~/src/redradishtech/atlassian_app_upgradereport || fail "Missing directory"
+	bundle install
+	set -x
+	bundle exec exe/atlassian_product_upgradereport \
+		--clientspacekey="$ATL_DOC_SPACE" \
+		--productionhost "$ATL_DOC_PRODUCTIONHOST" \
+		--profiledir "$ATL_PROFILEDIR" \
+		"${apps[@]}"
+
+	if [[ $? != 0 ]]; then
+		fail "Note: if this fails with a 401 error, ensure Jira is running"
+	fi
+}
+
+main "$@"

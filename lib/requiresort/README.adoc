@@ -1,0 +1,81 @@
+= requiresort
+
+Given a list of text files containing '@provides <label>' and/or '@requires <label>' , outputs the list so that @provides appear before matching @requires.
+
+USAGE: requiresort [PATH ...]
+
+PATH is zero or more paths to text files.
+
+== Example
+
+Say we have SQL files that create, populate, query, then drop a table, and therefore must be listed in a particular order:
+
+.create.sql
+[source,sql]
+---
+-- @provides person
+CREATE TABLE person (id SERIAL, lastname varchar, firstname varchar, age int);
+---
+
+
+.adults.sql:
+[source,sql]
+---
+-- @requires person
+-- @provides users
+INSERT INTO person (lastname, firstname, age) VALUES ('Joe', 'Shmoe', 39);
+INSERT INTO person (lastname, firstname, age) VALUES ('John', 'Doe', 45);
+---
+
+.children.sql:
+[source,sql]
+---
+-- @requires person
+-- @provides users
+INSERT INTO person (lastname, firstname, age) VALUES ('Jimmy', 'Smith', 10);
+---
+
+
+.query.sql:
+[source,sql]
+---
+-- @requires users
+SELECT avg(age) From person;
+---
+
+.cleanup.sql:
+[source,sql]
+---
+-- @requires users
+DROP TABLE person;
+---
+
+Given these files, `ls` gives the incorrect order for our needs:
+```
+$ ls -1 *.sql
+adults.sql
+children.sql
+cleanup.sql
+create.sql
+query.sql
+```
+
+`requiresort` gives the correct order:
+```
+## Correct order by dependencies
+$ requiresort *.sql
+create.sql
+children.sql
+adults.sql
+query.sql
+cleanup.sql
+```
+
+
+Copyright 2021 Jeff Turner
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+

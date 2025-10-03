@@ -1,0 +1,21 @@
+#!/bin/bash -eu
+
+if [[ ${1:-} = --help ]]; then
+	echo >&2 "Purpose: SQL to print JIRA issues linked to Confluence pages"
+	echo >&2 "Usage: atl_pg_usage_jira_conflinks | atl_psql"
+	echo >&2
+	exit 1
+fi
+
+echo "WITH baseurl AS 
+(select propertyvalue AS baseurl from propertyentry pe JOIN propertystring ps USING (id) WHERE pe.property_key='jira.baseurl')
+SELECT 
+	baseurl || '/browse/' || project.pkey || '-' || jiraissue.issuenum AS pkey
+	, relationship
+	, remotelink.url
+FROM project JOIN jiraissue ON project.id = jiraissue.project
+	JOIN remotelink ON remotelink.issueid = jiraissue.id
+	CROSS JOIN baseurl
+WHERE remotelink.applicationtype='com.atlassian.confluence'
+ORDER BY remotelink.id desc
+LIMIT 5;"

@@ -1,0 +1,71 @@
+#!/bin/bash
+
+## Notify healthchecks.io of a health check on an app's service (e.g. jira rsnapshot backup). The health check is informed of the exit code and stdout.
+# This is typically invoked indirectly from ./notify_all_monitoring.
+#
+# We assume 'slug-based' healthchecks.io reporting, and the caller has to set ATL_MONITORING_HEALTHCHECKS_PING_KEY
+# This script will create a new healthchecks.io monitoring endpoint if it doesn't already exist.
+
+# shellcheck source=/opt/atl_manage/lib/logging.sh
+. "$ATL_MANAGE/lib/logging.sh"
+main()
+{
+	app="$1"
+	service="$2"
+	state="$3"
+	output="$4"
+
+	if [[ ! -v ATL_MONITORING_HEALTHCHECKS_SERVICES ]]; then
+		warn "Not notifying healthchecks.io of anything, as ATL_MONITORING_HEALTHCHECKS_SERVICES is not defined"
+		exit 0
+	fi
+	is_service_notified "$service" || exit 0					# Check if we notify healthchecks.io about $service
+	[[ $ATL_ROLE = prod || $ATL_ROLE == preprd || $ATL_ROLE = standby ]] || exit 0		# Only notify healthchecks.io in production. That includes standby, which in a replication env might be where rsnapshot backups are made
+
+	[[ -v ATL_MONITORING_HEALTHCHECKS_PING_KEY ]] || fail "Please define ATL_MONITORING_HEALTHCHECKS_PING_KEY"
+	URLBASE="https://hc-ping.com/$ATL_MONITORING_HEALTHCHECKS_PING_KEY/$(slugify "$app-$service")"
+	(( state <= 3 )) || { echo >&2 "State must be 0, 1 or 2"; exit 2; }
+	if [[ -n $output ]]; then
+		_curl -fsS --data-raw "$output" "$URLBASE/log?create=1"
+	else
+		_curl -fsS "$URLBASE/log?create=1"
+	fi
+	_curl -fsS "$URLBASE/$state"
+}
+
+_curl() {
+	curl --user-agent "Curl-on-$HOSTNAME/1" -m 10 --retry 5 -o /dev/null "$@"
+}
+
+is_service_notified() {
+	# Given 'backup-tarsnap-fresh backup-rsnapshot-fresh', 'backup-rsnapshot' should not match, but 'backup-rsnapshot-fresh' should.
+	echo "$ATL_MONITORING_HEALTHCHECKS_SERVICES" | sed -e 's/ /\n/g' | grep -q "^$1$"
+}
+
+usage()
+{
+	echo >&2 "Usage: healthchecks_submit <healthcheck_url> <IGNORED> <state> <output>"
+	echo >&2 "Where:"
+	echo >&2 "        state is 0, 1 or 2"
+	exit 2
+}
+
+
+# Convert args into a valid slug (a-z, 0-9, hyphens, and underscores), per https://healthchecks.io/docs/http_api/#success-uuid
+slugify() {
+	echo "${*//[^a-zA-Z0-9_-]/_}"
+}
+
+
+fail()
+{
+	echo >&2 "$1"
+	exit 2
+}
+
+if [[ $# -ne 4 || $* =~ --help ]]
+then
+	usage
+else
+	main "$@"
+fi

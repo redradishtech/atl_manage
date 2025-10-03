@@ -1,0 +1,22 @@
+#!/bin/bash -eu
+set -o pipefail
+
+# https://www.redradishtech.com/display/~jturner/2020/08/14/Nicer+ActiveObjects+tables+for+SQL+queries
+# https://github.com/redradishtech/activeobject_views
+aodir="$ATL_MANAGE/lib/activeobject_views"
+if [[ ! -d "$aodir" ]]; then
+	git clone https://github.com/redradishtech/activeobject_views "$aodir"
+	cd "$aodir"
+else
+	cd "$aodir"
+	git pull
+fi
+
+set -x
+if [[ $(basename "$0") = atl_activeobjects_tables_install ]]; then
+	cat create_views.sql | atl_psql -tAXq | atl_psql -tAXq
+elif [[ $(basename "$0") = atl_activeobjects_tables_uninstall ]]; then
+	cat drop_views.sql | atl_psql -tAXq | atl_psql -tAXq
+else
+	fail "??"
+fi

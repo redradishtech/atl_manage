@@ -1,0 +1,24 @@
+#!/bin/bash -eu
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
+
+main() {
+	set -vx
+	apt-get install -y build-essential zlib1g-dev libssl-dev libreadline6-dev libyaml-dev git sqlite3 libsqlite3-dev
+	if [[ ! -f /usr/local/rbenv/.git/config ]]; then
+		git clone https://github.com/rbenv/rbenv.git /usr/local/rbenv
+	fi
+	if [[ ! -d /usr/local/rbenv/plugins/ruby-build ]]; then
+		mkdir /usr/local/rbenv/plugins
+		git clone https://github.com/rbenv/ruby-build.git /usr/local/rbenv/plugins/ruby-build
+	fi
+	rbenv install 2.3.3
+	rbenv rehash
+	rbenv global 2.3.3
+	gem install bundler
+	set +vx
+
+}
+main "$@"

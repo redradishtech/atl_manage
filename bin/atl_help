@@ -1,0 +1,46 @@
+#!/bin/bash
+fmt="%-20s %s\n"
+fmtdir="%-20s %s (%s)\n"
+
+highlight() {
+	perl -pe 's/_([^ ]+?)_/$ENV{HI}\1$ENV{RESET}/g'
+}
+
+echo "Shortcuts and commands:"
+echo
+echo -e "$({
+	if [[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY != java ]]; then
+		printf "$fmtdir" cdaa "cd to the _a_pplication's _a_pp/ (code) directory" "$ATL_APPDIR/app/"
+	fi
+	printf "$fmtdir" cda "cd to the _a_pplication directory" "$ATL_APPDIR"
+	printf "$fmtdir" cdab "cd to the _a_pp directory _b_ase" "$ATL_APPDIR_BASE"
+	printf "$fmtdir" cdal "cd to the _a_pp _l_og directory" "$ATL_LOGDIR"
+	printf "$fmtdir" cdd "cd to the _d_ata directory" "$ATL_DATADIR"
+	printf "$fmtdir" cddl "cd to the _d_ata _l_ogs  directory" "$ATL_DATALOGDIR"
+	printf "$fmtdir" cddb "cd to the _d_ata directory _b_ase" "$ATL_DATADIR_BASE"
+	printf "$fmtdir" cdb "cd to the _b_ackups directory" "$ATL_BACKUP_ROOT"
+	printf "$fmtdir" cdb0 "cd to the most recent (_0_'th) _b_ackup" "$ATL_BACKUP_ROOT/hourly.0"
+	printf "$fmtdir" cdwl "cd to the _w_eb server _l_ogs directory" "/var/log/$ATL_WEBSERVER/$ATL_LONGNAME"
+	printf "$fmtdir" cdm "cd to the 'atl' scripts home" "$ATL_MANAGE"
+	printf "$fmt" "atl list" "List available app profiles"
+	printf "$fmt" "atl load" "Load a particular app profile"
+	printf "$fmt" "atl monitoring" "Show the status of all the app's ${ATL_MONITORING}-monitored services"
+	case "${ATL_DATABASE_TYPE:-}" in
+	mysql) dbcmd=mysql ;;
+	postgresql*) dbcmd=psql ;;
+	*) dbcmd=sql ;;
+	esac
+	printf "$fmtdir" "atl $dbcmd" "Connect to the $ATL_DATABASE database" "as $ATL_DATABASE_USER"
+	printf "$fmtdir" "atl $dbcmd --super" "Connect to the $ATL_DATABASE database" "as $ATL_DATABASE_SUPERUSER"
+	printf "%-20s %s\n" "atl $dbcmd je_foo" "Connect to the je_foo account database"
+
+	if [[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY != java ]]; then
+		printf "%-20s %s\n" "atl reload" "Reload $ATL_SYSTEMD_SERVICENAME"
+	fi
+	printf "%-20s %s\n" "atl restart" "Restart $ATL_SYSTEMD_SERVICENAME"
+	printf "%-20s %s\n" "atl upgrade" "Upgrades to ATL_NEWVER (${ATL_NEWVER:-currently unset})"
+	printf "%-20s %s\n" "atl downgrade" "Downgrade to the previous version"
+	printf "%-20s %s\n" "atl logstats" "Show available log file statistics "
+	printf "%-20s %s\n" "atl help" "Print this help"
+
+} | highlight)"

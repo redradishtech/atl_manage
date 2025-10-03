@@ -1,0 +1,42 @@
+#!/bin/bash -eu
+
+if (($# < 1)); then
+	echo >&2 "Purpose: Given a plugin key, prints uses in Confluence of that plugin's macros"
+	echo >&2 "E.g.: atl_pg_usage_conf_plugin com.mxgraph.confluence.plugins.diagramly [--wiki]"
+	echo >&2
+	echo >&2 "Note: A raw list of pages containing macros can also be obtained via REST, as used by the atl_usage_conf_plugin)"
+	exit 1
+fi
+
+pluginkey="$1"
+shift
+macroregex=$(
+	{
+		echo -n "("
+		atl_plugin_macros "$pluginkey" | xargs echo -n | sed -e 's/ /|/g'
+		echo -n ")"
+	}
+)
+if [[ $macroregex = "()" ]]; then
+	echo "\echo Plugin contains no macros"
+	exit
+fi
+#echo "select lastmoddate, title, substring(body from '.{50}${1}.{160}' ) from content JOIN bodycontent USING (contentid) where body ~ 'ac:name=\"${1}' order by lastmoddate desc LIMIT ${2:-10};"
+echo '\echo Searching for macros: '"$macroregex"
+#echo "select to_char(content.lastmoddate, 'YYYY-MM'), spaces.spacekey, title, substring(body from '.{50}${1}.{160}' ) from spaces JOIN content ON spaces.spaceid = content.spaceid JOIN bodycontent USING (contentid) where body ~ 'ac:name=\"${macroregex}' and prevver is null order by 1 desc LIMIT ${2:-10};"
+
+if [[ ${1:-} = --wiki ]]; then
+	echo '\echo || Space || Page || Creator ||  Last Modified ||'
+	echo "
+	WITH baseurl as (
+	SELECT regexp_replace(bandanavalue, '.*<baseUrl>([^<]+)</baseUrl>.*', '\1') as baseurl FROM bandana WHERE bandanakey ='atlassian.confluence.settings'
+	)
+	select '|' || spaces.spacekey || '| [' || content.title || '|' || baseurl || '/pages/viewpage.action?pageId=' || contentid || '] | [~' || user_mapping.username || '] | ' || to_char(content.lastmoddate, 'YYYY-MM') || ' |' from content JOIN bodycontent USING (contentid) LEFT JOIN spaces ON content.spaceid = spaces.spaceid JOIN user_mapping ON content.creator = user_mapping.user_key CROSS JOIN baseurl WHERE body ~ '<ac:structured-macro [^>]*ac:name=\"${macroregex}\"' AND spacekey is not null and prevver is null and content_status='current' order by content.lastmoddate desc limit 500;"
+else
+	echo "
+		WITH baseurl as (
+		SELECT regexp_replace(bandanavalue, '.*<baseUrl>([^<]+)</baseUrl>.*', '\1') as baseurl FROM bandana WHERE bandanakey ='atlassian.confluence.settings'
+		)
+		select contentid, to_char(content.lastmoddate, 'YYYY-MM') AS lastmod, baseurl || '/display/' || spaces.spacekey || '/' || content.title AS url, user_mapping.username AS creator from content JOIN bodycontent USING (contentid) LEFT JOIN spaces ON content.spaceid = spaces.spaceid JOIN user_mapping ON content.creator = user_mapping.user_key CROSS JOIN baseurl WHERE body ~ '<ac:structured-macro [^>]*ac:name=\"${macroregex}\"' AND spacekey is not null and prevver is null and content_status='current' order by lastmod desc limit 500;"
+fi
+echo '\echo Searched for macros: '"$macroregex"

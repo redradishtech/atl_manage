@@ -1,0 +1,21 @@
+#!/bin/bash -eu
+
+if [[ $# -ne 1 ]]; then
+	echo >&2 "Purpose: SQL to print JIRA workflows containing the given workflow function"
+	echo >&2 "E.g.: atl_pg_usage_jira_workflow_funcs googlecode"
+	echo >&2
+	exit 1
+fi
+
+echo "select jiraworkflows.workflowname
+	, string_agg(distinct project.pkey, ', ') AS projects
+	, regexp_matches(jiraworkflows.descriptor, '.{90}${1}[^<]+.{190}', 'g')
+FROM project
+	JOIN (select * from nodeassociation where sink_node_entity='WorkflowScheme') AS nodeassociation ON project.id = nodeassociation.source_node_id::integer 
+	JOIN workflowscheme ON workflowscheme.id = nodeassociation.sink_node_id
+	JOIN workflowschemeentity ON workflowschemeentity.scheme = workflowscheme.id
+	JOIN jiraworkflows ON workflowschemeentity.workflow = jiraworkflows.workflowname
+WHERE jiraworkflows.descriptor ~ '${1}' GROUP BY 1, 3;"
+
+# Perhaps in future we can do this with XPath / XSLT:
+# atl_jira_workflowdescriptor 'T4 Release workflow v4.2' --xpath "/wl-result/post-functions/function/arg[@name='class.name' and starts-with(., 'com.innovalog.jmwe.plugins.functions')]"

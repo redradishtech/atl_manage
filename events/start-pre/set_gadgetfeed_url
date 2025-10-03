@@ -1,0 +1,17 @@
+#!/bin/bash -eu
+## When an applink is added, Confluence seem to auto-add a gadget feed using the applink's URL. This function resets it correctly in non-prod instances.
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+require_app confluence
+require_table bandana
+
+if [[ $ATL_PRODUCT = confluence && $ATL_ROLE != prod ]]; then
+	# ATL_SHORTNAME will be something like 'confluence-upgrade', and the substitution makes this 'jira-upgrade'.
+	pre='http://jira.internal'
+	post="http://${ATL_SHORTNAME/confluence/jira}.internal"
+	atl_pg_set "$ATL_PRODUCT" gadgetfeed-url "$pre" "$post" | atl_psql -tXAq | while read -r oldurl; do
+		log "Changed Confluence's gadget feed URL from $pre ($oldurl) to $post"
+	done
+fi

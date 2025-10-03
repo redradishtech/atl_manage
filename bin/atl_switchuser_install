@@ -1,0 +1,38 @@
+#!/bin/bash -eu
+# https://www.redradishtech.com/pages/viewpage.action?pageId=5636099
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+declare -A checksum
+checksum[jira7]="fd8e2880405243534413332b3ba86e05b2ffb51a  switchuser.jsp"
+checksum[jira9]="43aa9eea8d57b0efd95def144a0ab2c261e7c639  switchuser.jsp"
+checksum[conf]="7d76af22907ea811442633f9c1c4ba355d968341  switchuser.jsp"
+
+if [[ $ATL_PRODUCT = jira ]]; then
+	url="$ATL_BASEURL/secure/admin/switchuser.jsp"
+	cd "$ATL_APPDIR/atlassian-jira/secure/admin/"
+	set -x
+
+
+	if version_lessthan "$ATL_VER" 8.0; then
+		if ! sha1sum --quiet --check - <<< "${checksum[jira7]}" &>/dev/null; then
+			rm -f switchuser.jsp
+			curl -LOJ 'https://hg.sr.ht/~redradishtech/atlassian_switchuser/raw/jira/7.x/switchuser.jsp'
+		fi
+	else
+		if ! sha1sum --quiet --check - <<< "${checksum[jira9]}" &>/dev/null; then
+			rm -f switchuser.jsp
+			curl -LOJ 'https://hg.sr.ht/~redradishtech/atlassian_switchuser/raw/jira/9.x/switchuser.jsp'
+		fi
+	fi
+elif [[ $ATL_PRODUCT = confluence ]]; then
+	url="$ATL_BASEURL/admin/switchuser.jsp"
+	cd "$ATL_APPDIR/confluence/admin/"
+	if ! sha1sum --quiet --check - <<< "${checksum[conf]}" &>/dev/null; then
+		rm -f switchuser.jsp
+		curl -LOJ 'https://hg.sr.ht/~redradishtech/atlassian_switchuser/raw/confluence/switchuser.jsp'
+	fi
+fi
+chown root:"$ATL_GROUP" switchuser.jsp
+chmod g+r switchuser.jsp

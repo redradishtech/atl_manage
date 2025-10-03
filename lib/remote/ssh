@@ -1,0 +1,3 @@
+#!/bin/bash
+sshcmd=(ssh -F "$(gethomedir "${!DESTINATION_SYNCUSER}")/.ssh/config"  -o UserKnownHostsFile="$(gethomedir "${!DESTINATION_SYNCUSER}")/.ssh/known_hosts")
+

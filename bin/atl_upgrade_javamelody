@@ -1,0 +1,38 @@
+#!/bin/bash -eu
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+#shellcheck disable=SC2119
+cachedir=$(cachedir)
+
+LATEST_JAVAMELODY=1.99.0
+JAR=jira-confluence-javamelody-$LATEST_JAVAMELODY.jar
+
+main() {
+	if [[ $(echo "$ATL_APPDIR"/*/WEB-INF/lib/jira-confluence-javamelody-*.jar) =~ .*jira-confluence-javamelody-(.*).jar ]]; then
+		dest="${BASH_REMATCH[0]}"
+		cur_ver="${BASH_REMATCH[1]}"
+		if [[ $LATEST_JAVAMELODY != "$cur_ver" ]]; then
+			jarcache="$(fetch_javamelody_jar)"
+			install -o "$ATL_USER" -g root "$jarcache" "$(dirname "$dest")/$JAR"
+			(
+				# hg commands must be run within the repo's directory
+				cd "$ATL_APPDIR"
+				hg add "$(dirname "$dest")/$JAR"
+				hg rm "$dest"
+				hg qrefresh
+				log "Now atl_reinstall --rebase --commit=$ATL_LONGNAME/monitoring-javamelody -m \"Upgrade JavaMelody to $LATEST_JAVAMELODY\""
+			)
+		fi
+	fi
+}
+
+fetch_javamelody_jar() (
+	. "$ATL_MANAGE/lib/appfetcher/fetch"
+	url() { echo https://github.com/javamelody/jira-confluence-javamelody/releases/download/"$LATEST_JAVAMELODY"/"$JAR"; }
+	validate() { zip_validator "$@"; }
+	fetch https://github.com/javamelody/jira-confluence-javamelody/releases/download/"$LATEST_JAVAMELODY"/"$JAR"
+)
+
+main "$@"

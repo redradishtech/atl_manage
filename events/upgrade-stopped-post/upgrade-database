@@ -1,0 +1,17 @@
+#!/bin/bash
+
+upgrade-stopped-post() {
+	log "The 'upgrade-database' patch indicates that $ATL_PRODUCT needs its database upgraded somehow. This script doesn't know how, so we're dropping you into bash (in the new product deployment directory) to figure it out yourself."
+	if [[ -v ATL_MULTITENANT ]] && [[ "$ATL_MULTITENANT" = true ]]; then
+		log "Oo, and this system is multi-tenant! Please run the SQL against ALL the databases:"
+	else
+		log "Please run the necessary SQL against the database:"
+	fi
+	(
+		cd "$ATL_APPDIR_BASE/$ATL_NEWVER"
+		bash
+	)
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

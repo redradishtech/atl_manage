@@ -1,0 +1,4 @@
+#!/bin/bash
+
+[[ $ATL_WEBSERVER = apache2 ]] || exit 0
+a2enmod remoteip

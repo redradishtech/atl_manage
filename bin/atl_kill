@@ -1,0 +1,19 @@
+#!/bin/bash -e
+## Kill (via systemd) the application.
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+[[ -v ATL_SYSTEMD_SERVICENAME ]] || fail "$ATL_SHORTNAME is not run using systemd, so we can't kill it"
+
+atl_maintenance check
+
+if [[ -z $1 ]]; then
+	systemctl kill "$ATL_SYSTEMD_SERVICENAME"
+elif [[ $1 =~ -([0-9]) ]]; then
+	set -vx
+	systemctl kill "$ATL_SYSTEMD_SERVICENAME" --signal="${BASH_REMATCH[1]}"
+	set +vx
+else
+	error "Invalid arg: $1"
+fi

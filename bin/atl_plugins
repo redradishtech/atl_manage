@@ -1,0 +1,407 @@
+#!/bin/bash -eu
+## Prints info about installed plugins
+
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+# shellcheck source=/opt/atl_manage/lib/http.sh
+source "$ATL_MANAGE/lib/http.sh" --
+
+usage() {
+	cat <<EOF
+$*
+Purpose: Queries installed $ATL_PRODUCT plugins
+Usage:
+atl_plugins [--format] OPTIONS
+
+
+Where --format is:
+	report-tests	Table with old/new columns and rows for each plugin's tests. Suitable for a company-specific but version-independent upgrade report template
+	report-data	Comma-separated plugin data, suitably for passing to atlassian_product_upgradereport to replace the version-specific holes in 'report-tests'
+	report-summary	Table of plugin versions/states, suitable as a summary pasted into a version-specific upgrade report
+	cwiki		Prints a simple Confluence table in cwiki format
+	licenses	Print licenses (and info)
+
+OPTIONS can be:
+	--incompatible
+	--upgradeable
+	--eval
+	--disabled
+	--expired
+	--jars
+	--load
+	--install=<jar> NOT IMPLEMENTED
+	--plugin=<pluginkey>    Print only details for this plugin. Repeat for multiple plugins
+	--upgrade
+	--help
+	--refresh		causes the cache to be flushed
+	--save			causes the output to be saved to $ATL_PLUGINDATA_JSON
+	--load			load data from $ATL_PLUGINDATA_JSON
+	--filter		E.g. --filter=.pluginKey="ch.bitvoodoo.confluence.plugins.navitabs"
+
+If no --format is specified, output suitable for the terminal is printed.
+
+EXAMPLES
+
+	atl_plugins --format=licenses --plugin="ch.bitvoodoo.confluence.plugins.navitabs"      # Print the Navitabs plugin license
+
+
+Given a Confluence plugin-cache/ directory from oldconfluence, install plugins into new confluence:
+
+EOF
+	cat <<'EOF'
+	ATL_BASEURL=https://oldconfluence atl_plugins --save
+	atl_plugins --load --filter='select(.enabled == true)' --format=json | jq --slurp -r '.[] | [.key, .version] | @tsv ' | while read key version; do jar=$(atl_plugin_jar --dir=. $key $version); if [[ -n "$jar" ]]; then echo "Installing $key $version from $jar"; atl_plugins --install="$jar"; else "No jar for $key $version"; fi; done
+EOF
+	exit
+}
+
+jqfilter() {
+	#shellcheck disable=SC2016
+	local basejq='.[] | .licenseDetails.maintenanceExpiryDate as $ed 
+			| (if $ed then $ed/1000 else null end) as $ed
+			| (if $ed then $ed | gmtime | strftime("%Y-%m-%d") else null end) as $expiryDate
+			| (if ($ed and (now - $ed) > 0) then true else false end) as $expired'
+	local filters=()
+	if [[ -n $filter ]]; then
+		filters+=("$filter")
+	fi
+	if ((${#plugins[@]})); then
+		# Evaluates to e.g. | ["ch.bitvoodoo.confluence.plugins.navitabs", "de.scandio.confluence.plugins.pocketquery"] as $plugins
+		basejq+="| [\"$(echo "${plugins[*]}" | sed "s/ /\",\"/g")\"] as \$plugins "
+		# https://stackoverflow.com/questions/43259563/how-to-check-if-element-exists-in-array-with-jq
+		filters+=('select(.key | IN($plugins[]))')
+	fi
+	if $disabled; then
+		filters+=('select(.enabled == false)')
+	fi
+	if $incompatible; then
+		filters+=('select(.incompatible == true)')
+	fi
+	if $upgradeable; then
+		filters+=("(select(.updateAvailable == true)")
+	fi
+	if $evaluation; then
+		filters+=("select(.licenseDetails.evaluation == true)")
+	fi
+	if $nonevaluation; then
+		filters+=("select(.licenseDetails.evaluation == false)")
+	fi
+	if $expired; then
+		#filters+=("select(.licenseDetails.error == true)")
+		#shellcheck disable=SC2016
+		filters+=('select($expired)')
+	fi
+
+	# https://stackoverflow.com/questions/1527049/how-can-i-join-elements-of-an-array-in-bash
+	function join_by {
+		local IFS="$1"
+		shift
+		echo "$*"
+	}
+	echo "$basejq"
+	if ((${#filters[@]})); then
+		echo -en "\t\t\t| "
+		join_by '|' "${filters[@]}"
+	fi
+}
+
+installplugin() {
+	installjar="$1"
+	token=$(upmtoken)
+	#log "Got token $token"
+	if [[ -n $token ]]; then
+		headers=$(mktemp)
+		headers=$(curl -k -sS --header "X-Atlassian-Token: no-check" -b "$(cookiejar)" -F "plugin=@$installjar;filename=$(basename "$installjar")" "$ATL_BASEURL/rest/plugins/1.0/?token=$token" -D-)
+		echo "$headers" | grep -qi Location: || fail "No Location header response when installing jar $installjar: $headers"
+		newurl="$(echo "$headers" | grep -i Location: | awk '{print $2}' | tr -d '\r')"
+
+		for x in $(seq 1 100); do
+			sleep .5
+			json=$(curl -L -k -sS --header "X-Atlassian-Token: no-check" -b "$(cookiejar)" "$newurl")
+			# Gives us output like:
+			#
+			# {
+			#   "type": "INSTALL",
+			#   "pingAfter": 100,
+			#   "status": {
+			#     "done": true,
+			#     "statusCode": 200,
+			#     "contentType": "application/vnd.atl.plugins.task.install.err+json",
+			#     "subCode": "upm.pluginInstall.error.install.failed",
+			#     "source": "plugin.7176396089583438605.pageapproval-plugin-2.3.0.obr",
+			#     "name": "plugin.7176396089583438605.pageapproval-plugin-2.3.0.obr"
+			#   },
+			#   "links": {
+			#     "self": "/rest/plugins/1.0/pending/928b2bc8-b235-4fe4-a659-caf036277af9",
+			#     "alternate": "/rest/plugins/1.0/tasks/928b2bc8-b235-4fe4-a659-caf036277af9"
+			#   },
+			#   "timestamp": 1626317135694,
+			#   "userKey": "402881e440af89540140af897fe20004",
+			#   "id": "928b2bc8-b235-4fe4-a659-caf036277af9"
+			# }
+			#
+			contentType=$(echo "$json" | jq -r .status.contentType)
+			doneStatus=$(echo "$json" | jq -r .status.done)
+			if [[ $doneStatus != false ]]; then
+				if [[ $contentType = application/vnd.atl.plugins.task.install.err+json ]]; then
+					subCode="$(echo "$json" | jq -r .status.subCode)"
+					pluginSource="$(echo "$json" | jq -r .status.source)"
+					fail "Plugin '$pluginSource' failed: $subCode"
+				else
+					enabled="$(echo "$json" | jq -r .enabled)"
+					broken="$(echo "$json" | jq -r .broken)"
+					key="$(echo "$json" | jq -r .key)"
+					pname="$(echo "$json" | jq -r .name)"
+					if [[ $enabled != true ]]; then error "Plugin '$key' is not enabled after upload. $json"; fi
+					if [[ $broken = true ]]; then error "Plugin '$key' is brokenafter upload. $json"; fi
+				fi
+				log "Plugin '$pname' ($key) uploaded and enabled"
+				break
+			else
+				donePercent=$(echo "$json" | jq -r .status.amountDownloaded)
+				echo -ne "Done: $donePercent/100\r"
+			fi
+		done
+	else
+		error "Unable to find upm-token: header in result from /rest/plugins/1.0/"
+	fi
+}
+
+printlatestjars() {
+	getplugindata | jq -r "$(jqfilter)"' | [.key, (.key | gsub("[\\.-]"; "_")), .links."update-details"] | @tsv ' |
+		while IFS=$'\t' read -r key keyvar details; do
+			[[ -n $details ]] || continue
+			newver="$(cat "$(geturlfile "$details")" | jq -r ".version")"
+			newverurl="$(cat "$(geturlfile "$details")" | jq -r ".links.binary")"
+			if [[ $newverurl != null ]]; then
+				log "Fetching $key new version $newver: $newverurl"
+				newverjar="$(geturlfile "$newverurl")"
+				echo "$newverjar"
+			fi
+		done
+}
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	PARSED=$(getopt --options 'ieduxsr' --longoptions 'incompatible,upgradeable,eval,noneval,disabled,expired,sen,jars,save,load,install:,plugin:,upgrade,format:,filter:,help,refresh' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	incompatible=false
+	upgradeable=false
+	evaluation=false
+	nonevaluation=false
+	disabled=false
+	expired=false
+	sen=false
+	jars=false
+	upgrade=false
+	install=false
+	export save=false
+	export load=false
+	export refresh=false
+	format=false
+	filter=
+	plugins=()
+	while true; do
+		case "$1" in
+		-i | --incompatible) incompatible=true ;;
+		-e | --eval) evaluation=true ;;
+		--noneval) nonevaluation=true ;;
+		-d | --disabled) disabled=true ;;
+		-u | --upgradeable) upgradeable=true ;;
+		-x | --expired) expired=true ;;
+		-s | --sen) sen=true ;;
+		-j | --jars) jars=true ;;
+		--upgrade) upgrade=true ;;
+		--load) load=true ;;
+		--save) save=true ;;
+		-r | --refresh) refresh=true ;;
+		--install)
+			installjar="$2"
+			if [[ ! -f $installjar ]]; then error "Plugin file does not exist: $installjar"; fi
+			shift
+			install=true
+			;;
+		--format)
+			format="$2"
+			shift
+			;;
+		--filter)
+			filter="$2"
+			shift
+			;;
+		--plugin)
+			plugins+=("$2")
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage "Invalid option: $1" ;;
+		esac
+		shift
+	done
+	# }}}
+
+	installjq
+
+	if $jars; then
+		printlatestjars
+	elif $upgrade; then
+		error "FIXME: Reuse --jars codepath"
+		getplugindata 0 | jq -r 'select(.updateAvailable) | .key + "\t" + (.key | gsub("[\\.-]"; "_")) + "\t" + .links."pac-details"' | while IFS=$'\t' read -r key keyvar details; do
+			log "Upgrading $key"
+			newver="$(cat "$(geturlfile "$details")" | jq -r ".update.version")"
+			newverurl="$(cat "$(geturlfile "$details")" | jq -r ".update.links.binary")"
+			if [[ $newverurl != null ]]; then
+				newverjar="$(geturlfile "$newverurl")"
+				installplugin "$newverjar"
+			fi
+		done
+	elif $install; then
+		installplugin "$installjar"
+	else
+		# https://gist.github.com/dainkaplan/4651352
+		pluginreport=$(mktemp)
+		trap 'rm -f "$pluginreport"' EXIT TERM
+		if [[ $format == report-data ]]; then
+			# Generates a ❤-separated list of key→value pairs, where the key is a @foo.bar.baz:old@ or @foo.bar.baz:new@ token.
+			# This string will be fed to atlas-cl with --special "❤→" --findReplace STRING. See /home/jturner/src/redradish/atlassian_app_upgradereport/exe/atlassian_product_upgradereport line 359
+			getplugindata | jq --join-output "$(jqfilter)"' |
+			def status(msg;col): "<ac:structured-macro ac:name=\"status\" ac:schema-version=\"1\"><ac:parameter ac:name=\"title\">" + msg + "</ac:parameter><ac:parameter ac:name=\"colour\">" + col + "</ac:parameter></ac:structured-macro> ";
+
+			"❤@" + .key + ":old@→" + .version
+			+ (if .enabled == false 		then status("disabled"; "Grey") else "" end )
+			+ (if .incompatible == true 		then status("Incompatible";"Red") else "" end )
+			+ (if .licenseDetails.evaluation == true then status("Evaluation";"Yellow") else "" end )
+			+ (if .licenseDetails.error == "EXPIRED" then status(("expired on " + .licenseDetails.expiryDateString);"Red") elif .licenseDetails.error then status(.licenseDetails.error; "Red") else "" end )
+			+ "❤@" + .key + ":new@→" + (if .updateAvailable == true then status("upgraded";"Green") + " to " + .newVersion.version  else .version end ) 
+			' >"$pluginreport"
+		elif [[ $format == report-summary ]]; then
+			{
+				cat - <<-EOF
+					<h2>Plugin State Summary</h2>
+					<table>
+					  <colgroup>
+					    <col/>
+					    <col/>
+					    <col/>
+					    <col/>
+					  </colgroup>
+					  <tbody>
+					    <tr>
+					      <th colspan="1">Plugin</th>
+					      <th colspan="1">Old Version</th>
+					      <th colspan="1">Old Status</th>
+					      <th colspan="1">New Version</th>
+					    </tr>
+				EOF
+				getplugindata | jq -r "$(jqfilter)"' |
+				def status(msg;col): "<ac:structured-macro ac:name=\"status\" ac:schema-version=\"1\"><ac:parameter ac:name=\"title\">" + msg + "</ac:parameter><ac:parameter ac:name=\"colour\">" + col + "</ac:parameter></ac:structured-macro> ";
+				"<tr>"
+				+ "<th><p><a href=\"https://marketplace.atlassian.com/plugins/" + .key + "\">" + .name + "</a></p></th>"
+				+ "\t<td><p>" + .version + "</p></td>"
+				+ "\t<td><p>"
+					 + (if .enabled == false then "'"$DISABLED"'" + status("disabled";"Grey") + "'"$DEFAULT"'" else "" end ) 
+					 + (if .incompatible == true then "'"$HI$RED"'" + status("incompatible";"Red") + "'"$DEFAULT"'" else "" end ) 
+					 + (if .updateAvailable == true then "'"$HI$YELLOW"'" + status("updatable to " + .newVersion.version;"Yellow") + "'"$DEFAULT"'" else "" end )
+					 + (if .licenseDetails.evaluation == true then "'"$DISABLED"'" + status("eval";"Yellow") + "'"$DEFAULT"'" else "" end )
+					 + (if .licenseDetails.error == "EXPIRED" then "'"$HI$RED"'" + status(("expired on " + .licenseDetails.expiryDateString);"Red") + "'"$DEFAULT"'" elif .licenseDetails.error then status(.licenseDetails.error; "Red") else "" end )
++ "</p></td>"
+				+ "\t<td><p>" + (if .updateAvailable == true then status("upgraded";"Green") + " to " + .newVersion.version  else .version end ) + "</p></td>"
+				+ "</tr>"
+			'
+				cat - <<-EOF
+					  </tbody>
+					</table>
+				EOF
+			} >"$pluginreport"
+		elif [[ $format == report-tests ]]; then
+			{
+				cat - <<-EOF
+					<table>
+					  <colgroup>
+					    <col/>
+					    <col/>
+					  </colgroup>
+					  <tbody>
+				EOF
+				getplugindata | jq -r "$(jqfilter)"' | "<tr><td colspan=\"2\"><div class=\"content-wrapper\"><p><h3><ac:structured-macro ac:name=\"anchor\" ac:schema-version=\"1\"><ac:parameter ac:name=\"\">" + .key + "</ac:parameter></ac:structured-macro>" + .name + "</h3></p><p><ul><li>\"" + .description + "\"</li><li><a href=\"https://marketplace.atlassian.com/plugins/" + .key + "\">marketplace link</a></li></ul></p></div>"
+			+ "</td></tr>"
+			+ "<tr>"
+			+ "<td>@" + .key + ":old@</td>"
+			+ "<td>@" + .key + ":new@</td>"
+			+ "</tr>"
+			+ "<tr>"
+			+ "<td></td>"
+			+ "<td></td>"
+			+ "</tr>"'
+				cat - <<-EOF
+					  </tbody>
+					</table>
+				EOF
+			} >"$pluginreport"
+		elif [[ $format == cwiki ]]; then
+			echo "|| Plugin || Old Version || Old State || New Version (blank=same) ||"
+			getplugindata | jq -r "$(jqfilter)"' | "|| [" + .name
+			+ "|https://marketplace.atlassian.com/plugins/" + .key + "/server/overview]"
+			+ "|" +  .version
+			+ "| " + (if .enabled == false then "'"$HI$RED"'disabled '"$DEFAULT"'" else "" end )
+			+  (if .incompatible == true then "'"$HI$RED"'incompatible '"$DEFAULT"'" else "" end )
+			+  (if .licenseDetails.evaluation == true then "'"$HI$RED"'eval '"$DEFAULT"'" else "" end )
+			+ "\t" + (if .licenseDetails.error == "EXPIRED" then "'"$HI$RED"'expired on " + .licenseDetails.expiryDateString + " '"$DEFAULT"'" elif .licenseDetails.error then .licenseDetails.error else "" end )
+			+ "|" + (if .updateAvailable == true then "'"$HI$YELLOW"'updated to " + .newVersion.version + "'"$DEFAULT"'" else " " end )
+			+ "|"
+			' >"$pluginreport"
+		elif [[ $format == sen ]]; then
+			echo "|| Plugin || SEN ||"
+			getplugindata | jq -r "$(jqfilter)"' | select(.enabled == true and .licenseDetails.evaluation != true) | "" 
+			+ "|[" + .name
+			+ "|https://marketplace.atlassian.com/plugins/" + .key + "/datacenter/overview?hosting=datacenter&tab=pricing]"
+			+ "| " + .licenseDetails.supportEntitlementNumber
+			+ "| \(.licenseDetails.maximumNumberOfUsers)"
+			+ "| " + (if .enabled == false then "'"$HI$RED"'disabled '"$DEFAULT"'" else "" end )
+			+  (if .incompatible == true then "'"$HI$RED"'incompatible '"$DEFAULT"'" else "" end )
+			+  (if .licenseDetails.evaluation == true then "'"$HI$RED"'eval '"$DEFAULT"'" else "" end )
+			+ "\t" + (if .licenseDetails.error == "EXPIRED"  then "'"$HI$RED"'expired on " + .licenseDetails.expiryDateString + " '"$DEFAULT"'" elif .licenseDetails.error then .licenseDetails.error else "" end )
+			+ "|" + (if .licenseDetails.supportEntitly == true then "'"$HI$YELLOW"'updated to " + .newVersion.version + "'"$DEFAULT"'" else " " end )
+			+ "|"
+			' >"$pluginreport"
+		elif [[ $format == json ]]; then
+			# The default: no script args or format.
+			getplugindata | jq -r "$(jqfilter)"' | .'
+		elif [[ $format == licenses ]]; then
+			# The default: no script args or format.
+			getplugindata | jq -r "$(jqfilter)"' | 
+				"# " + .key + 
+				"\t" + (if $expired then "'"$HI$RED"'expired \($expiryDate)'"$DEFAULT"'" else "" end )
+				+ "\t" + (if .licenseDetails.error == "EXPIRED"  then "'"$HI$RED"'expired on " + .licenseDetails.expiryDateString + " '"$DEFAULT"'" elif .licenseDetails.error then .licenseDetails.error else "" end )
+				+ "\n" + .licenseDetails.rawLicense' >"$pluginreport"
+		elif [[ $format == false ]]; then
+			# The default: no script args or format.
+			getplugindata | jq -r "$(jqfilter)"' |
+			.key
+			+ "\t" + .name 
+			+ "\t" +  .version
+			+ "\t" + (if .enabled == false then "disabled" else "" end )
+			+ "\t" + (if .incompatible == true then "'"$HI$RED"'incompatible'"$DEFAULT"'" else "" end )
+			+ "\t" + (if .updateAvailable == true then "'"$HI$YELLOW"'updatable to " + .newVersion.version + "'"$DEFAULT"'" else "" end )
+			+ "\t" + (if $expired then "'"$HI$RED"'expired \($expiryDate)'"$DEFAULT"'" else "" end )
+			+ "\t" + (if .licenseDetails.evaluation == true then "'"$HI$RED"'eval'"$DEFAULT"'" else "" end )
+			+ "\t" + (if .licenseDetails.error == "EXPIRED"  then "'"$HI$RED"'expired on " + .licenseDetails.expiryDateString + " '"$DEFAULT"'" elif .licenseDetails.error then .licenseDetails.error else "" end )
+			+ (if .enabled == false then "'"$DEFAULT"'" else "" end) 
+			' >"$pluginreport"
+		else
+			usage
+		fi
+		cat "$pluginreport"
+	fi
+}
+
+main "$@"

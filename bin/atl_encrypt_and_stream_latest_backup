@@ -1,0 +1,42 @@
+#!/bin/bash -eu
+## Streams an encrypted tar of the most recent backup. Intended to be called over SSH remotely, e.g. embedded as a line in /root/.ssh/authorized_keys:
+# restrict,command="/home/jethro/code/current/.env/atl_env /opt/atl_manage/bin/atl_encrypt_and_stream_latest_backup --exclude=home/logs" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG+KgBpxkox6Mn0VbByRmnztQ76s4YihCDFnsvxn2sh0 ej-backup-jturner
+
+#shellcheck source=/opt/atl_manage/lib/common.sh
+. "$ATL_MANAGE"/lib/common.sh
+
+# If the tar command fails, propagate the error through the pipe so the caller is informed
+set -o pipefail
+
+usage() {
+	echo >&2 "Usage: atl_encrypt_and_stream_latest_backup [--exclude=...]"
+	echo >&2 "E.g.: $0 > \$ATL_LONGNAME-backup-\$(date +%Y%m%d).tar.zstd.age"
+	exit 2
+}
+
+fail() {
+	echo >&2 "$*"
+	exit 1
+}
+
+
+[[ -v ATL_BACKUP_ROOT ]] || fail "The $0 script must be invoked via atl_env to contextualize it"
+[[ -d $ATL_BACKUP_ROOT ]] || fail "ATL_BACKUP_ROOT $ATL_BACKUP_ROOT does not exist or is not readable"
+backupdir=$ATL_BACKUP_ROOT/hourly.0
+[[ -d "$backupdir" ]] || fail "No hourly.0/ backup in $ATL_BACKUP_ROOT"
+backupdate="$(date -d @"$(stat -c %W "$backupdir")" +%Y-%m-%d)"
+[[ $backupdate =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "Unexpected backup date $backupdate from $backupdir"
+if (( $# > 0 )); then
+	[[ "$*" =~ ^--exclude=[^\ ]+ ]] || fail "Currently only one tar --exclude=... params are supported (not $*)"
+fi
+if [[ ${1:-} = -h || ${1:-} = --help ]]; then
+	usage
+fi
+
+cmd=(tar c --zstd --to-stdout -C "$backupdir" "$@" .)
+
+(
+	# readlock on backup.log (which is global), so we don't download half a backup
+	flock --shared 200
+	"${cmd[@]}" | atl_encrypt -o -
+) 200>"$(lockdir --global)/backup.lock"

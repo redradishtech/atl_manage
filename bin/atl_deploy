@@ -1,0 +1,675 @@
+#!/bin/bash -eu
+set -o pipefail
+# Implements various scripts:
+# atl_update						# Rebases the patchqueue (getting new config changes) and applies to the currently running app
+# atl_update --commit -m "..."		# Commit local changes to a patchqueue, and reapply to the currently running app
+# atl_deploy
+#
+## Deploys the app indicated by the currently loaded profile. Deploy ATL_NEWVER if that variable is set, ATL_VER otherwise.
+## If the app is running, atl_workingcopy is used to make changes that don't affect the app.
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+# shellcheck source=/opt/atl_manage/lib/filesystem.sh
+source "$ATL_MANAGE/lib/filesystem.sh" --
+
+main() {
+	if [[ $0 =~ atl_(re)?deploy$ ]]; then
+		_deploy "$@"
+	elif [[ $0 =~ atl_deploydir$ ]]; then
+		_deploy "$@"
+	elif [[ $0 =~ atl_update$ ]]; then
+		_deploy "$@"
+	elif [[ $0 =~ atl_undeploy$ ]]; then
+		_undeploy "$@"
+	fi
+}
+
+_deploy() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	local PARSED
+	PARSED=$(getopt --options 'hvcrwm:' --longoptions 'help,verbose,force,rebase,commit::,message:,keep,resume,overwrite,exclude:' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	# Note, no commit=. We check on the variable's defined'ness rather than value below, so that we can distinguish between '--commit' and '--commit=foo'
+	verbose=
+	force=
+	rebase=
+	resume=
+	overwrite=
+	# now enjoy the options in order and nicely split until we see --
+	excludes=()
+	while true; do
+		case "$1" in
+		-v | --verbose) verbose=true ;;
+		-f | --force) force=true ;;
+		--commit)
+			shift
+			commit="$1"
+			;;
+		-m | --message)
+			shift
+			message="$1"
+			;;
+		--keep) keep=true ;;
+		--rebase) rebase=true ;;
+		-r | --resume) resume=true ;;
+		-w | --overwrite) overwrite=true ;;
+		--exclude)
+			shift
+			excludes+=(--exclude "$1")
+			;;
+		-h | --help) usage ;;
+		--)
+			shift
+			break
+			;;
+		*) usage "Invalid option: $1" ;;
+		esac
+		shift
+	done
+	# }}}
+	setvars   # If ATL_NEWVER is defined, sets ATL_VER=$ATL_NEWVER, as well as ATL_APPDIR etc, so that later code can just use ATL_VER
+	# Note: mirror these (backwards) in atl_uninstall
+	add_user_and_group
+	installdbclient
+	install_runtime
+	#[[ -d $ATL_APPDIR ]] || fail "What, deploy failed??"
+	#cd "$ATL_APPDIR"	# deploy, which runs in a subshell, may have replaced $CWD, so this 'cd' also avoids further shell unhappiness
+	patchqueue_command=("$ATL_MANAGE/lib/create_patchqueue" ${commit+--commit="$commit"} ${resume:+-r} "${excludes[@]:-}" ${rebase:+--rebase} "${message+--message="$message"}" ${keep+--keep})
+	case "$(basename "$0")" in
+		atl_update)
+
+			# If the app is running, and we're redeploying ATL_VER (not ATL_NEWVER which wouldn't affect the running app), then use atl_workingcopy to safely make the changes under the live app
+			if [[ ! -v REAL_ATL_NEWVER ]] && atl_running; then
+				# Note we use ${commit+...}, not ${commit:-...}. The former triggers if $commit is defined even if equalling ''
+				# No, we can't just pass through $PARSED because, for instance, atl_workingcopy doesn't accept --rebase but create_patchqueue does
+				# If we have no excludes we don't want any arg passed through, not even '', as that gets ignored by atl_workingcopy's getopt and ends up as the first part of the nested create_patchqueue command
+				#shellcheck disable=2068
+				cd "$ATL_APPDIR"
+				atl_workingcopy ${verbose:+-v} ${resume:+-r} ${overwrite:+-w} ${excludes[@]:-} -- "${patchqueue_command[@]}" --rebase
+			else
+				# FIXME: modifying live files is a bad idea, because for a relatively long time (while lib/create_patchqueue works) files like apache2/<longname> will be unavailable or filled with unsubstituted @tokens@. Cron jobs that happen to trigger will break, and specifically if another atl_reinstall calls 'apachectl configtest' it will fail due to @tokens@.
+				cd "$ATL_APPDIR_BASE/$ATL_VER"   # Can't use ATL_APPDIR as that would be wrong if ATL_NEWVER is set
+
+				"${patchqueue_command[@]}"
+			fi
+			;;
+		atl_deploydir) 
+			# Deploy and apply patchqueue
+			# shellcheck source=/opt/atl_manage/lib/appfetcher.sh
+			. "$ATL_MANAGE/lib/appfetcher.sh"
+			dir=$(fetch "$@")
+			dir="$(unarchive "$dir")"
+			echo "unarchived: $dir"
+			dir="$(customized_app "$dir")"
+			echo "customized: $dir"
+			dir="$(mercurialize "$dir")"
+			echo "mercurialized: $dir"
+			dir="$(patchqueueify "$dir" 3>&1 1>&2)"
+			echo "patchqueued: $dir"
+			dir="$(jjpatchqueue "$dir" 3>&1 1>&2)"
+			echo "jjpatchqueue: $dir"
+			echo "Deploy dir: $dir"
+			exit
+			;;
+		atl_deploy) 
+			if [[ -d "$ATL_APPDIR" ]]; then
+				usage "App is already deployed."
+			fi
+
+			# Deploy and apply patchqueue
+			# shellcheck source=/opt/atl_manage/lib/appfetcher.sh
+			. "$ATL_MANAGE/lib/appfetcher.sh"
+			#fetch "$@" | read -r archive
+			dir=$(fetch "$@")
+			dir="$(unarchive "$dir")"
+			dir="$(customized_app "$dir")"
+			dir="$(mercurialize "$dir")"
+			dir="$(patchqueueify "$dir" 3>&1 1>&2)"
+			dir="$(jjpatchqueue "$dir" 3>&1 1>&2)"
+
+
+			# Note: copy ACLs too, since they are applied in the cache
+			rsync -raA "$dir/" "$ATL_APPDIR"
+			#atl_workingcopy echo "rsync -raA \"$dir/\" \"$ATL_APPDIR\""
+			(
+				cd "$ATL_APPDIR_BASE"
+				if [[ ! -L current ]]; then ln -s "$ATL_VER" current; fi
+			)
+			;;
+		atl_redeploy) 
+			# Deploy and apply patchqueue
+			# shellcheck source=/opt/atl_manage/lib/appfetcher.sh
+			. "$ATL_MANAGE/lib/appfetcher.sh"
+			#fetch "$@" | read -r archive
+			dir=$(fetch "$@")
+			dir="$(unarchive "$dir")"
+			dir="$(customized_app "$dir")"
+			dir="$(mercurialize "$dir")"
+			dir="$(patchqueueify "$dir" 3>&1 1>&2)"
+			dir="$(jjpatchqueue "$dir" 3>&1 1>&2)"
+
+			# Note: copy ACLs too, since they are applied in the cache
+			atl_workingcopy -- rsync -raA --delete "$dir/" .
+			(
+				cd "$ATL_APPDIR_BASE"
+				if [[ ! -L current ]]; then ln -s "$ATL_VER" current; fi
+			)
+			;;
+	esac
+	# We can't do this from the install-post event as that assumes atl_env works, which assumes .env already exists
+	# shellcheck source=/opt/atl_manage/lib/profile.sh
+	(
+		. "$ATL_MANAGE/lib/profile.sh"
+		atl_freeze
+	)
+}
+
+
+# Returns $1 committed into a mercurial repository
+patchqueueify() {
+	local newhash upstreamhash cache oldhash
+	upstreamdir="$(readlink -f "$1")"	# Normalize
+
+	[[ -d "$upstreamdir" ]] || {
+		errmsg "Cannot mercurialize nonexistent upstream dir '$upstreamdir'"
+		return 1
+	}
+	read -r upstreamhash <"$upstreamdir.inputhash"
+	[[ -n $upstreamhash ]] || fail "Upstream $upstreamdir.inputhash missing."
+
+	# Our upstream is already specific to the longname, version and uid
+	cache=$(cacheslot "$upstreamdir-patchqueued")
+	_log() { log "patchqueueify:$cache: $*"; }
+	
+	if [[ -d $cache ]]; then
+		read -r oldhash <"$cache.inputhash"
+		[[ -n $oldhash ]] || fail "Error: we have a patchqueueify dir $cache, but not a hash for it in $cache.inputhash"
+		newhash="$(cd "$cache" && "${patchqueue_command[@]}" --getremotehash)" || exit $?
+		[[ -n $newhash ]] || fail "Failed to compute hash of patchqueue"
+		if [[ $oldhash == "$newhash" ]]; then
+			_log "Patchqueue hasn't changed; reusing"
+		else
+			_log "Stale (upstream patchqueue hash '${newhash}' is not '${oldhash:-}'); recreating"
+			rm -rf "$cache" "$cache".*
+		fi
+	fi
+	if [[ ! -d $cache ]]; then
+		tmp=$(cacheslot_tmp)
+		cp -al "$upstreamdir" "$tmp"
+		cd "$tmp" || exit 1
+		"${patchqueue_command[@]}"
+		newhash="$(cd "$tmp"; "${patchqueue_command[@]}" --getremotehash)" || exit $?
+		[[ -n $newhash ]]|| fail "Failed to compute new hash (in $tmp)"
+		mv "$tmp" "$cache"
+		echo "$newhash" > "$cache.inputhash"
+		_log "patchqueued copy is ready"
+	else
+		if [[ $rebase ]]; then
+			_log "*** We have a checkout of the app, and all branches in .hg/patches/ reflect upstream. We will now rebase the patchqueues"
+			_log "*** For reference, our hash of the pre-rebased patchqueue is: $(cat "$cache.inputhash")"
+			cd "$cache"
+			"${patchqueue_command[@]}" || exit $?
+			newhash="$(/opt/atl_manage/lib/create_patchqueue --gethash)" || exit $?
+			newremotehash="$(/opt/atl_manage/lib/create_patchqueue --getremotehash)" || exit $?
+			_log "*** After rebasing, our local hash is $newhash"
+			_log "*** After rebasing, we presumably pushed upstream, so the upstream hash should be identical: $newremotehash"
+			if [[ $newhash != "$newremotehash" ]]; then
+				echo >&2 "Oops, local hash in $PWD does not match remote hash, calculated by /opt/atl_manage/lib/create_patchqueue --getremotehash. Dropping into a shell"
+				bash || { rm -rf "$cache" "$cache".*; exit $?; }
+				rm -rf "$cache" "$cache".*
+				exit 1
+			fi
+		fi
+	fi
+	echo "$cache" >&3
+}
+
+# Returns $1 committed into a mercurial repository
+jjpatchqueue() {
+	local newhash upstreamhash cache oldhash
+	upstreamdir="$(readlink -f "$1")"	# Normalize
+
+	[[ -d "$upstreamdir" ]] || {
+		errmsg "Cannot jjpatchqueue nonexistent upstream dir '$upstreamdir'"
+		return 1
+	}
+	read -r upstreamhash <"$upstreamdir.inputhash"
+	[[ -n $upstreamhash ]] || fail "Upstream $upstreamdir.inputhash missing."
+
+	# Our upstream is already specific to the longname, version and uid
+	cache=$(cacheslot "$upstreamdir-jjpatchqueue")
+	_log() { log "jjpatchqueue:$cache: $*"; }
+	
+	if [[ -d $cache ]]; then
+		read -r oldhash <"$cache.inputhash"
+		[[ -n $oldhash ]] || fail "Error: we have a jjpatchqueue dir $cache, but not a hash for it in $cache.inputhash"
+
+		if [[ $upstreamhash == "$oldhash" ]]; then
+			_log "Patchqueue hasn't changed; reusing"
+		else
+			_log "Stale (upstream hash '$upstreamhash' is not '$oldhash'); recreating"
+			rm -rf "${cache?}" "$cache".*
+		fi
+	fi
+
+	if [[ ! -d $cache ]]; then
+		tmp=$(cacheslot_tmp)
+		cp -al "$upstreamdir" "$tmp"
+		cd "$tmp" || exit 1
+
+		### Change files in $tmp
+		hg -q qpop -a
+		hg -q qpush -a || { echo >&2 "WTH? Patchqueue from $upstreamdir does not cleanly apply"; exit 1; }
+		hg -q qpop -a
+
+		{
+			echo ".hg"
+			# Jujutsu mustn't add the app's native files
+			if [[ -d app ]]; then echo "app"; fi
+		} > .gitignore
+		jj git init --colocate
+		jj config set --repo snapshot.max-new-file-size 43963367
+
+		if [[ -d app ]]; then jj -R app desc -m "patch:compiled js, css"; fi
+
+		local basereporoot appreporoot
+		basereporoot="$(jj log --no-graph -r @ -T 'self.change_id().short()')"  # This is BEFORE the first patch
+		appreporoot="$(jj -R app log --no-graph -r @ -T 'self.change_id().short()')"  # This IS the first patch
+
+		while patchname=$(hg -q qnext); do
+			jj new -m "patch:$patchname"
+			if [[ -d app ]]; then jj -R app new -m "patch:$patchname"; fi
+			hg qpush -f  || fail "Unexpectedly failed to qpush $patchname (although we've already qpop/qpushed the whole set)"
+			echo "Applied $(hg -q qtop)"
+		done || exit $?
+
+		jj new -m "Patchqueue" 
+		jj parallelize "$basereporoot..description('patch:_replacetokens')-" || :  # .. because $basereporoot is before the first patch
+		jj bookmark create -r @ master
+
+		jj -R app new -m "Patchqueue"
+		jj -R app parallelize "$appreporoot::description('patch:_replacetokens')-" || :  # :: because $appreporoot is the first patch
+		jj -R app bookmark create -r @ patchqueued
+
+		set +x
+
+		### generate $newhash
+		newhash="$upstreamhash"
+		cp "$upstreamdir.inputhash" "$cache.inputhash"   # 1-1 transformation
+
+		[[ -n $newhash ]]|| fail "Failed to compute new hash (in $tmp)"
+		mv "$tmp" "$cache"
+		echo "$newhash" > "$cache.inputhash"
+		_log "patchqueued copy is ready"
+	fi
+	echo "$cache" >&3
+}
+
+_undeploy() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	PARSED=$(getopt --options 'hvf' --longoptions 'help,verbose,force,delete-data,delete-database' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	verbose=
+	force=
+	deletedata=
+	deletedatabase=
+	resume=
+	overwrite=
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		-v | --verbose) verbose=true ;;
+		-f | --force) force=true ;;
+		--delete-database) deletedatabase=true ;;
+		--delete-data) deletedata=true ;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage_undeploy "Invalid options" ;;
+		esac
+		shift
+	done
+	# }}}
+	setvars
+	if [[ -d $ATL_APPDIR ]]; then
+		unapply_patchqueue
+		undeploy
+	fi
+	remove_user_and_group
+	if [[ -n $deletedata ]]; then fail "--delete-data is not yet implemented. Please delete manually"; fi
+	if [[ -n $deletedatabase ]]; then fail "--delete-database is not yet implemented. Please delete manually"; fi
+}
+
+setvars() {
+	# Perhaps also do this if ! -d $ATL_DATADIR
+	if [[ -v ATL_NEWVER ]]; then
+		# If ATL_NEWVER is set, we want to deploy/redeploy/undeploy the new version
+		REAL_ATL_NEWVER="$ATL_NEWVER"
+		_atl_setversion "$ATL_NEWVER"
+	fi
+	unset ATL_NEWVER # For the remainder of this script, any reference to $ATL_NEWVER is likely an error. We're meant to be installing to ATL_VER
+}
+
+usage() {
+	echo -e "\n${RED}$*${RESET}\n"
+
+	case "$(basename "$0")" in
+	atl_deploy)
+		echo "Purpose: Unpacks the new version of the app (${ATL_VER:-currently unset}), creating user/group accounts, and applies relevant patches."
+		;;
+	atl_redeploy)
+		echo "Purpose: Wipes and redeploys the ${ATL_VER} app instance, losing any local changes.";;
+	atl_update)
+		echo "Purpose: Updates the $ATL_VER app instance with config from the latest, rebased patchqueue. If --commit=<branch>/<patch> -m ... is given, local changes are committed to the patchqueue first. This is safe to run when $ATL_VER is running in production. If the app is running, this script will only proceed if doing so will not affect the running app (it aborts before making changes otherwise)."
+		;;
+	esac
+	cat <<EOF
+
+Usage:
+$0 <[options]>
+
+Options:
+	--commit		Commit local mods to _local, and thence to the $ATL_LONGNAME branch.
+	-r --resume		If we have uncommitted patchqueue mods in *-workingcopy, resume deployment from there.
+	-w --overwrite		When used with -c, overwrite the current ($ATL_VER) directory without making the usual assumption that $ATL_PRODUCT is live and running
+	-f --force		Removes and reinstalls any existing components (appdir files, patchqueue, systemd config, but not ssl key/cert) (${force-})
+	-h			Show this message
+	-v --verbose		Show commands as they are run
+
+
+Notes:
+	This script is safe to run normally. If a config file already exists it is not touched, unless '-f' is passed
+EOF
+	exit 2
+}
+
+usage_undeploy() {
+	cat <<EOF
+Usage: atl_undeploy <[options]>
+Purpose: Deletes user/group accounts, init scripts, root directories and Apache config for an app.
+Options:
+	-f --force		Removes all existing components, including non-symlink SSL certs/keyfiles, Apache logs, uncommitted patchqueue mods
+	--delete-data		Delete data ($deletedata)
+	-h			Show this message
+
+Tasks:
+	unapply_patchqueue
+	undeploy
+
+Notes:
+	Expects a profile to be pre-loaded (run 'atl profile load <profile>').
+	This script is safe to run normally. If a config file already exists it is not touched, unless '-f' is passed
+EOF
+	exit 2
+}
+
+add_user_and_group() {
+	create_group() {
+		# Note that atl_profile has already validated that ATL_USER, ATL_UID, ATL_GROUP, ATL_GID, ATL_SERVICES_USER and ATL_SERVICES_GROUP are set, make sense and reflect reality on this system if already created. Our job is just to create the users/groups if they don't exist.
+		if ! getent group "$ATL_GID" >/dev/null; then
+			if ((ATL_GID < 1000)); then
+				fail "ATL_GROUP '$ATL_GROUP' does not exist. Its GID '$ATL_GID' suggests it is a system account we are not responsible for creating"
+			fi
+			# Group $ATL_GID doesn't yet exist. Create it. We'll let the 'useradd' below create the user
+			groupadd --gid "$ATL_GID" "$ATL_GROUP"
+		fi
+	}
+
+	create_appdir_base() {
+		# TODO: move this into lib/zfs.sh
+		# Note: permissions must correspond to permission checks in atl_check_appdeployment#check_permissions
+		if [[ -v ATL_ZFS ]]; then
+			# POSIX ACLs so we can have locked-down permissions yet still grant rX permission as needed with setfacl -m u:user:rX
+			# exec=off is equivalent to mounting the filesystem with noexec, i.e. preventing executables if the app is hacked.
+			. "$ATL_MANAGE/lib/zfs.sh"
+			zfs_create_filesystem_if_not_exists "${ATL_ZFSPOOL}$ATL_APPDIR_BASE"
+			# Even if our directory already exists, set its ownership and permissions to what we want
+			chgrp "$ATL_GID" "$ATL_APPDIR_BASE"
+			chmod 750 "$ATL_APPDIR_BASE"
+			if [[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ java ]]; then
+				# We want APPDIR_BASE (the home directory for the user) read-only by the user, but Java wants its directories writable so pre-create them
+				install -d -o "$ATL_UID" "$ATL_APPDIR_BASE"/{.cache,.java}
+			fi
+		else
+			# Note that this sets the ownership and permissions even if ATL_APPDIR_BASE already exists.
+			# Use ATL_GID instead of ATL_GROUP as the group may not yet be created
+			install -g "$ATL_GID" -m 750 -d "$ATL_APPDIR_BASE" # Some security-sensitive environments don't want o=rx. Nagios needs access, so nagios needs to setfacl in its install-post script. Note that we don't set 700 permissions on *existing* directories as that would break nagios for the duration of the script (and permanently if atl_activate later fails).
+			# With the change in ownership of ATL_APPDIR_BASE from $ATL_USER:$ATL_GROUP to root:$ATL_GROUP, this is necessary to fix old directories. June/22
+			setfacl -m g::rX "$ATL_APPDIR_BASE"
+		fi
+
+		if [[ $ATL_APPDIR_BASE =~ ^/opt/atlassian/[^/]+$ ]]; then
+			# HACK: ATL_APPDIR_BASE is typically /opt/atlassian/whatever, and given our umask, /opt/atlassian will be created without o=rw, resulting in several problems:
+			# - Nagios/Icinga will break later as it tries to read its symlink into /opt/atlassian/whatever/current/monitoring/nagios.cfg.
+			# - Apache (www-data) will be unable to read $ATL_APPDIR/.well-known/* and $ATL_APPDIR/local/*
+			# - Since /opt/atlassian/whatever is our ~whatever home dir, ssh for that user will remain inexplicably broken if /opt/atlassian isn't group-readable.
+			# To prevent these problems we need to chmod go=rx all parts of the path to $ATL_APPDIR_BASE. Here we achieve part of this ($ATL_APPDIR_BASE/.. for the normal case where ATL_APPDIR_BASE=/opt/atlassian/whatever). Patches should further setfacl the permissions they need in $ATL_APPDIR/.hgpatchscript files (e.g. webserver-apache patch's $ATL_APPDIR/.hgpatchscript/webserver-apache runs 'setfacl -m u:www-data:rX $ATL_APPDIR')
+			chown root /opt/atlassian
+			setfacl -m g:"$ATL_GID":rX /opt/atlassian
+			#setfacl -m u:"$ATL_UID":rX /opt/atlassian
+			#chmod u=rwx,go=rx /opt/atlassian
+		fi
+	}
+
+	create_backup_tmp() {
+		if [[ -v ATL_BACKUP_TMP ]]; then install -d -m 750 "$ATL_BACKUP_TMP"; fi
+	}
+
+	create_datadir() {
+		if [[ -v ATL_DATADIR_BASE ]]; then install -d -o root -g "$ATL_GROUP" -m 750 "$ATL_DATADIR_BASE"; fi
+		# Oct/25: Previously we set the owner to root. That might be good for EJ but not for Jira or Confluence, which regularly create new stuff in their home dirs.
+		if [[ -v ATL_DATADIR ]]; then install -d -o "$ATL_USER" -g "$ATL_GROUP" -m 750 "$ATL_DATADIR"; fi
+	}
+
+	create_user() {
+		[[ -v ATL_USER ]] || return 0
+		if ! id "$ATL_USER" >/dev/null 2>&1; then
+			if ((ATL_UID < 1000)); then
+				fail "ATL_USER '$ATL_USER' does not exist. Its UID '$ATL_UID' suggests it is a system account we are not responsible for creating"
+			fi
+			log "Creating runtime account $ATL_USER"
+			# Note the lack of --create-home: we did it ourselves earlier, ensuring that a) it is (re)created even if deleted but the user exists, b) permissions are correct despite our highly restrictive umask
+			# FIXME: On 31/May/21 I changed the shell from bash to nologin. This might break backupmirror and replication, but nologin should be the default so those things need to adapt
+			useradd --home-dir "$ATL_APPDIR_BASE" -s /sbin/nologin --comment "Runtime Role account for $ATL_SHORTNAME $ATL_PRODUCT instance" -g "$ATL_GID" --uid "$ATL_UID" "$ATL_USER"
+		fi
+	}
+
+	create_services_group() {
+		if ! getent group "$ATL_SERVICES_GID" >/dev/null; then
+			groupadd --gid "$ATL_SERVICES_GID" "$ATL_SERVICES_GROUP"
+		fi
+	}
+
+	create_services_user() {
+		if ! id "$ATL_SERVICES_USER" &>/dev/null; then
+			if ((ATL_SERVICES_UID < 1000)); then
+				fail "ATL_SERVICES_USER specifies a system account (UID less than 1000) we are not responsible for creating, yet $ATL_SERVICES_USER does not exist."
+			fi
+			log "Creating services account $ATL_SERVICES_USER"
+			# Note the lack of --create-home: we did it ourselves earlier, ensuring that a) it is (re)created even if deleted but the user exists, b) permissions are correct despite our highly restrictive umask
+			# The -G $ATL_GROUP ensures the service account has at least read-only access to $ATL_USER content
+			useradd --home-dir "$ATL_APPDIR_BASE" -s /sbin/nologin --comment "Services Role account for $ATL_SHORTNAME $ATL_PRODUCT instance" -g "$ATL_SERVICES_GROUP" --uid "$ATL_SERVICES_UID" "$ATL_SERVICES_USER"
+		fi
+		# The point of ATL_SERVICES_USER is that it is in ATL_GROUP, and thus has read-only access to ATL_USER files. This is done independently of 'useradd' as ATL_SERVICES_USER might be shared amongst apps (e.g. 'rrservices' user used to run services for Jira and Confluence)
+		usermod -aG "$ATL_GROUP" "$ATL_SERVICES_USER"
+
+		# Create ~/.hgrc for the $ATL_SERVICES_USER so 'hg' functions as expected, and .psqlrc for sane psql defaults. Also .profile and .bashrc so that services running at $ATL_SERVICES_USER don't need to invoke atl_env for every atl_ command.
+		# This does leave services running as 'root' to fend for themselves.
+		(
+			shopt -s dotglob
+			cd "$ATL_MANAGE/templates/skel"
+			for file in *; do
+				install -g "$ATL_SERVICES_USER" "$file" "$ATL_APPDIR_BASE"
+			done
+		)
+		# Not writable by ATL_USER on purpose
+		install -g "$ATL_SERVICES_USER" -m 744 /etc/skel/.profile "$ATL_APPDIR_BASE"
+		install -g "$ATL_SERVICES_USER" -m 744 /etc/skel/.bashrc "$ATL_APPDIR_BASE"
+		# FIXME: What is this .profile for? Perhaps when replication or backupmirror SSHes in as SYNCUSER?
+		{
+			echo ". ~/current/.env/atl_env"
+			echo "export PATH=~/current/.env:\$PATH"
+			echo "echo .profile sourced"
+			echo "####################################################"
+			echo "# This file is overwritten by $0 on each redeploy. "
+			echo "# All manual modifications will be lost"
+		} >>"$ATL_APPDIR_BASE"/.profile
+		chgrp "$ATL_SERVICES_USER" "$ATL_APPDIR_BASE/.profile"
+
+		#if [[ ! $ATL_PRODUCT =~ (jira|confluence|crowd|fisheye) ]]; then
+		# Our convention is to have $ATL_USER's home dir be ATL_APPDIR_BASE, but I don't think it is assumed anywhere
+		[[ $ATL_SERVICES_USER = root ]] || [[ "$(getent passwd "$ATL_SERVICES_USER" | awk -F':' '{print $6}')" = "$ATL_APPDIR_BASE" ]] || warn "The ATL_SERVICES_USER '$ATL_SERVICES_USER' home directory is not $ATL_APPDIR_BASE (\$ATL_APPDIR_BASE) as expected"
+		#fi
+	}
+
+	create_group
+	create_appdir_base
+	create_backup_tmp
+	create_datadir
+	create_user
+	create_services_group
+	create_services_user
+}
+
+remove_user_and_group() {
+	if id "$ATL_USER" >/dev/null 2>&1; then
+		if ((ATL_UID < 1000)); then
+			log "Not removing system account $ATL_USER ($ATL_UID)"
+		else
+			local psout
+			if psout=$(ps -u "$ATL_USER"); then
+				fail "Processes are still running as $ATL_USER, so not deleting: $psout"
+			fi
+			warn "Please do this manually"
+			warn "Please do this manually"
+			warn "Please do this manually"
+			warn "Please do this manually"
+			warn "userdel \"${ATL_USER}\""
+			#log "Deleted user ${ATL_USER}"
+		fi
+	else
+		log "User does not exist: $ATL_USER"
+	fi
+}
+
+
+undeploy() (
+	log "Asking for home.lock.."
+	flock --exclusive 200
+	log "Acquired home.lock"
+	if [[ -L $ATL_APPDIR_BASE/current && $(readlink -f "$ATL_APPDIR_BASE"/current) = "$ATL_APPDIR_BASE/$ATL_VER" ]]; then
+		log "Removing current/ symlink pointing to $ATL_VER"
+		rm "$ATL_APPDIR_BASE"/current
+	fi
+	if [[ -d $ATL_APPDIR ]]; then
+		rm -r "${ATL_APPDIR:?}"
+	fi
+
+	if [[ -d $ATL_DATADIR ]]; then
+		if [[ -v deletedata && -n $deletedata ]]; then
+			read -r -p "Was asked to delete $ATL_ROLE data in $ATL_DATADIR, of size $(du -sh "$ATL_DATADIR"). If you really want to proceed, type 'delete': " deleverything
+			case $deleverything in
+			delete) true ;;
+			*) error "Aborting. You may delete $ATL_DATADIR by hand if you want" ;;
+			esac
+			log "Deleting data $ATL_DATADIR"
+			rm -r "${ATL_DATADIR:?}"
+			if [[ -L $ATL_DATADIR_BASE/current && $(readlink -f "$ATL_DATADIR_BASE"/current) = "$ATL_DATADIR" ]]; then
+				rm "$ATL_DATADIR_BASE"/current
+			fi
+		else
+			warn "Not removing data. To delete data, pass in --delete-data"
+		fi
+	fi
+	# https://superuser.com/questions/352289/bash-scripting-test-for-empty-directory
+	if [[ -d $ATL_APPDIR_BASE && -z "$(ls -A "$ATL_APPDIR_BASE")" ]]; then
+		log "Removing empty $ATL_APPDIR_BASE"
+		rm -r "$ATL_APPDIR_BASE"
+	fi
+) 200>"$(lockdir)/home.lock"
+
+installdbclient() {
+	case "$ATL_DATABASE_TYPE" in
+	postgresql*)
+		atl_install_postgresql || : # The script will notice that ATL_PRODUCT isn't 'postgresql', and so will only install psql client libraries, not the full database.
+		;;
+	mysql)
+		atl_install_mysql
+		;;
+	esac
+}
+
+unapply_patchqueue() (
+	flock -s 200
+	if [[ ! -d $ATL_APPDIR ]]; then return; fi
+	cd "$ATL_APPDIR"
+	if hg status | grep -q ^M; then
+		if [[ -z $force ]]; then
+			warn "Uncommitted patches in $PWD. Run with --force to delete"
+		fi
+	fi
+	if hg st --mq | grep -q ^M; then
+		if [[ -z $force ]]; then
+			warn "Uncommitted patches in patchqueue, $PWD/.hg/patches. Run with --force to delete"
+		fi
+	fi
+) 200>"$(lockdir --)/home.lock"
+
+install_runtime() {
+	log "Installing runtime"
+	if [[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ java ]]; then
+		atl_install_java
+	elif [[ ${ATL_PRODUCT_RUNTIME_TECHNOLOGY:-} =~ php ]]; then
+		# .list in ubuntu 22.x, .sources in 24.x
+		if [[ $HOSTNAME = jturner-desktop ]]; then
+			warn "On jturner-desktop we are using the Ubuntu-default, non-ondrej PHP libraries. Ubuntu $(lsb_release -rs) is not?? LTS and ondrej only supports LTS"
+		else
+			[[ -f $(compgen -G /etc/apt/sources.list.d/ondrej-ubuntu-apache2-$(lsb_release --short --codename).*) ]] || add-apt-repository ppa:ondrej/apache2
+			[[ -f $(compgen -G /etc/apt/sources.list.d/ondrej-ubuntu-php-$(lsb_release --short --codename).*) ]] || add-apt-repository ppa:ondrej/php
+		fi
+		pkginstall apache2
+		pkginstall "${ATL_PRODUCT_RUNTIME_TECHNOLOGY}" # e.g. php7.4-fpm
+		a2enmod proxy_fcgi
+		# Particular PHP apps may want other packages, like php7.4-mysql. We don't yet have a well-defined place to install those. atl_setup? It hasn't historically been app-specific. Here? Perhaps. For InvoiceNinja we pkginstall some PHP deps in $ATL_APPDIR/events/install-post/generalsettings
+		if [[ $ATL_PRODUCT = jethro ]]; then
+			pkginstall "${ATL_PRODUCT_RUNTIME_TECHNOLOGY%-fpm}-mysql"
+			if [[ $HOSTNAME != jturner-desktop ]]; then
+				## Without 'zip' we get
+				# Class 'ZipArchive' not found
+				# Line 63 of /home/jethro/code/2.33.0/app/views/view_0_send_mc_campaign.class.php
+				pkginstall "${ATL_PRODUCT_RUNTIME_TECHNOLOGY%-fpm}-zip"
+
+				# Class 'DOMDocument' not found
+				# Line 36 of /home/jethro/code/2.33.0/app/calls/call_service_comp_slides.class.php
+				pkginstall "${ATL_PRODUCT_RUNTIME_TECHNOLOGY%-fpm}-xml"
+				# Needed for 'Send campaign' mailchimp support. Error 'PHP message: cURL support is required, but can't be found. - Line 42 of /home/easyjethro/code/2.33.0/app/vendor/drewm/mailchimp-api/src/MailChimp.php'
+				pkginstall "${ATL_PRODUCT_RUNTIME_TECHNOLOGY%-fpm}-curl"
+				# Needed for incoming photo resizing
+				pkginstall "${ATL_PRODUCT_RUNTIME_TECHNOLOGY%-fpm}-gd"
+				if [[ $ATL_ROLE != prod ]]; then
+					pkginstall "${ATL_PRODUCT_RUNTIME_TECHNOLOGY%-fpm}-xdebug"
+				fi
+
+				# conf.d/debugging-logposts.conf now needs security2 to log POSTS
+				pkginstall libapache2-mod-security2
+			else
+				log "WARNING: didn't install ${ATL_PRODUCT_RUNTIME_TECHNOLOGY%-fpm}-{zip,xml,curl,gd} as upstream repo is missing them"
+			fi
+			# For the jethro-request-id header
+			a2enmod unique_id
+
+		fi
+	fi
+}
+
+main "$@"
+# vim: set foldmethod=marker formatoptions+=cro :

@@ -1,0 +1,14 @@
+#!/bin/bash -eu
+# https://wiki.redradishtech.com/display/~jturner/2017/08/29/Confluence+attachment+locations
+
+if [[ $# -ne 0 ]]; then
+	echo >&2 "Purpose: SQL to print important/relevant pages, i.e. heavily edited pages modified in the last week"
+	exit 1
+fi
+
+cat <<'EOF'
+WITH baseurl as (
+	SELECT regexp_replace(bandanavalue, '.*<baseUrl>([^<]+)</baseUrl>.*', '\1') as baseurl FROM bandana WHERE bandanakey ='atlassian.confluence.settings'
+)
+select baseurl.baseurl || '/pages/viewpage.action?pageId=' || content.contentid AS url, content.title, maxes.max from content JOIN (select title, max(version) from content where lastmoddate>(now() - '1 week'::interval) AND contenttype='PAGE'  group by spaceid, pageid, title limit 20) maxes ON content.title=maxes.title AND content.version = maxes.max CROSS JOIN baseurl  WHERE content.spaceid is not null order by max desc;
+EOF

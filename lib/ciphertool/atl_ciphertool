@@ -1,0 +1,7 @@
+#!/bin/bash
+# See https://confluence.atlassian.com/adminjiraserver/advanced-encryption-974378813.html#Advancedencryption-before
+
+# See com/atlassian/crowd/crypto/SaltingEncryptor.java
+#echo  >&2 "Sample -m decrypt input:"
+#echo  >&2 '{"algorithm":"AES_CBC_PKCS5Padding", "keyFilePath":"keys/javax.crypto.spec.SecretKeySpec_1635563190684","serializedSealedObject":"rO0ABXNyABlqYXZheC5jcnlwdG8uU2VhbGVkT2JqZWN0PjY9psO3VHACAARbAA1lbmNvZGVkUGFyYW1zdAACW0JbABBlbmNyeXB0ZWRDb250ZW50cQB+AAFMAAlwYXJhbXNBbGd0ABJMamF2YS9sYW5nL1N0cmluZztMAAdzZWFsQWxncQB+AAJ4cHVyAAJbQqzzF/gGCFTgAgAAeHAAAAASBBBt8Pz31c7yqzx+x8U31xIBdXEAfgAEAAAAQDsIv8yfWZAyR3arTa6N0lm9Fv1Z70Z5W38r7nXtbEokCtaODGOhKWk13gLNb0nj8d3xrwqKtmkPCndNy5RA4WJ0AANBRVN0ABRBRVMvQ0JDL1BLQ1M1UGFkZGluZwu003du003d"}'
+java -cp "$ATL_MANAGE/lib/ciphertool/*" com.atlassian.db.config.password.tools.CipherTool -c com.atlassian.db.config.password.ciphers.algorithm.AlgorithmCipher "$@"

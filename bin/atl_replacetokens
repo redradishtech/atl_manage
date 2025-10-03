@@ -1,0 +1,74 @@
+#!/bin/bash -eu
+
+# Replaces all %{ATL_FOO} tokens in an app's files, as well as renaming files with %{ATL_*} in their names.
+#shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+if [[ $* =~ -c ]]; then
+	warn "atl_replacetoken: -c is obsolete"
+fi
+
+# Path safety checks. This command can mess up a lot of things if run in the wrong directory.
+if [[ ! $* =~ --force ]]; then
+	if [[ $PWD = "$ATL_APPDIR_BASE"* ]]  || [[ $PWD =~ /var/cache ]]; then
+		:
+	else
+		error "atl_replacetokens should only normally be run within ATL_APPDIR_BASE ($ATL_APPDIR_BASE). Set --force if you really want to"
+	fi
+
+	if [[ $ATL_PRODUCT =~ (jira|confluence|crowd) ]]; then # Don't break on non-Tomcat apps, notably Jethro. This is ugly but we're embedding app-specific logic everywhere already
+		for d in "${ATL_TOMCAT_SUBDIR}bin" "${ATL_TOMCAT_SUBDIR}conf" monitoring systemd; do
+			if [[ ! -d $d ]]; then
+				error "Expected to be in app checkout directory (missing expected directory $d)."
+			fi
+		done
+	fi
+fi
+
+# Rename systemd/%{ATL_LONGNAME}.service, .hgpatchscript/%{ATL_LONGNAME}.service and possibly others
+find . -maxdepth 2 -name "*%{ATL_*}*" | while read -r f; do
+	newfile=$(echo "$f" | perl -pe 's/(%\{([^}]+)\})/defined $ENV{$2} ? $ENV{$2} : defined $ENV{$2 . "_DEFAULT"} ? $ENV{$2 . "_DEFAULT"} : $1/eg')
+	#log "Renaming $f to $newfile"
+	hg mv -f "$f" "$newfile"
+done
+# Somet of the files/directories are not going to exist e.g. apache-tomcat/ is only for Crowd. nullglob means that these don't expand to anything
+shopt -s nullglob
+shopt -s globstar
+tmp=$(mktemp)
+trap 'rm $tmp' EXIT TERM
+# The conf/**/*.xml is for Crowd, which stores CrowdDS in apache-tomcat/conf/Catalina/localhost/ROOT.xml
+# The .env is for Laravel PHP apps like InvoiceNinja
+# We should probably simplify this to e.g. */*.conf, to allow arbitrary new patches/config files. For now I prefer explicitness
+# Note we don't replace %{ATL_LONGNAME} in .hg/patches/series. That patch name needs to stay generic, as it is applies in both prod and sandboxes.
+# FIXME: replace nagioscheck.sh with just healthcheck some time long after Jul/22
+# The apache2/*.pem is for when we want to only set ATL_SSLCERT/ATL_SSLCERTKEYFILE but need a physical file to point Apache to
+
+invoiceninja=(app/.env app/storage app/public/logo)
+jethro=(app/conf.php app/index.php app/include/version.txt congregation_attendance_group_refresher/* lastlogins/*.service app/include/user_system.class.php)
+fisheye=(config.xml)
+php_apps=(php/*.conf php/README php/*.snippet)
+for file in bin/!(*.tar.gz|*.jar|*.bat|*.exe*|*.txt|*.dll*) "${ATL_TOMCAT_SUBDIR}"bin/*.sh "${ATL_TOMCAT_SUBDIR}"conf/**/*.xml apache2/*.conf apache2/conf.d/*.conf apache2/*.pem nginx/*.conf systemd/*.service replication/*.service backups/*.{conf,cron,healthcheck,nagioscheck.sh} monitoring/* monitoring/bin/* monitoring/.eventhandler replication/*.cron replication/lsyncd.conf "${ATL_TOMCAT_SUBDIR}"conf/*.cron isso-public-comments/isso.conf local/isso.js emailprocessing/* cloudflare/cloudflare_origin_cert/* letsencrypt/secrets/*.ini oomhandler/* "${invoiceninja[@]}" "${php_apps[@]}" "${jethro[@]}" "${fisheye}"; do
+	if [[ -L "$file" ]]; then
+		ref="$(readlink "$file")" # E.g. file 'app/storage' in invoiceninja references '%{ATL_DATADIR}/storage'
+		newref="$(echo "$ref" | replace_tokens)"
+		if [[ $ref != "$newref" ]]; then
+			log "Rewriting $file symlink from $ref to $newref"
+			rm "$file"
+			ln -s "$newref" "$file"
+		else
+			if ref="$(readlink -f "$file" 2>/dev/null)"; then
+				[[ $ref =~ "$ATL_APPDIR_BASE" ]] || continue # Skip absolute symlinks to e.g. /usr/sbin/php or /usr/bin/java, but allow relative symlinks within APPDIR_BASE
+			else
+				continue # Broken symlink. Odd but not our business!
+			fi
+		fi
+	fi
+	[[ -f "$file" ]] || continue # If '*' expands to nothing we'll be left with a directory; skip. Also skip if $file is a symlink to a directory, rewritten above
+	grep -q '%{' "$file" || continue
+	cat -- "$file" | replace_tokens >"$tmp" || error "Error replacing tokens in $file"
+	#log "In $file, made changes:"
+	#diff "$file" "$tmp" || true
+	cat "$tmp" >"$file"
+done
+
+#perl -i -pe 's/(%\{([^}]+)\})/defined $ENV{$2} ? $ENV{$2} : defined $ENV{$2 . "_DEFAULT"} ? $ENV{$2 . "_DEFAULT"} : $1/eg' bin/*.sh conf/*.xml apache2/*.conf systemd/*.service backups/*.conf backups/*.nagioscheck apache-tomcat/conf/*.xml apache-tomcat/bin/*.sh

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="$PROJECT_DIR$" vcs="hg4idea" />
+    <mapping directory="$PROJECT_DIR$/lib/activeobject_views" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/lib/requiresort" vcs="hg4idea" />
+    <mapping directory="$PROJECT_DIR$/lib/versioned_directories" vcs="hg4idea" />
+    <mapping directory="$PROJECT_DIR$/monitoring/plugins/nagios-check-many" vcs="Git" />
+  </component>
+</project>

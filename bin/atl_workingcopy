@@ -1,0 +1,361 @@
+#!/bin/bash -eu
+set -o pipefail
+## Run a command in a working copy of $ATL_APPDIR, and then copy the (presumably modified) working copy back to $ATL_APPDIR, but only if the new/modified files would not interfere with the running Tomcat application in $ATL_APPDIR.
+# For instance, if a user wants to modify some patchqueue-derived change, it wouldn't be safe to 'hg qpop' in $ATL_APPDIR because that would certainly break the running app. Instead, 'atl_workingcopy bash', then hg qpop, qpush as needed, and when bash exits the results will be applied.
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+
+workingcopy="$ATL_APPDIR-workingcopy"
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	local PARSED
+	PARSED=$(getopt --options 'hvrw' --longoptions 'help,resume,overwrite,exclude:' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	resume=
+	overwrite=
+	excludes=()
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		-r | --resume) resume=true ;;
+		-w | --overwrite) overwrite=true ;;
+		--exclude)
+			shift
+			excludes+=(--exclude "$1")
+			;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	# }}}
+	[[ $# -gt 0 ]] || usage
+
+	unset ATL_NEWVER # Any access of ATL_NEWVER is an error, as this script only runs on the current version
+
+	(
+		flock --exclusive 200 # Write lock the app dir
+		create_workingcopy_and_backup
+		cd "$workingcopy"
+		trap 'dehardlink_workingcopy' INT EXIT TERM
+		# Run whatever nested command was given. Deliberately unquoted
+		# Edit: why didn't we quote? If we don't --message="foo bar" isn't preserved
+		if command -v "$1" >/dev/null; then
+			log "Running: $*"
+			"$@"
+		else
+			log "Running under bash: $*"
+			bash -c "$@"
+		fi
+		apply_workingcopy
+	) 200>"$(lockdir)"/app.lock
+}
+
+usage() {
+	cat <<EOF
+Purpose: Run a command in a working copy of $ATL_APPDIR, and then copy the (presumably modified) working copy back, but only if the new/modified files would not interfere with the running Tomcat application.
+
+Usage:
+$(basename "$0") <command>
+
+E.g.:
+$(basename "$0") bash      # For making ad-hoc changes
+$(basename "$0") $ATL_MANAGE/lib/create_patchqueue   # Redeploy the whole patchqueue
+
+
+EOF
+	exit 2
+}
+
+# Make a backup and *-workingcopy instance to work on ($workingcopy)
+create_workingcopy_and_backup() {
+	if [[ ! -d "$ATL_APPDIR" ]]; then
+		mkdir -p "$workingcopy"
+		return 0
+	fi
+	# We're working on live data. Do stuff in a copy.
+	# Note we hardlink back to the original, so in-use files like conf/server.xml and logs/catalina.out are still live. MODIFYING files like lib/*.jar would be unsafe, but fortunately popping and pushing the HG patchqueue REPLACES files, so the original in-use file is untouched. Later when we rsync back, we don't need to worry about inode-identical files like logs/catalina.out, only pushed/popped files
+	# If  --resume was set we don't actually populate $backupdir, but rely on it having been made in a previous run. We need $backupdir set for later checks
+	backupdir="$ATL_APPDIR-backup-$(date +%Y%m%d-%H%M%S)"
+	if [[ -d $workingcopy && $resume ]]; then
+		log "Not updating existing $workingcopy (--resume)"
+	else
+		log "Creating working copy: $workingcopy"
+		rsync -raAH --delete --link-dest="$ATL_APPDIR/" "$ATL_APPDIR/" "$workingcopy"
+
+		# Use a trap to ensure our workingcopy is deleted eventually. Our workingcopy has */*.cron hardlinks which breaks cron.
+		# The 'wait' is because lib/create_patchqueue (often our nested script) runs 'hg -q push --mq --new-branch &' in the working copy, and we want to wait for that to complete before nuking the directory.
+		#trap "wait; rm -r \"$workingcopy\"" TERM EXIT
+		log "Creating backup: $backupdir"
+		# Cron refuses to execute /etc/cron.d/*.cron files if their referent (assuming a symlink) has > 1 hardlink, dying with:
+		#
+		#  cron[1136]: (*system*jira-staging-backup-rsnapshot) NUMBER OF HARD LINKS > 1 (/etc/cron.d/jira-staging-backup-rsnapshot)
+		#
+		# where /etc/cron.d/jira-staging-backup-rsnapshot is a symlink to $ATL_APPDIR/backups/rsnapshot.cron
+		# So when copying $ATL_APPDIR, as here, we must be careful NOT to hardlink our */*.cron files. Hence a two-part rsync, and also the trap above.
+		rsync -raAH --delete --link-dest="$ATL_APPDIR/" "$ATL_APPDIR/" "$backupdir" --exclude '*/*.cron'
+		if [[ -n $(
+			shopt -s nullglob
+			echo "$ATL_APPDIR"/./*/*.cron
+		) ]]; then
+			# No --link-dest because we want distinct copies of .cron files
+			rsync -raAHR --delete "$ATL_APPDIR"/./*/*.cron "$backupdir"
+		fi
+		# Delete all $ATL_APPDIR_BASE/.*-backup-.* directories except the 5 most recent
+		# For some reason this gives 'Cannot remove .... No such file or directory errors. Add the 'set -x' to debug'
+		# Edit: hopefully the --no-run-if-empty fixed the above error
+		(
+			debug "Deleting any old *-backup-* copies..."
+			cd "$ATL_APPDIR_BASE"
+			rsync -L --list-only --ignore-missing-args -- *-backup-* | grep '^d' | sort -k3,4r | tail -n+5 | awk '$5 ~ /\..*-backup-.*/ {printf "%s\0",$5}' | xargs -0 --no-run-if-empty rm -r
+		) &
+		disown # disown it so that slow delete (LO) doesn't hold the lock for ages
+	fi
+}
+
+# We have been working in a *-workingcopy copy; now copy changes back to the live $ATL_VER/ directory, safely, without upsetting the live app.
+apply_workingcopy() {
+
+	# A tempfile storing changes between our working copy and prod. Used across various sub-functions, so defined here
+	local CHANGES
+
+	# Given the name of a .hgignore file (or directory of files) with 'syntax: rootglob', converts each line to an rsync-style --exclude
+	globfile_to_excludes() {
+		[[ -e $1 ]] || fail "Missing ${1:-}"
+		{
+			if [[ -f "$1" ]]; then
+				cat "$1"
+			elif [[ -d "$1" ]]; then
+				cat "$1"/*
+			fi
+		} | grep -v '^#' | grep -v '^syntax:' | sort | uniq | sed -e 's,^,--exclude=/,'
+	}
+
+	rsync_workingcopy_to_production() {
+
+		local excludes
+		set_rsync_excludes() {
+
+			# We could choose between $ATL_APPDIR/.hgignore and $ATL_APPDIR_BASE/$ATL_VER-workingcopy/.hgignore. We assume the running app knows its own runtime files better than the new deployment.
+			local hgignore="$ATL_APPDIR/.hgignore"
+			local runtime_excludes
+			if grep -q '^syntax: rootglob' "$hgignore"; then
+				mapfile -t runtime_excludes < <(globfile_to_excludes "$hgignore")
+			elif grep -q '^syntax: rootglob' "$hgignore"; then
+				warn "Our currently live app in $ATL_APPDIR has an obsolete .hgignore, missing 'syntax: rootglob'. falling back to new .hgignore in -workingcopy, which is correct"
+				mapfile -t runtime_excludes < <(globfile_to_excludes "$hgignore")
+			else
+				fail "$hgignore is expected to have 'syntax: rootglob'."
+			fi
+			excludes+=("${runtime_excludes[@]}") # Add to any command-line-provided excludes
+			# When atl_workingcopy wraps lib/create_patchqueue, that script's push_patches_upstream() function has backgrounded a 'hg push' which may still be running, and vanishes these .hg/undo.backup.* files during our rsync, resulting in errors (file has vanished: "/opt/atlassian/redradish_website/7.19.5-workingcopy/.hg/patches/.hg/undo.backup  .branch"). I don't think these files matter much, so exclude them from our rsync
+			excludes+=(--exclude='**'/.hg/undo.backup.{branch,dirstate}{,.bck})
+		}
+		cd "$ATL_APPDIR_BASE"
+		set_rsync_excludes
+		rsync -rlpgoDAH --checksum --delete "${excludes[@]}" "${ATL_VER}-workingcopy/" "$ATL_VER/" "$@"
+	}
+
+	rsynclines_beginning_with() {
+		# -s sends cmdline args: https://stackoverflow.com/questions/3321829/how-do-i-best-pass-arguments-to-a-perl-one-liner
+		# https://stackoverflow.com/questions/31724503/most-efficient-way-to-check-if-string-starts-with-needle-in-perl
+		perl -slane 'print $_ =~ s/^[^ ]+ +//r if index(@F[0], $start)==0' -- -start="$1"
+	}
+
+	# Use rsync to figure out what changed in -workingcopy, and record these changes (in rsync format) in the $CHANGES tempfile for later use.
+	find_changes_from_workingcopy_to_current() {
+		CHANGES=$(mktemp) # Note: the tempfile is cleaned up by the caller
+		# To cleanup: invoke our trap function set earlier, and then rm the $CHANGES file. Note $CHANGES is out of scope at exit time so resolve it now
+		#shellcheck disable=SC2064
+		trap "dehardlink_workingcopy; rm -f '$CHANGES'" TERM EXIT INT
+
+		# Now figure out what changed between $ATL_APPDIR and -workingcopy, by using rsync with no destination and the '--out-format' parameter, as per https://unix.stackexchange.com/questions/109636/is-there-a-linux-deep-diff-tool-that-also-compares-file-attributes and https://unix.stackexchange.com/questions/452859/how-to-rsync-and-grep-only-path-of-modified-files-in-source-directory
+		# --out-format='%i %n%L' is equivalent to --itemize-changes
+		#
+		# 3) EXCLUSIONS.
+		#  - You will note a large --exclude=/{\.hg,backups,...} clause. The ultimate purpose of $CHANGES is to identify if $ATL_APPDIR can be safely overwritten by -workingcopy/ *despite* there being a live app (e.g. Tomcat) running in $ATL_APPDIR. There are some files we *know* Tomcat doesn't use, because they are our 'supporting infrastructure'. Monitoring scripts, webserver (vs. appserver) files, replication scripts, etc. We can ignore them, so they don't appear in $CHANGES. So actually '$CHANGES' should be called '$changes_of_files_possibly_in_active_use_by_the_running_app'. It would be rather nice if each patch, in addition to populating .hgignore with 'runtime' files,
+		# 4) ZFS  To emulate this goodness with ZFS, we use 'zfs diff <snapshot> <workingcopy>' to identify files we changed. Unfortunately 'zfs diff' is buggy and fails if files are in use by Java.
+
+		local ignored_by_app
+		mapfile -t ignored_by_app < <(globfile_to_excludes "$ATL_APPDIR/.ignored_by_app")
+		rsync_workingcopy_to_production --dry-run "${ignored_by_app[@]}" --out-format='%i %n%L' >"$CHANGES"
+	}
+
+	fail_if_lostfiles() {
+		debug "Files changed in working copy: «$(cat "$CHANGES")»"
+
+		# $CHANGES contains lines from rsync, like:
+		# >f..t...... lib/postgresql-42.1.4.jar
+		# *deleting   logs/replication_filesystem_working.cron.log
+		#
+		lostfiles=$(mktemp)
+		#trap 'rm "$lostfiles"' TERM EXIT
+		# In this expression, we print verbatim everything after the first text block, if the first is '*deleting'
+		rsynclines_beginning_with '*deleting' <"$CHANGES" >"$lostfiles"
+		debug "Files deleted in working copy: «$(cat "$lostfiles")»"
+
+		if [[ -s $lostfiles ]]; then
+			msg="The following files disappeared from the application directory, and may be relied on by production."
+			msg+="\n\n$(cat "$lostfiles")\n\n"
+			msg+=" In future you may wipe these files with -w / --overwrite."
+			msg+="The list is generated with:\n"
+			msg+="$(declare -f rsync_workingcopy_to_production)\n"
+			msg+="rsync_workingcopy_to_production -v --dry-run\n"
+			msg+="\nFull diff of changes in: $CHANGES\n"
+			echo -e "$msg"
+			read -r -p "Can we overwrite these files, without affecting the running app? (y/N) " yesno
+			case $yesno in
+			y | Y) log "Continuing then.." ;;
+			*) fail "Aborting. " ;;
+			esac
+		else
+			debug "..no files will be removed"
+		fi
+	}
+
+	fail_if_inused_modified_files() {
+		log "Checking for modified in-use files ($CHANGES).."
+		(
+			cd "$workingcopy"
+			if grep -q '^>f' "$CHANGES"; then
+				if (rsynclines_beginning_with ">f" <"$CHANGES") | xargs --no-run-if-empty fuser; then
+					error "The files mentioned above are in-use. Files in $CHANGES"
+				fi
+			fi
+			if grep -q '^..\.\.t' "$CHANGES"; then
+				# .d..t...... apache-tomcat/conf/
+				# .f..t...... apache-tomcat/conf/server.xml
+				# .f..t...... apache-tomcat/conf/tomcat_logcleanup.cron
+				# .d..t...... apache-tomcat/conf/Catalina/localhost/
+				# .f..t...... apache-tomcat/conf/Catalina/localhost/ROOT.xml
+				timestamp_sensitive_directories_regex="${ATL_TOMCAT_SUBDIR}conf"
+				if grep "$timestamp_sensitive_directories_regex" "$CHANGES"; then
+					error "We've found timestamp modifications in a timestamp-sensitive directory ($timestamp_sensitive_directories_regex)."
+				fi
+				error "Timestamps are going to be changed on the following directories:\n$(cat "$CHANGES")\nOut of an abundance of caution, we're not proceeding until these directories can be whitelisted"
+			fi
+		)
+	}
+
+	fail_if_inusefiles() {
+		if grep -q '^\*deleting' "$CHANGES"; then
+			perl <"$CHANGES" -0lane '@F[1] if /^\*deleting/' | xargs --no-run-if-empty fuser | while read -r line; do
+				error "The files mentioned above are in-use. Add -w to force-overwrite. Files in $CHANGES"
+			done
+		fi
+	}
+
+	print_changed_files() {
+		if [[ -s $CHANGES ]]; then
+			log "The following changes were made: \n$(cat "$CHANGES")"
+		else
+			log "No changes were made"
+		fi
+	}
+
+	#### Older diff-based implementation
+	# Independent of the rsync-based tests (the function setting $CHANGES and functions testing its contents), this implementation does a 'diff' from workingcopy to prod, and errors if any differing file is in use by $ATL_USER.
+	check_for_inuse_modified_files_based_on_diff() {
+		# We're in $PWD, and are running 'diff -x .hg -rq ${ATL_VER} ${ATL_VER}-workingcopy', which we expect should have 5 parts, the 4th being the file
+		local used
+		used=()
+		while read -r _ _ _ file _; do
+			#log "Considering file '$file'"
+			if fuser --user "$file" |& grep -q "($ATL_USER)"; then
+				log "  $file is modified AND used by $ATL_PRODUCT"
+				log "  $file modification date: $(stat --format='%y' "$file")"
+				used+=("${file}")
+			else
+				log "  $file is modified but not in current use by the $ATL_PRODUCT process"
+			fi
+		done < <(diff -x .hg -rq "${ATL_VER}-workingcopy" "${ATL_VER}" | grep 'Files .* and .* differ' || true)
+		# We need to alter $used, but cannot do so in a pipe subshell. Use this workaround: http://mywiki.wooledge.org/BashFAQ/024
+
+		# https://serverfault.com/questions/477503/check-if-array-is-empty-in-bash
+		if ((${#used[@]})); then
+			error "ERROR ERROR ERROR ERROR: 'diff' found an in-use file that 'rsync' didn't. Perhaps this is just unfortunate timing: our rsync finished at $(stat --format='%y' "$CHANGES") (compare to mod dates above)..  The files listed above were modified by patches in $workingcopy, and are ACTIVELY in use by $ATL_PRODUCT. As such they cannot be copied back. Please resolve this manually"
+		fi
+
+	}
+
+	#### Older diff-based implementation
+	print_changed_files_based_on_diff() {
+		local diffs
+		diffs="$(
+			cd "$ATL_APPDIR_BASE"
+			diff -x .hg "$(basename "${backupdir}")" "${ATL_VER}" | grep -v 'Common subdirectories' || true
+		)"
+		if [[ -z $diffs ]]; then
+			log "All done. No changes were made"
+		else
+			log "All done. Here are the differences:\n$diffs\nFiles 'Only in ${ATL_VER}' are new. There should be no 'Only in *-backupdir'. Files that differ are unused by any process *currently*, but if any of these differences affects the app, restart ${ATL_SHORTNAME}"
+		fi
+	}
+
+	# This is the rsync command used to apply the working copy. It is stored as a $CHANGES variable to be used twice: once to first check what changes will be made, and then to actually make the transfer.
+	#
+	# Rsync flags are equivalent to -a (-rlptgoD) but without -t, and with -A (ACLs) and -H (hardlinks). --checksum means only content changes count, not timestamp differences
+	#
+	# Notes:
+	# 1) HARDLINKS.  -workingcopy is hardlinked to $ATL_APPDIR via --link-dest above. This is ideal for us since:
+	# - log files (written to by the app) are the same in -workingcopy, so don't get flagged as different even though they change
+	# - 'hg qpop' and 'hg qpush' work by recreating the file (assigning a new inode), not modifying them in-place. This is just what we want: file changes in -workingcopy are not immediately visible in the original (as they would be if hardlinked), but will be applied via rsync.
+	# 2) TIMESTAMPS.  Pushing/popping files modifies their timestamps. If a jar file changed only by timestamp, not content, we don't want to bother rsyncing it (hence --checksums). Java doesn't seem to care if jar timestamps change, but if a Tomcat config file like apache-tomcat/conf/Catalina/localhost/ROOT.xml is modified that doesn't specify reloadable="false" (as in Crowd), then a timestamp change will cause the entire webapp to redeploy. Bad! Hence, --checksums to avoid all timestamp-change-induced problems.
+	# 3) EXCLUDES
+	#  - You will also see a --exclude-from="$ATL_APPDIR/.hgignore" clause. As background: the app in $ATL_APPDIR has two kinds of files:
+	#  -- static files (the app itself, monitoring scripts, webserver config files etc). We know these up-front, commit them to the hg patchqueue, and they don't cause trouble.
+	#  -- runtime files, files created by the app (or surrounding scripts). E.g. Tomcat writes to logs/, temp/, work/, the JFR patch writes files to flightrecordings/, PHP apps write sessions to app/storage/. These files do cause trouble, in that Mercurial flags them as changes that prevent certain operations, like qpop/qpush.
+	#    Each patch therefore patches .hgignore with any 'runtime' files or directories. E.g. the 'tomcat' patch adds '^work/', '^logs/' and '^temp/', and 'flightrecording' adds '^flightrecordings/'.
+	#    This is handy, because we want to exclude all runtime directories from our final rsync from -workingcopy/ back to $ATL_APPDIR. For instance, Tomcat might have written a new .class file into work/ while we were busy editing -workingcopy/. If we 'rsync --delete' our workingcopy to $ATL_APPDIR, we would accidentally delete this new runtime file. Same for new log files, new PHP sessions and other runtime files. It is very handy that Mercurial's need to exclude runtime files coincides with ours - so we use the .hgignore (which must be 'syntax: rootglob) to generate --exclude's.
+
+	log "Now applying changes back to '${ATL_APPDIR}'..."
+	cd "$ATL_APPDIR_BASE"
+	if [[ ! $overwrite ]]; then
+		log "Checking for removed files.."
+
+		find_changes_from_workingcopy_to_current # This defines $CHANGES
+
+		if atl_running; then
+			fail_if_lostfiles             # Abort if any files would 'disappear' when the working copy is applied over production, if the app is running and the files in question aren't known to be unimportant.
+			fail_if_inused_modified_files # Abort of any files 'in use' (according to fuser) are modified
+			fail_if_inusefiles
+
+			# A second, independent check (uses 'diff' directly)
+			#check_for_inuse_modified_files_based_on_diff
+			log "No modified files are in active use." # ..if we're still here
+		else
+			log "$ATL_PRODUCT is not running. Not checking for 'in-use' modifications"
+		fi
+	fi
+
+	log "Copying $workingcopy back.."
+	rsync_workingcopy_to_production
+
+	#print_changed_files_based_on_diff
+	print_changed_files
+}
+
+# It is harmless (and possibly useful) to leave our workingcopy around after we're done, except that, because we use hardlinks, our replication/replication.cron and other *.cron files will now have more than one hardlink. If /opt/atlassian/$app/current/replication/replication.cron is symlinked to /etc/cron.d, as usual, then cron will outright break, with errors:
+# (*system*confluence-backup-rsnapshot) NUMBER OF HARD LINKS > 1 (/etc/cron.d/confluence-backup-rsnapshot)
+# To avoid breaking cron, here we dehardlink the */*.cron files
+
+dehardlink_workingcopy() (
+	cd "$workingcopy"
+	# Break hardlinks
+	shopt -s nullglob # In case there's no cronjobs
+	for cron in */*.cron; do
+		# https://unix.stackexchange.com/questions/66815/breaking-a-hard-link-in-place
+		cp -p "$cron" "$cron".tmp
+		mv -f "$cron".tmp "$cron"
+	done
+)
+
+main "$@"

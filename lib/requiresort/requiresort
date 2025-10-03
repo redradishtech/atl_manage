@@ -1,0 +1,85 @@
+#!/bin/bash
+
+usage()
+{
+	cat <<-EOF
+	Given a list of text files containing '@provides <label>' and/or '@requires <label>' , outputs the list so that @provides appear before matching @requires.
+
+	USAGE: requiresort [PATH ...]
+
+	   ..where PATH is zero or more paths to text files.
+
+	EXAMPLE:
+
+	Say we have SQL files that create, populate, query, then drop a table, and therefore must be listed in a particular order:
+
+	create.sql:
+
+	-- @provides person
+	CREATE TABLE person (id SERIAL, lastname varchar, firstname varchar, age int);
+
+	adults.sql:
+
+	-- @requires person
+	-- @provides users
+	INSERT INTO person (lastname, firstname, age) VALUES ('Joe', 'Shmoe', 39);
+	INSERT INTO person (lastname, firstname, age) VALUES ('John', 'Doe', 45);
+
+	children.sql:
+	-- @requires person
+	-- @provides users
+	INSERT INTO person (lastname, firstname, age) VALUES ('Jimmy', 'Smith', 10);
+
+	query.sql:
+	-- @requires users
+	SELECT avg(age) From person;
+
+	cleanup.sql:
+
+	-- @requires users
+	DROP TABLE person;
+
+
+	## Incorrect order for our needs
+	$ ls -1 *.sql
+	adults.sql
+	children.sql
+	cleanup.sql
+	create.sql
+	query.sql
+
+	## Correct order by dependencies
+	$ requiresort *.sql
+	create.sql
+	children.sql
+	adults.sql
+	query.sql
+	cleanup.sql
+
+
+	ERRATA:
+
+	Files without @provides or @requires directives are emitted at the end.
+	Dependency loops will result in an error to stderr (from tsort) and a nonzero exit code.
+
+EOF
+}
+
+main()
+{
+	(( $# > 0 )) || exit 0
+	set -o pipefail
+	{
+		grep -P --with-filename '@provides [\w\.]+$' "$@" | sed -e 's/:.*@provides / definition:/g'   # Emit a <filename> <definition> pair, i.e. a definition depends on the file it is in
+		grep -P --with-filename '@requires [\w\.]+$' "$@" | sed -e 's/:.*@requires / definition:/g' | awk '{print $2,$1}' # Emit a <definition> <filename> pair, i.e. a requirement indicates that file depends on the required definition
+	} | tsort | grep -v ^definition: 
+	(( tsort_exitcode=${PIPESTATUS[-2]} )) 
+	(( tsort_exitcode == 0 )) || exit $tsort_exitcode
+	grep  -P -H --files-without-match '@(provides|requires) ' "$@" || :
+}
+
+if [[ $1 == --help ]]; then
+	usage "$@";
+else
+	main "$@"
+fi

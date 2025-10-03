@@ -1,0 +1,79 @@
+#!/bin/bash
+
+export GREEN='\u001B[32m'
+export RED='\u001B[31m'
+export RESET='\e[0m'
+
+msg() { echo -e >&2 "${GREEN}$*${RESET}"; }
+bad() { echo -e >&2 "	${RED}$*${RESET}"; exit 1; }
+
+
+msg "Running error_in_function"
+out=$(./error_in_function 2>&1)
+exitcode=$?
+
+error_in_function_tests() {
+	## EXPECTED OUTPUT:
+	#
+	# error_in_function:10 before_failure
+	# !!!boo                          (CWD: /opt/atl_manage/lib/logging)
+	#         ./error_in_function:6 failer
+	#        ./error_in_function:11 main
+	#        ./error_in_function:15 main
+
+	[[ $exitcode == 4 ]] || bad "error_in_function should have returned exit code 4"
+	[[ $out =~ before_failure ]] || bad "Should at least have printed before_failure"
+	[[ $out =~ boo.*CWD:\  ]] || bad "error() message not detected in output: «$out»"
+	[[ $out =~ error_in_function:.+\ failer  ]] || bad "Stacktrace not detected in output «$out»"
+	[[ $out =~ error_in_function:.+\ main  ]] || bad "Stacktrace not detected in output «$out»"
+	[[ ! $out =~ after_failure ]] || bad "Script keeps going when it should have failed"
+}
+
+error_in_function_tests
+
+
+msg "Running failing_subprocess"
+out=$(./failing_subprocess 2>&1)
+exitcode=$?
+
+failing_subprocess_tests() {
+	## This tests an unexpected command failure when 'set -e' is not used, i.e. the show goes on
+	## EXPECTED OUPUT:
+	# failing_subprocess:6 before_failure
+	# !!!             Command failed (1): false
+	#                                 (CWD: /opt/atl_manage/lib/logging)
+	# failing_subprocess:8 after_failure
+	[[ $out =~ before_failure ]] || bad "Should at least have printed before_failure"
+	[[ $out =~ Command\ failed\ \(1\):\ false ]] || bad "Command failure message not detected in output «$out»"
+}
+failing_subprocess_tests
+[[ $out =~ after_failure ]] || bad "Script should have kept going"
+[[ $exitcode == 0 ]] || bad "Script should have completed successfully"
+
+
+msg "Running failing_subprocess with bash -e"
+out=$(bash -e ./failing_subprocess 2>&1)
+exitcode=$?
+failing_subprocess_tests
+[[ ! $out =~ after_failure ]] || bad "Script should NOT have kept going"
+[[ $exitcode == 4 ]] || bad "Script should have exited nonzero, not $exitcode"
+
+out=$(./nested_fails 2>&1)
+nested_fails_tests() {
+	## EXPECTED OUTPUT:
+	# error_in_function:10 before_failure
+	# !!!boo                          (CWD: /opt/atl_manage/lib/logging)
+	#         ./error_in_function:6 failer
+	#         ./error_in_function:11 main
+	#         ./error_in_function:15 main
+	#         ./nested_fails:6 bar
+	#         ./nested_fails:10 foo
+	#         ./nested_fails:12 main
+	error_in_function_tests
+	[[ $out =~ nested_fails:.+\ bar  ]] || bad "Outer stacktrace not detected in output «$out»"
+	[[ $out =~ nested_fails:.+\ foo  ]] || bad "Outer stacktrace not detected in output «$out»"
+	[[ $out =~ nested_fails:.+\ main  ]] || bad "Outer stacktrace not detected in output «$out»"
+}
+nested_fails_tests
+
+msg "All done!"

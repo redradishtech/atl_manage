@@ -1,0 +1,146 @@
+#!/bin/bash
+
+. /opt/atl_manage/lib/logging.sh
+
+main() {
+	check "Apache running?" apache_running
+	check "Apache has spare workers" apache_spare_workers
+	check "Is the application $ATL_PRODUCT_RUNTIME_TECHNOLOGY process running?" running
+	if [[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ java ]]; then
+		check "Tomcat 8009 listening?" tomcat_port_listening 8009
+		check "Tomcat 8009 responsive?" tomcat_port_responding 8009
+		set_tomcathttp
+		check "Tomcat $tomcathttp listening?" tomcat_port_listening "$tomcathttp"
+		check "App /status page through Tomcat $tomcathttp" webapp_status_page_directly_from_tomcat "$tomcathttp"
+	fi
+	check "App /status through $ATL_WEBSERVER" webapp_status_page
+	if [[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ java ]]; then
+		check "Persistent connections from Apache to Tomcat" apache_to_tomcat
+		check "Persistent connections from Tomcat to $ATL_DATABASE_TYPE" tomcat_to_database
+#		check "Database connections" database_activity
+		echo "To see spikes in hits, sessions, low memory or high CPU, see $ATL_BASEURL/monitoring"
+		echo "Still panicing?"
+		read -rp "View thread dump? (y/N) " yesno
+		echo "$yesno"
+		case $yesno in
+		y | Y) atl_diagnostic default.threaddump 0 | vim - ;;
+		esac
+	fi
+}
+
+check() {
+	printf "%-60s" "$1"
+	shift
+	if output=$("$@"); then
+		printf "${GREEN}✓${RESET}\n%s\n" "${output}"
+	else
+		printf "${RED}✗ %s${RESET}\n" "${output//$'\n'/$'\n'   }"
+	fi
+}
+
+apache_running() {
+	apache_serverstatus >/dev/null
+}
+
+apache_serverstatus() {
+	[[ -v ss ]] || ss="$(atl_diagnostic server-status)"
+	echo "$ss"
+
+}
+
+apache_spare_workers() {
+	apache_serverstatus | perl -F: -lane 'printf("\n\t%-20s %s", $F[0], $F[1]) if grep(/$F[0]/, qw(BusyWorkers IdleWorkers ConnsTotal Scoreboard) )'
+	idlecount="$(apache_serverstatus | perl -F: -lane 'print $F[1] if $F[0] eq "IdleWorkers"')"
+	((idlecount > 10))
+}
+
+running() {
+	atl_ps >/dev/null
+}
+
+tomcat_port_listening() {
+	# We could use ss here, but lsof returns a nonzero exit code if nothing matches, which is what we want. https://unix.stackexchange.com/questions/384920/ss-exit-code-always-0
+	lsof -sTCP:LISTEN -i "@$ATL_FQDN_INTERNAL:$1" >/dev/null
+}
+
+tomcat_port_responding() {
+	chronic check_ajp -I "$ATL_FQDN_INTERNAL" --port="$1" -c 2
+}
+
+webapp_status_page_directly_from_tomcat() {
+	local json
+	local internalurl="http://$ATL_FQDN_INTERNAL:$1"
+	[[ "$ATL_BASEURL_INTERNAL" = "$internalurl" ]] || fail "Unexpectedly, our inferred internal URL '$internalurl' is not equal to AT_BASEURL_INTERNAL '$ATL_BASEURL_INTERNAL'"
+	json="$(curl -s --max-time 3 "http://$ATL_FQDN_INTERNAL:$1/status")"
+	echo "$json" | grep RUNNING
+}
+
+webapp_status_page() {
+	local json
+	json="$(curl -s --max-time 3 "$ATL_BASEURL/status")"
+	echo "$json" | grep RUNNING
+}
+
+apache_to_tomcat() {
+	local ajpconns=$(ss --resolve --no-header --processes --all --tcp '( dport = :8009 )')
+	echo "$ajpconns" | awk '{print $5}' | sort | uniq -c
+}
+
+tomcat_to_database() {
+	local dbconns dbconncount allowed_max
+	dbconns="$(ss --resolve --no-header --processes --all --tcp "( dst $ATL_DATABASE_HOST and dport = :$ATL_DATABASE_PORT )")"
+	dbconncount="$(echo "$dbconns" | wc -l)"
+	echo "$dbconns" | awk '{print $5}' | sort | uniq -c
+	case "$ATL_DATABASE_TYPE" in
+		postgresql)
+			allowed_max="$(atl_pg_conftool show --short max_connections)"
+			if ! (( dbconncount + 10 < allowed_max)); then
+				echo >&2 "Problem: we're short on free db connections (used $dbconncount of $allowed_max total). Increase Postgres max_connections"
+				return 1
+			else
+				echo -e "\twithin Postgres' max_connections=$allowed_max limit"
+			fi
+			;;
+	esac
+}
+
+database_activity() {
+	[[ $ATL_DATABASE_TYPE = postgresql ]] || return
+	atl_psql --super -tAc 'select count(*) from pg_stat_activity;'
+}
+
+set_tomcathttp() {
+	if [[ ! -v tomcathttp ]]; then
+		case "$ATL_PRODUCT" in
+		jira) tomcathttp=8080 ;;
+		confluence) tomcathttp=8090 ;;
+		crowd) tomcathttp=8095 ;;
+		esac
+	fi
+}
+
+main "$@"
+
+#Apache:
+#
+#MaxRequestWorkers (608) total incoming connections. Each is represented by a character:
+#
+# __W______________WLR_____________L__L_..........................
+# ............WL____WL____L__W_W_L__W_W__LR_WR______..............
+# ..................G.............................................
+# ................................................................
+# ................................................................
+# ................................................................
+# ................................................................
+# ................................................................
+# ................................................................
+# ................................
+#
+#
+#  handled by:
+#        N processes * ThreadsPerChild (38) (where N<=ServerLimit)
+#        ProxyPass would use max = ThreadsPerChild (38) pooled connections                               https://httpd.apache.org/docs/2.4/mod/mod_proxy.html
+#                but actually there are 183 Jira backend connections and 146 Confluence connections
+#
+#  AJP then can accept maxConnections (8192) incoming connections, and acceptCount (100) further blocked, handled by maxThreads (200) threads.                   https://tomcat.apache.org/tomcat-8.0-doc/config/ajp.html#Connector_Comparison
+#

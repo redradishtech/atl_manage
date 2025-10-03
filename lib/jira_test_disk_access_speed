@@ -1,0 +1,19 @@
+#!/bin/bash -eu
+#https://confluence.atlassian.com/kb/test-disk-access-speed-for-jira-server-performance-troubleshooting-818577561.html
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+# shellcheck source=/opt/atl_manage/lib/http.sh
+source "$ATL_MANAGE/lib/http.sh" --
+
+jar=$(geturlfile "https://confluence.atlassian.com/jirakb/files/54362304/54591494/3/1444177154112/support-tools.jar")
+
+java -Djava.io.tmpdir="$ATL_DATADIR"/caches -jar "$jar"
+
+echo "Expected:
+
+open    <40,000
+r/w     <40,000
+close   <20,000
+delete	<50,000
+"

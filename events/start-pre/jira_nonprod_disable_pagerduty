@@ -1,0 +1,15 @@
+#!/bin/bash
+## Disable PagerDuty on sandbox when Jira starts
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+PATH=$ATL_MANAGE/bin:$PATH
+
+require_app jira
+require_table propertystring
+only_in_nonproduction
+
+log "Disabling PagerDuty on $ATL_ROLE"
+# Note that the generated SQL uses 'on conflict' which is not supported in older (9.2) Postgres
+atl_pg_set jira disableplugin com.pagerduty.jira-server-plugin | atl_psql -tAXq

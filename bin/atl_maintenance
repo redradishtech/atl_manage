@@ -1,0 +1,103 @@
+#!/bin/bash -eu
+# Sets, unsets and checks the status of 'maintenance mode' for an app.
+# Improvement ideas:
+# - allow ahead-of-time scheduled maintenance windows. The markerfile will need extending to start:end:message format.
+# - Add maintenance states 'soft' (warning banner; user access allowed) and 'hard' (access restricted by Apache)
+# - Restrict Apache to only maintenance IPs
+# - Set a banner with the maintenance message.
+# - Disable 'rm' and 'rsync' aliasing during maintenance
+
+# shellcheck source=/opt/atl_manage/lib/maintenance.sh
+source "$ATL_MANAGE/lib/maintenance.sh"
+# Necessary for the 'grep -v's
+set -o pipefail
+
+main() {
+	case "${1:-}" in
+	in_maintenance)
+		[[ -f $ATL_MAINTENANCE_MARKERFILE ]] && exit 0 || exit 1
+		;;
+	esac
+	#shellcheck source=/opt/atl_manage/lib/common.sh
+	source "$ATL_MANAGE/lib/common.sh" --nolog
+	#shellcheck source=/opt/atl_manage/lib/maintenance.sh
+	source "$ATL_MANAGE/lib/maintenance.sh" --nolog
+
+	case "${1:-}" in
+	set | on)
+		[[ $# -ge 2 ]] || usage
+		shift
+		hours=$1
+		shift
+		message="$*"
+		rm -f "$ATL_MAINTENANCE_MARKERFILE"
+		write_markerfile "$message"
+		touch -d "$hours" "$ATL_MAINTENANCE_MARKERFILE"
+		chmod ugo+r "$ATL_MAINTENANCE_MARKERFILE"   # Let apache read the file
+		log "Setting maintenance mode for ${hours}, with message: $message"
+		;;
+	unset | off)
+		shift
+		if [[ $# != 0 ]]; then error "$0 'unset' does not take any args"; fi
+		log "Unsetting maintenance mode"
+		rm -f "$ATL_MAINTENANCE_MARKERFILE"
+		;;
+	check)
+		check_in_maintenance
+		;;
+	st | status)
+		warn "Deprecated in favour of in_maintenance (21/Jun/21)"
+		if [[ -f $ATL_MAINTENANCE_MARKERFILE ]]; then
+			echo "maintenance mode ON	 [$(cat "$ATL_MAINTENANCE_MARKERFILE")]"
+		else
+			echo "maintenance mode OFF"
+		fi
+		;;
+	--help | *)
+		usage
+		;;
+	esac
+}
+
+write_markerfile() {
+	local message="$1"
+	echo "<html><head><title>Site under Maintenance</title></head><body><h1>Site Under Maintenance</h1><p>$message</p></body></html>" >"$ATL_MAINTENANCE_MARKERFILE"
+	log "Wrote message to markerfile $ATL_MAINTENANCE_MARKERFILE"
+}
+
+usage() {
+	cat <<EOF
+$*
+Purpose: sets, unsets and checks the status of whether $ATL_LONGNAME is in maintenance mode
+
+
+Usage:
+atl_maintenance	set|on [interval]	[maintenance message]
+atl_maintenance	unset|off				# Sets maintenance mode to OFF
+atl_maintenance in_maintenance					# Exits with 0 if in maintenance, 1 if not in maintenance
+Shows maintenance status, printing ON or OFF
+atl_maintenance check					# Non-zero exit code if we're in maintenance mode, and the user doesn't override when prompted
+atl_maintenance	--help
+
+Examples:
+
+	atl_maintenance set '+3 hours'
+	atl_maintenance set '2pm' "Upgrade"
+
+EOF
+	exit
+}
+
+check_in_maintenance() {
+	if [[ $ATL_ROLE =~ prod ]] && [[ ! -f $ATL_MAINTENANCE_MARKERFILE ]]; then
+		read -rp "Ahem, we're a production server ($ATL_BASEURL). Is $ATL_LONGNAME in maintenance mode? (y/n): " YN
+		case $YN in
+		[yY])
+			main on '+5 minutes' ""
+			;;
+		*) quit "Then we shouldn't be proceeding." ;;
+		esac
+	fi
+}
+
+main "$@"

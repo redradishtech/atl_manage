@@ -1,0 +1,33 @@
+#!/bin/bash -u
+## Triggers a reindex of a sample Jira issues (via a custom testreindex.jsp), and if indexing is timing out, takes a diagnostic snapshot
+# Hint: check /rest/indexanalyzer/1/state?maxResults=100
+# https://confluence.atlassian.com/jirakb/how-to-remove-from-jira-lucene-index-issues-that-have-been-deleted-in-the-database-but-still-present-in-index-998896911.html
+
+. /opt/atl_manage/lib/logging.sh
+
+TIMEOUT=${ATL_INDEXING_MAX_DELAY:-20}
+
+main() {
+	# FIXME: We swallow stderr because on Jira <8.13.6 there are no index logs, and
+	# the script prints a warning. Swallowing stderr isn't great because it masks
+	# other errors
+	if json=$(atl_logstats index last 2>/dev/null); then
+		timeout=$(echo "$json" | jq '.totalTimeTimedOutMillis.count')
+		if (( timeout > 0 )); then
+			error "Index stats show $timeout index requests timed out."
+		fi
+	fi
+
+	timeout "$TIMEOUT" curl -s "$ATL_BASEURL_INTERNAL/testreindex.jsp"
+	# 'timeout' exits with 124 if an actual timeout occurs, which is the only error condition we want to take a thread dump for (vs. ATL_BASEURL_INTERNAL not responding or testindex.jsp not being deployed)
+	if (( $? == 124 )); then
+		log "JIRA reindexing is stuck. No reindex within $TIMEOUT seconds. Taking thread dump"
+		atl_event slowreindex
+		# FIXME: add this everywhere or nowhere
+		if [[ -x $ATL_APPDIR/bin/database_activity_dump.sh ]]; then "$ATL_APPDIR/bin/database_activity_dump.sh"; fi
+		sleep 60  # Failsafe to prevent server meltdown if we're invoked too often
+		exit 2
+	fi
+}
+
+main "$@"

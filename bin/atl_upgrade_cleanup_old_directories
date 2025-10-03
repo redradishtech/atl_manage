@@ -1,0 +1,73 @@
+#!/bin/bash -eu
+
+#shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed --nolog
+source "$ATL_MANAGE/lib/zfs.sh"
+
+MINAGE=60
+(
+	shopt -s nullglob
+	mydirs=("$ATL_APPDIR_BASE")
+	if [[ $ATL_DATADIR_VERSIONED = true ]]; then
+		mydirs+=("$ATL_DATADIR_BASE")
+	fi
+	for base in "${mydirs[@]}"; do
+
+		oldver="$(switchver "$base" oldest || :)"
+		dir="$base/old/$oldver"
+
+		if [[ -n $oldver && -d "$dir" ]]; then
+			log "Checking that $base/old/$oldver has no files younger than $MINAGE days..."
+			# Delete any backups and working copies associated with the old version
+			ionice -c 3 rm -rf "$base"/."$oldver"-backup-* "$base"/"$oldver"-workingcopy &
+			ionice -c 3 rm -rf "$base"/"$oldver"-backup-????????-?????? &
+			if [[ ! -L "$dir" ]] && # Exclude the symlink to ../$ver, which is the n-1 release
+				[[ -z $(find "$dir"/ -mtime -$MINAGE) ]]; then
+				log "Deleting $dir"
+				if [[ -v ATL_ZFS && $dir =~ "$ATL_DATADIR_BASE" ]]; then   # Only DATADIR is zfs-versioned
+					if fs=$(zfs_filesystem_mounted_at "$dir"); then
+						warn "Please manually delete ZFS filesystem (if not cloned): zfs destroy -r $fs"
+					else
+						warn "Old version files are unexpectedly not in a distinct filesystem. Please delete manually: $dir"
+					fi
+				else
+					warn "Please manually delete $dir"
+				fi
+			else
+				# Either the previous/ symlink, or an old/ dir not MINAGE-old enough. Clean transient files
+				log "So. you live to see another day, $dir"
+				if [[ $base = "$ATL_APPDIR_BASE" ]]; then
+					frdir="$dir"/flightrecordings
+					if [[ -d "$frdir" ]]; then
+						find "$frdir" -mindepth 1 -delete
+					fi
+					tempdir="$dir"/${ATL_TOMCAT_SUBDIR}temp
+					if [[ -d "$tempdir" ]]; then
+						find "$tempdir" -mindepth 1 -delete
+					fi
+				fi
+			fi
+			for mirrordir in "$base"/"$oldver"_mirror-from-*; do
+				warn "WARNING: deleting obsolete location of mirror dir $mirrordir. This is slightly experimental!"
+				rm -rf "$mirrordir"
+			done
+
+			for backupdir in "$ATL_BACKUP_ROOT"/"$oldver"-before-upgrade-to-*; do
+				warn "WARNING: deleting $backupdir. This is slightly experimental!"
+				rm -rf "$backupdir"
+			done
+		fi
+	done
+)
+
+case $ATL_PRODUCT in
+jira)
+	find "$ATL_DATADIR/export" -name "20[12]*-*-*-**.zip" -mtime +60 -print0 | xargs -0 --no-run-if-empty --verbose rm -f
+	;;
+confluence)
+	# FIXME: find the name of the auto-backup dir - I don't think it's 'backups'
+	if [[ -d $ATL_DATADIR/backups ]]; then
+		find "$ATL_DATADIR/backups" -name "backup-*.zip" -mtime +30 -print0 | xargs -0 --no-run-if-empty --verbose echo rm -f
+	fi
+	;;
+esac

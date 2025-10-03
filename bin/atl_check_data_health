@@ -1,0 +1,833 @@
+#!/bin/bash -eu
+## Database integrity checks
+# Note that this script may spawn some very slow SQL queries in the background. It is thus unsuitable for running from an automated check.
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+# atl_psql isn't available otherwise
+export PATH=$ATL_MANAGE/bin:$PATH
+export PATH="/usr/lib/nagios/plugins:$PATH" # For check_http
+shopt -s lastpipe
+
+main() {
+	## Note that main is not a subshell, because we need to pass the values of $errors and $warnings to the caller
+
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	local PARSED
+	PARSED=$(getopt --options 's:' --longoptions 'help,runslowqueries' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	# Note, no commit=. We check on the variable's defined'ness rather than value below, so that we can distinguish between '--commit' and '--commit=foo'
+	runslowqueries=
+	while true; do
+		case "$1" in
+		--runslowqueries | -s) runslowqueries=true ;;
+		-h | --help) usage ;;
+		--)
+			shift
+			break
+			;;
+		*) usage "Invalid option: $1" ;;
+		esac
+		shift
+	done
+	# }}}
+
+	cd /tmp # notice we're in a subshell - change to /tmp so psql doesn't panic if $PWD isn't readable by our user, which will be $ATL_USER if called from cron
+	postgresql_logging_everything
+	postgresql_zfs
+	# I don't think this is the right place for runtime status checks, but here FYI is one
+	# sudo -u postgres "$ATL_MANAGE"/monitoring/plugins/check_postgres.pl --action=backends --warning=-10 --critical=-5
+	continue_if_database_accessible || exit 0
+
+	annotated_threads
+	case "$ATL_PRODUCT" in
+	jira)
+		jira_bamboo_duplicate_jobs
+		jira_deactivated_workflows
+		jira_index_recovery
+		jira_orphan_customfieldvalues
+		jira_duplicate_epic_story_links
+		jira_changehistory_not_slow
+		jira_analytics
+		jira_zipbackups
+		jira_lexorank_markers
+		jira_activeobject_views_defined
+		if [[ $runslowqueries ]]; then
+			jira_conflicting_jqlt_scriptrunner
+			jira_no_data_available_gadgets
+			# Aug/22: disabling this check. Jira 8.20.8 at least ignores such users - they cannot be seen/deleted in the Project Roles screen, and who knows if this still causes problems
+			jira_github_token_format
+			jira_project_roles_reference_valid_users
+			jira_users_without_application_access
+		fi
+		jira_cwd_users_have_app_user_record
+		jira_securelogin_null_tokengen_time
+		jira_webhooks_too_long_for_jira10
+		;;
+	confluence)
+		confluence_webdav_widget_security
+		confluence_huge_events
+		confluence_huge_scheduler_run_details
+		confluence_huge_snapshots
+		confluence_analytics
+		confluence_zipbackups
+		if [[ $runslowqueries ]]; then
+			confluence_broken_attachments
+			confluence_gliffy_null_images
+		fi
+		confluence_user_mapping
+		confluence_recommended_updates_email
+		;;
+	jethro)
+		jethro_null_assignees
+		# Obsolete
+		#jethro_archived_staff
+		jethro_planned_absence_creator
+		jethro_charactersets
+		jethro_members_enabled_but_no_from_address
+		jethro_bug845_nuked_fields
+		jethro_233_upgrades_not_run
+		jethro_233_missing_member_rego_fields
+		jethro_whitespace_in_emails
+		jethro_yearless_date_customfields
+		jethro_invisible_roles
+		jethro_check_custom_reports_for_broken_comments
+		# Not a problem
+		# jethro_check_for_windows_newlines
+		jethro_check_configsettings
+		;;
+	esac
+	gzipcompression
+	security_vulnerabilities
+	crowd_nestedgroups
+	javamelody_nagios_access
+}
+
+adderror() {
+	errors=$((errors + 1))
+	if (($#)); then warn "$@"; fi
+}
+
+addwarning() {
+	warnings=$((warnings + 1))
+	if (($#)); then warn "$@"; fi
+
+}
+
+continue_if_database_accessible() {
+	case "$ATL_DATABASE_TYPE" in
+	*postgresql*)
+		atl_psql -tAXqc 'select 1' >/dev/null || {
+			warn "No database set up / contactable"
+			return 0
+		}
+		;;
+	mysql)
+		atl_mysql -sBe 'select 1' >/dev/null || {
+			warn "No database set up / contactable"
+			return 0
+		}
+		;;
+	esac
+	case "$ATL_PRODUCT" in
+	jira)
+		require_table propertyentry
+		require_table project
+		;;
+	confluence)
+		require_table bandana
+		;;
+	crowd)
+		require_table cwd_directory
+		;;
+	esac
+}
+
+gzipcompression() {
+	case "$ATL_PRODUCT" in
+	confluence)
+		if [[ $(atl_pg_get confluence setting gzippingResponse | atl_psql -tAXq) != true ]]; then
+			atl_running || return 0 # We can only check if the app is GZip-compressing if it's online
+			if ! check_http --header='Accept-Encoding: gzip' --no-body --header-string='Content-Encoding: gzip' --ssl --sni -H "$ATL_FQDN" -u '/includes/js/signup.js' -e '200' >/dev/null; then
+				warn "$ATL_PRODUCT is not gzip-compressing output, either natively in $ATL_PRODUCT or at the $ATL_WEBSERVER layer. Responses will be slow. See https://confluence.atlassian.com/doc/compressing-an-http-response-within-confluence-13204.html"
+			else
+				:
+				# Note, echo not warn - we don't want stacktrace in output that gets sent to nagios
+				#echo "Note: $ATL_PRODUCT is correctly configured to gzip output at the $ATL_WEBSERVER layer, not natively in $ATL_PRODUCT"
+			fi
+		fi
+
+		;;
+	jira)
+		if [[ $(atl_pg_get jira setting jira.option.web.usegzip | atl_psql -tAXq) != 1 ]]; then
+			atl_running || return 0 # We can only check if the app is GZip-compressing if it's online
+			if ! check_http --header='Accept-Encoding: gzip' --no-body --header-string='Content-Encoding: gzip' --ssl --sni -H "$ATL_FQDN" -u '/static-assets/metal-all.js' -e '200' >/dev/null; then
+				warn "$ATL_PRODUCT is not gzip-compressing output, either natively in $ATL_PRODUCT or at the $ATL_WEBSERVER layer. Responses will be slow."
+			else
+				:
+				#echo "Note: $ATL_PRODUCT is correctly configured to gzip output at the $ATL_WEBSERVER layer, not natively in $ATL_PRODUCT"
+			fi
+		fi
+		;;
+	esac
+}
+
+postgresql_logging_everything() {
+	[[ $ATL_DATABASE_TYPE =~ postgresql ]] || return 0
+
+	local logstatement
+	logstatement="$(atl_psql -tAXqc "show log_statement;")"
+	if [[ "$logstatement" != none ]]; then
+		echo "WARNING: Postgres is logging excessively (log_statment=$logstatement). This will decrease IO performance and eventually fill up the disk"
+		echo "To fix this: echo \"alter user \\\"$ATL_DATABASE_USER\\\" set log_statement to 'none';\" | atl_psql --super"
+		echo "See https://wiki.postgresql.org/wiki/Per-user_log_settings"
+		addwarning
+	fi
+}
+
+postgresql_zfs() {
+	if [[ ${ATL_ZFS:-} = true && $ATL_DATABASE_TYPE =~ postgresql ]]; then
+		fpw=$(echo "show full_page_writes;" | atl_psql -tAXq)
+		if [[ $fpw != off ]]; then
+			echo "OPTIMIZATION: With ZFS, we can turn Postgres full_page_writes=off (currently '$fpw')"
+			echo "	https://gist.github.com/saurabhnanda/5258207935bf23cd112be292d22f00d5"
+			echo
+			echo '	"ZFS is Copy on Write (CoW). As a result, it’s not possible to have a torn page because a page can’t be partially written without reverting to the previous copy. This means we can actually turn off full_page_writes in the Postgres config. "'
+			echo "	-https://www.2ndquadrant.com/en/blog/pg-phriday-postgres-zfs/"
+			echo "Do it with:"
+			echo "atl_psql --super -c 'ALTER SYSTEM SET full_page_writes=off;'"
+			echo "systemctl reload postgresql@$ATL_DATABASE_VERSION-$ATL_DATABASE_CLUSTER"
+
+		fi
+	fi
+}
+
+security_vulnerabilities() {
+	case "$ATL_PRODUCT" in
+	jira)
+		version_greaterequalthan "$ATL_VER" 8.20.10 || warn "Vulnerable to servlet filter CVE-2022-26136, CVE-2022-26137: https://confluence.atlassian.com/security/multiple-products-security-advisory-cve-2022-26136-cve-2022-26137-1141493031.html"
+		version_greaterequalthan "$ATL_VER" 8.20.6 || warn "Vulnerable to Seraph bypass CVE-2022-0540: https://confluence.atlassian.com/jira/jira-security-advisory-2022-04-20-1115127899.html"
+		version_greaterequalthan "$ATL_VER" 8.20.10 || warn "Vulnerable to CVE-2022-26135: https://confluence.atlassian.com/jira/jira-server-security-advisory-29nd-june-2022-1142430667.html"
+		;;
+	confluence)
+		version_greaterequalthan "$ATL_VER" 7.13.7 || warn "Vulnerable to servlet filter CVE-2022-26136, CVE-2022-26137: https://confluence.atlassian.com/security/multiple-products-security-advisory-cve-2022-26136-cve-2022-26137-1141493031.html"
+		version_greaterequalthan "$ATL_VER" 7.13.7 || warn "Vulnerable to Questions for Confluence CVE-2022-26138: https://confluence.atlassian.com/doc/questions-for-confluence-security-advisory-2022-07-20-1142446709.html"
+		version_greaterequalthan "$ATL_VER" 7.13.7 || warn "Vulnerable to RCE CVE-2022-26134 - https://confluence.atlassian.com/doc/confluence-security-advisory-2022-06-02-1130377146.html"
+
+		version_greaterequalthan "$ATL_VER" "7.13.0" || warn "Vulnerable to OGNL injection CVE-2021-26084: https://confluence.atlassian.com/doc/confluence-security-advisory-2021-08-25-1077906215.html"
+		;;
+	fisheye)
+		version_greaterequalthan "$ATL_VER" 4.8.10 || warn "Vulnerable to servlet filter CVE: https://confluence.atlassian.com/doc/questions-for-confluence-security-advisory-2022-07-20-1142446709.html"
+		;;
+	esac
+}
+
+annotated_threads() {
+	[[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ java ]] || return 0
+	# It is really useful, when taking a thread dump, to be able to see the username and URL associated with each thread. This used to be achieved by plugins, but nowadays the 'Troubleshooting and support tools' plugin has it built-in, but off by default.
+	local warning="WARNING: Please turn on Thread diagnostics in the Thread diagnostics tab of $ATL_BASEURL/plugins/servlet/troubleshooting/view/"
+	case "$ATL_PRODUCT" in
+	confluence)
+		echo "select '$warning'  where not exists (select * from bandana where bandanacontext='_GLOBAL' and bandanakey='com.atlassian.troubleshooting.thready.configuration.enabled' and bandanavalue='<string>true</string>');" | atl_psql -tAXq
+		;;
+	jira)
+		echo "select '$warning' where not exists (select * from propertyentry pe JOIN propertystring ps USING (id) WHERE pe.entity_name='jira.properties' and pe.property_key='com.atlassian.troubleshooting.thready.configuration.enabled' and propertyvalue='true');" | atl_psql -tAXq
+		;;
+	esac
+}
+
+require_table() {
+	case "$ATL_DATABASE_TYPE" in
+	*postgresql*)
+		# https://stackoverflow.com/questions/20582500/how-to-check-if-a-table-exists-in-a-given-schema
+		if [[ $(atl_psql -tAXqc "SELECT EXISTS ( SELECT 1 FROM pg_tables WHERE  schemaname = 'public' AND tablename = '$1');") != t ]]; then
+			# Our database isn't set up. No point doing any consistency checks
+			exit 0
+		fi
+		;;
+	mysql)
+		if [[ -z "$(echo "SHOW TABLES LIKE '$1'" | atl_mysql -sB)" ]]; then
+			exit 0
+		fi
+		;;
+	esac
+}
+
+jira_deactivated_workflows() {
+	## Note that since 2/12/21 this should rarely trigger, as $ATL_MANAGE/events/start-pre/jira_fix_issues_with_no_workflow fixes it on startup
+	sql="select count(*), to_char(max(jiraissue.updated), 'YYYY-MM-DD') AS lastupdated, string_agg(project.pkey || '-' || jiraissue.issuenum, ', ') AS issues FROM project JOIN jiraissue ON project.id = jiraissue.project JOIN os_wfentry ON jiraissue.workflow_id = os_wfentry.id WHERE os_wfentry.state=0;"
+	atl_psql -F$'\t' -tAXqc "$sql" | while IFS=$'\t' read -r count _ _; do
+		# We get a false positive if the script runs at precisely the wrong moment. Sleep a bit, then re-check
+		if ((count > 0)); then
+			sleep 5
+			atl_psql -F$'\t' -tAXqc "$sql" | while IFS=$'\t' read -r count lastupdated issues; do
+				if ((count > 0)); then
+					echo -e "$count issues have deactivated workflows.\n\tMost recently updated: $lastupdated\n\tThis can occur when a workflow post-function fails (e.g. Groovy), or when jira is shut down improperly e.g. due to high load. Per https://confluence.atlassian.com/jirakb/how-to-run-the-workflow-integrity-checks-in-sql-658179102.html, this can be fixed with : update os_wfentry set state=1 from jiraissue JOIN project ON project.id = jiraissue.project WHERE jiraissue.workflow_id = os_wfentry.id AND os_wfentry.state=0 RETURNING os_wfentry.*;\n\tAffected issues:\n\t$issues"
+					adderror
+				fi
+			done
+		fi
+	done
+}
+
+jira_conflicting_jqlt_scriptrunner() {
+	local count
+	count=$(atl_psql -tAXqc "select count(*) from pluginversion where pluginkey in ('com.j-tricks.jql-plugin', 'com.onresolve.jira.groovy.groovyrunner');")
+	if [[ $count = 2 ]]; then
+		count=$(atl_psql -tAXqc "select count(*) from pluginstate where pluginkey ~ '^com.j-tricks.jql-plugin:(recent-projects|inactive-users|attachment-count|has-subtasks|overdue-versions|has-links)$' and pluginenabled='false';")
+		if [[ $count != 6 ]]; then
+			addwarning "WARNING: JQL Tricks and ScriptRunner are both present in the $ATL_DATABASE db, and certain JQL functions overlap (recentProjects, inactiveUsers, hasAttachments, hasSubtasks, overDueVersions, hasLinks). These should be disabled in the JQLT plugin or queries will break;"
+		fi
+	fi
+}
+
+jira_index_recovery() {
+	[[ $ATL_ROLE = prod ]] || return 0 # Only check this in prod; in non-prod index backups will have been disabled by $ATL_MANAGE/events/start-pre/jira_nonprod_disable_indexsnapshots
+	local count
+	count=$(atl_psql -tAXqc "select count(*) from serviceconfig where clazz = 'com.atlassian.jira.index.ha.IndexSnapshotService';;")
+	if [[ $count = 0 ]]; then
+		addwarning "Index recovery is not enabled (/secure/admin/IndexAdmin.jspa). This will slow down a restore from backup"
+	fi
+}
+
+jira_bamboo_duplicate_jobs() {
+	local count
+	count=$(atl_psql -tAXqc "select count(*) from clusteredjob where job_runner_key='com.atlassian.jira.plugin.ext.bamboo.service.PlanStatusUpdateJob';")
+	# We don't really want any of these, but until we figure out an SQL fix, let's only warn about >10
+	if ((count > 10)); then
+		addwarning "WARNING: There are $count Bamboo PlanStatusUpdateJobs, each writing to the database once a minute. Unless you are using Bamboo these should be deleted. See https://jira.atlassian.com/browse/JRASERVER-66593. Use the ScriptRunner fix at https://jira.atlassian.com/browse/JRASERVER-66593?focusedCommentId=1904550&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-1904550"
+	fi
+}
+
+jira_orphan_customfieldvalues() {
+	local orphans
+	orphans=$(atl_psql -tAXqc "select cfname, stringvalue from customfield JOIN customfieldvalue ON customfield.id = customfieldvalue.customfield where customfieldvalue.issue is null;")
+	if [[ -n $orphans ]]; then
+		log "FYI: Orphan custom field values: there are some custom field values not attached to any issue. This will cause the Project Importer to break with: \"There was a problem parsing the backup XML file at foo.zip: No 'issue' field for CustomFieldValue '...'.\" Orphaned fields:\n$orphans"
+		# This is not nagios warning-worthy, of interest only to users doing project imports
+		#addwarning
+	fi
+}
+
+jira_duplicate_epic_story_links() {
+	local count
+	count=$(atl_psql -tAXqc "select count(*) from issuelinktype where linkname='Epic-Story Link';")
+	if [[ $count -gt 1 ]]; then
+		addwarning "WARNING: There are $count 'Epic-Story Link' link types. There should be just 1. This breaks linkedIssuesOf(). See https://confluence.atlassian.com/jirakb/duplicate-epic-story-link-types-in-issuelinktype-table-causing-errors-in-search-using-has-epic-779158623.html"
+	fi
+}
+
+jira_changehistory_not_slow() {
+	# https://amplitude.engineering/how-a-single-postgresql-config-change-improved-slow-query-performance-by-50x-85593b8991b0
+	:
+	#atl_psql -tAXqc 'SELECT CG.ID, CG.issueid, CG.AUTHOR, CG.CREATED, CI.ID, CI.groupid, CI.FIELDTYPE, CI.FIELD, CI.OLDVALUE, CI.OLDSTRING, CI.NEWVALUE, CI.NEWSTRING FROM public.changegroup CG INNER JOIN public.changeitem CI ON CG.ID = CI.groupid WHERE CG.issueid=10000 ORDER BY CG.CREATED ASC, CI.ID ASC;'
+}
+
+jira_analytics() {
+	analytics_enabled_count="$(echo "select count(*) from propertyentry JOIN propertystring USING (id) where propertyentry.entity_name='jira.properties' and property_key='com.atlassian.analytics.client.configuration..analytics_enabled' and propertyvalue='true';" | atl_psql -tAXq)"
+	if ((analytics_enabled_count > 0)); then
+		addwarning "WARNING: Analytics is enabled. Disable it at $ATL_BASEURL/plugins/servlet/analytics/configuration"
+	fi
+}
+
+jira_zipbackups() {
+	local attachmentsize
+	local MAX_MB=100
+
+	echo "select cron_expression from serviceconfig where clazz='com.atlassian.jira.service.services.export.ExportService' ;" | atl_psql -tAXq | while read -r _cronexp; do
+		attachmentsize=$(echo "select sum(filesize) from fileattachment;" | atl_psql -tAXq)
+		attachmentsize=$((attachmentsize / 1024 / 1024))
+		if ((attachmentsize > MAX_MB)); then
+			addwarning "WARNING: Jira XML backups are enabled, and zip backup will be over ${attachmentsize}Mb (attachments). Delete the backup service at $ATL_BASEURL/secure/admin/ViewServices!default.jspa"
+		fi
+	done
+}
+
+jira_lexorank_markers() {
+	# Catch the cause of errrors:
+	# com.atlassian.greenhopper.manager.lexorank.LexoRankIntegrityException: Expected the first rank row to be of type MAXIMUM_MARKER_ROW. Found row[LexoRankRow{id=6223180, fieldId=11500, issueId=6341160, lockHash='null', lockTime=null, bucket=1, rank='1|i1kgao:', type=ISSUE_RANK_ROW}]
+	#        at com.atlassian.greenhopper.manager.lexorank.LexoRankDaoImpl.getMaximumMarkerRowAndPreviousRow(LexoRankDaoImpl.java:366)
+	runsql() {
+		# --csv isn't supported in psql v11
+		#cat <<-EOF | atl_psql -tAX --csv -q
+		cat <<-EOF | atl_psql -tAX -F$'\t' -q
+			 SELECT customfield.cfname, customfield.id, minlexos."RANK", maxlexos."RANK" 
+				FROM customfield
+					LEFT JOIN (select * from "AO_60DB71_LEXORANK" where "TYPE"=0) minlexos ON minlexos."FIELD_ID" = customfield.id
+					LEFT JOIN (select * from "AO_60DB71_LEXORANK" where "TYPE"=2) AS maxlexos ON maxlexos."FIELD_ID" = customfield.id
+				WHERE customfieldtypekey='com.pyxis.greenhopper.jira:gh-lexo-rank';
+		EOF
+	}
+	lexorank_insert() {
+		local fieldid="$1"
+		local issueid="$2"
+		local rank="$3"
+		local type="$4"
+		echo 'WITH nextmax AS (select max("ID")+1 as id from "AO_60DB71_LEXORANK") INSERT INTO public."AO_60DB71_LEXORANK" ("FIELD_ID", "ID", "ISSUE_ID", "LOCK_HASH", "LOCK_TIME", "RANK", "TYPE", "BUCKET")'" select $fieldid, nextmax.id, $issueid, NULL, NULL, '$rank', $type, 1 from nextmax RETURNING *;"
+	}
+	lexorank_insert_minmarker() { lexorank_insert "$1" "-9223372036854775808" "1|000000:" 0; }
+	lexorank_insert_maxmarker() { lexorank_insert "$1" "9223372036854775807" "1|zzzzzz:" 2; }
+
+	#┌────────┬───────┬───────────┬───────────┐
+	#│ cfname │  id   │   RANK    │   RANK    │
+	#├────────┼───────┼───────────┼───────────┤
+	#│ Rank   │ 11500 │ 2|000000: │ 2|zzzzzz: │
+	#└────────┴───────┴───────────┴───────────┘
+	runsql | while IFS=$'\t' read -r cfname cfid min max; do
+		intro="Rank custom field '$cfname' ($cfid)"
+		err=
+		if [[ -z "$min" ]]; then
+			err="-- $intro has no MINIMUM_MARKER_ROW. Fix with: \n\t$(lexorank_insert_minmarker "$cfid")\n"
+		elif [[ ! "$min" =~ ^.\|000000:$ ]]; then err="$intro has unexpected MINIMUM_MARKER_ROW '$min'"; fi
+		if [[ -z "$max" ]]; then
+			err+="-- $intro has no MAXIMUM_MARKER_ROW. Fix with: \n\t$(lexorank_insert_maxmarker "$cfid")\n"
+		elif [[ ! "$max" =~ ^.\|zzzzzz:$ ]]; then err+=" $intro has unexpected MINIMUM_MARKER_ROW '$max'"; fi
+		if [[ -n "$err" ]]; then
+			addwarning -e "WARNING: $err"
+		fi
+	done
+}
+
+jira_activeobject_views_defined() {
+
+	atl_psql -tAXqc '\dn agile' | while read -rp agile; do # Pick the 'agile' schema as very likely to be presen
+		# org.postgresql.util.PSQLException: ERROR: cannot alter type of a column used by a view or rule
+		#  Detail: rule _RETURN on view jemh.auditmeta depends on column "UNKNOWN_COUNT"
+		echo "Warning: It appears activeobjects views are defined. This will break upgrades, and even things like JEMH events"
+		echo "To fix, ( cd $ATL_MANAGE/lib/activeobject_views; atl_psql -tAXq < drop_views.sql ) | atl_psql"
+		addwarning
+	done
+}
+
+crowd_nestedgroups() {
+	[[ $ATL_PRODUCT = jira ]] || [[ $ATL_PRODUCT = confluence ]] || return 0
+	require_table cwd_directory
+	require_table cwd_directory_attribute
+
+	# The d.active::text~'[T1]' is a hack to work with Confluence ('T', 'F') and Jira (0, 1)
+	nonnested_crowd_directory="$(echo "select d.directory_name from cwd_directory d JOIN cwd_directory_attribute cda ON d.id=cda.directory_id WHERE d.active::text~'[T1]' and  d.directory_type='CROWD' and cda.attribute_name='useNestedGroups' and cda.attribute_value='false';" | atl_psql -tAXq)"
+	if [[ -n $nonnested_crowd_directory ]]; then
+		echo "WARNING: Crowd directory '$nonnested_crowd_directory' is not using nested groups. If Crowd has any nested groups, these groups will not be populated in $ATL_PRODUCT. See https://confluence.atlassian.com/crowdkb/nested-users-not-appearing-in-atlassian-applications-linked-to-crowd-678691148.html"
+		echo "This can be fixed in the database with:"
+		echo "update cwd_directory_attribute set attribute_value='true' where attribute_name='useNestedGroups' and attribute_value='false' and directory_id=(select d.id from cwd_directory d JOIN cwd_directory_attribute cda ON d.id=cda.directory_id WHERE d.directory_type='CROWD' and cda.attribute_name='useNestedGroups' and cda.attribute_value='false');"
+	fi
+}
+
+javamelody_nagios_access() {
+	local dir
+	local group
+	for dir in "$ATL_DATADIR/javamelody" "$ATL_DATADIR/javamelody/$ATL_SHORTNAME"; do
+		[[ -d "$dir" ]] || continue
+		group="$(stat -c %G "$dir")"
+		if [[ $group != nagios ]]; then
+			addwarning "Directory $dir must have group 'nagios', not '$group', otherwise the JavaMelody plugin check_jmelody (running as nagios) will throw 'Permission denied' errors. Strange but true"
+		fi
+	done
+}
+
+jira_no_data_available_gadgets() {
+	local dashboards_count="$(echo "select count (distinct portalpage.pagename) from portalpage JOIN portletconfiguration pc ON pc.portalpage=portalpage.id   WHERE gadget_xml ~ 'stats-gadget.xml' and exists (select * from gadgetuserpreference where portletconfiguration=pc.id and userprefkey='statType');" | atl_psql -tAXq)"
+	if ((dashboards_count > 0)); then
+		echo "WARNING:  $dashboards_count dashboards have pie charts showing 'No Data Available'"
+		# I'm not exiting nonzero because EVERY Jira I know of has this problem now, and it obscures realer problems.
+		#addwarning
+	fi
+}
+
+jira_github_token_format() {
+	local tokens
+	tokens="$(echo "select \"DVCS_TYPE\", \"HOST_URL\", \"NAME\" from \"AO_E8B6CC_ORGANIZATION_MAPPING\" where \"DVCS_TYPE\" like 'github' and \"ACCESS_TOKEN\" !~ '^gho_';" | atl_psql -tAXq)"
+	if [[ -n $tokens ]]; then
+		addwarning "WARNING: Github will complain about older-style tokens: $tokens"
+	fi
+}
+
+jira_users_without_application_access() {
+	if ! version_greaterthan "$ATL_VER" 8.19; then return; fi
+	local query="cwd_user JOIN cwd_membership ON child_id=cwd_user.id JOIN cwd_group ON cwd_group.id=cwd_membership.parent_id WHERE cwd_user.active=1 AND cwd_user.id not in (select child_id from cwd_membership JOIN licenserolesgroup ON licenserolesgroup.group_id=cwd_membership.lower_parent_name) and cwd_user.id not in (select child_id from cwd_membership where parent_name='confluence-users')"
+	local user_count
+	user_count="$(echo "select count(distinct cwd_user.user_name) FROM $query;" | atl_psql -tAXq)"
+	if ((user_count > 0)); then
+		addwarning -e "WARNING: There are $user_count Jira users marked Active, but are not in any application group, and won't be able to log in **or receive notifications**. They also aren't in 'confluence-users' which would explain their lack of Jira access. This suddenly becomes a problem in Jira 8.20.1+. To see the users, run: \necho \"select distinct user_name FROM $query;\" | atl_psql"
+	fi
+
+}
+
+jira_cwd_users_have_app_user_record() {
+	local users
+	users="$(echo "select distinct lower_user_name from cwd_user JOIN cwd_directory ON cwd_directory.id=cwd_user.directory_id LEFT JOIN app_user USING (lower_user_name) WHERE cwd_directory.active=1 and cwd_user.active=1 AND app_user.lower_user_name is null;" | atl_psql -tAXq)"
+	if [[ -n "$users" ]]; then
+		addwarning "WARNING: There are active cwd_users who have no app_user record. This causes the user picker to break for anyone searching for letters matching the missing username (Jira 8.20.12). Affected users: $users"
+	fi
+}
+
+jira_securelogin_null_tokengen_time() {
+	local users
+	# Jun/25 update: kjmyuran is an example of someone with no apparent problems logging in with a null token. See email to him/her
+	users="$(echo 'select lower_user_name from cwd_user JOIN app_user USING (lower_user_name) JOIN "AO_B8B557_SECURE_LOGIN_USER" AS u ON u."USER_IDENTIFIER" = app_user.user_key  where u."TOKEN_GENERATION_TIME" is null and lower_user_name not in ('"'"'kjmyuran'"'"');' | atl_psql -tAXq)"
+	if [[ -n "$users" ]]; then
+		addwarning "WARNING: SecureLogin 2FA problem: some users have a null token generation time, meaning their 2FA will never work. See HD-8838. Affected users: $users"
+	fi
+}
+jira_project_roles_reference_valid_users() {
+	local query="select project.pkey, projectrole.name, projectroleactor.roletypeparameter from projectroleactor JOIN project ON projectroleactor.pid=project.id JOIN projectrole ON projectrole.id=projectroleactor.projectroleid LEFT JOIN app_user ON projectroleactor.roletypeparameter=app_user.user_key  where roletype='atlassian-user-role-actor'  AND app_user.user_key is null;"
+	local invalid
+	invalid="$(echo "$query" | atl_psql -tAXq)"
+	if [[ -n "$invalid" ]]; then
+		# This database problem results in log errors like:
+		# 2021-12-20 21:25:52,210-0800 ajp-nio-127.0.0.101-8009-exec-79 ERROR someone@example.com 1285x4528098x1 12q5sqc 157.51.51.205 /rest/api/2/issue/LUMINA-410/comment [c.a.jira.notification.NotificationFilterManagerImpl] Ignoring notification filter of type 'com.atlassian.jira.plugins.inform.batching.recipients.filters.ConditionalNotificationFilter' because of 'java.lang.IllegalStateException: There is no ID mapped for the user key 'nonexistent_user@example.com''
+		addwarning "WARNING: Project roles reference an invalid user. This has the effect of using old notification templates (HD-3161): $invalid"
+	fi
+}
+
+jira_webhooks_too_long_for_jira10() {
+	local count
+	local query='select count(*) From "AO_4AEACD_WEBHOOK_DAO" WHERE length("FILTER")>255 ;'
+	count="$(atl_psql -tAXqc "${query}")"
+	if ((count > 0)); then
+		addwarning -e "WARNING: There are $count webhooks ($ATL_BASEURL/plugins/servlet/webhooks) whose JQL filter is >255 chars. This will break on Jira 10. https://jira.atlassian.com/browse/JRASERVER-78654"
+	fi
+}
+
+confluence_huge_events() {
+	if ! version_greaterthan "$ATL_VER" 6.0; then return; fi
+	(
+		local synchrony_eventsize
+		synchrony_eventsize=$(atl_psql -tAXqc "select count(*) from \"EVENTS\";")
+		if ((synchrony_eventsize > 1000000)); then
+			addwarning -e "WARNING: Confluence has a large EVENTS table ($synchrony_eventsize entries). This should be truncated to speed up backups. See\nhttps://confluence.atlassian.com/confkb/how-to-reduce-the-size-of-synchrony-tables-858770831.html\nhttps://jira.atlassian.com/browse/CONFSERVER-52923\nhttps://jira.atlassian.com/browse/CONFSERVER-51812?focusedCommentId=1865374&page=com.atlassian.jira.plugin.system.issuetabpanels:comment-tabpanel#comment-1865374\n"
+		fi
+	) &
+}
+confluence_huge_snapshots() {
+	# Version 6.10.2 has Synchrony, but no SNAPSHOTS.inserted column
+	if ! version_greaterthan "$ATL_VER" 7.0; then return; fi
+	(
+		local synchrony_snapshotsize
+		synchrony_snapshotsize=$(atl_psql -tAXqc "select count(*) from \"SNAPSHOTS\" where inserted<now()-'1 week'::interval;")
+		# 100 is chosen arbitrarily. A well-used Confluence has < 100
+		if ((synchrony_snapshotsize > 1000)); then
+			addwarning "WARNING: Confluence has a large SNAPSHOTS table ($synchrony_snapshotsize entries). This indicates the Synchrony Data Removal (Soft) scheduled job is not running successfully (https://confluence.atlassian.com/confkb/how-to-remove-synchrony-data-968658367.html#HowtoremoveSynchronydata-hardremove)"
+		fi
+	)
+}
+
+confluence_webdav_widget_security() {
+	local ver=$ATL_VER
+	local VMAJOR=${ver%%.*}
+	local VPATCH=${ver##*.}
+	local VMINOR=${ver#${VMAJOR}.}
+	VMINOR=${VMINOR%%.${VPATCH}}
+	if [[ $VMAJOR -lt 6 ]] ||
+		[[ $VMAJOR -eq 6 && $VMINOR -lt 14 ]] ||
+		[[ $VMAJOR -eq 6 && $VMINOR -eq 14 && $VPATCH -lt 2 ]]; then
+		if [[ $ver = 6.12.13 || $ver = 6.13.3 || $ver = 6.6.2 ]]; then return; fi # Exceptions
+		# We've got a potentially vulnerable version
+		if ((ATL_DATABASE_VERSION >= 10)); then
+			webdav_disabled="$(echo "WITH pluginstates AS (select xmltable.* from bandana, XMLTABLE('/map/entry' PASSING (bandanavalue::xml) COLUMNS string text NOT NULL, boolean boolean ) where bandanacontext='_GLOBAL' and bandanakey='plugin.manager.state.Map') select boolean from pluginstates where string='confluence.extra.webdav';" | atl_psql -tAXq)"
+			widgetconnector_disabled="$(echo "WITH pluginstates AS (select xmltable.* from bandana, XMLTABLE('/map/entry' PASSING (bandanavalue::xml) COLUMNS string text NOT NULL, boolean boolean ) where bandanacontext='_GLOBAL' and bandanakey='plugin.manager.state.Map') select boolean from pluginstates where string='com.atlassian.confluence.extra.widgetconnector';" | atl_psql -tAXq)"
+			if [[ $webdav_disabled != f ]]; then
+				addwarning "WARNING: WebDAV plugin is vulnerable: https://confluence.atlassian.com/doc/confluence-security-advisory-2019-03-20-966660264.html. Please disable"
+			fi
+			if [[ $widgetconnector_disabled != f ]]; then
+				addwarning "WARNING: Widget Connector plugin is vulnerable: https://confluence.atlassian.com/doc/confluence-security-advisory-2019-03-20-966660264.html. Please disable"
+			fi
+		else
+			echo "WARNING: $ATL_PRODUCT version $ATL_VER is vulnerable to https://confluence.atlassian.com/doc/confluence-security-advisory-2019-03-20-966660264.html. Please go to $ATL_BASEURL/plugins/servlet/upm/manage/all and ensure 'WebDAV Plugin' and 'Widget Connector' plugins are disabled (we can't check on Postgres $ATL_DATABASE_VERSION)"
+		fi
+	fi
+}
+
+confluence_huge_scheduler_run_details() {
+	(
+		local runsize=$(atl_psql -tAXqc "select count(*) from scheduler_run_details;")
+		# E.g. 1m entries creates 72Mb of SQL
+		if ((runsize > 1000000)); then
+			addwarning "WARNING: Confluence has a large scheduler_run_details table ($runsize entries). This can cause database slowdowns as Postgres deletes old ones 2000 at a time."
+		fi
+	) &
+}
+
+confluence_analytics() {
+	analytics_enabled_count="$(echo "select count(*) from bandana where bandanacontext='_GLOBAL' and bandanakey='com.atlassian.analytics.client.configuration..analytics_enabled' and bandanavalue='<string>true</string>'" | atl_psql -tAXq)"
+	if ((analytics_enabled_count > 0)); then
+		addwarning "WARNING: Analytics is enabled. Disable it at $ATL_BASEURL/plugins/servlet/analytics/configuration"
+	fi
+}
+
+confluence_zipbackups() {
+	local cronexp attachmentsize
+	local MAX_MB=100
+
+	local enabled
+	enabled="$(echo "select unnest(xpath('/com.atlassian.confluence.schedule.ScheduledJobConfiguration/enabled/value/text()', bandanavalue::xml)) from bandana where bandanacontext='com.atlassian.confluence.schedule.ScheduledJobConfiguration' and bandanakey='DEFAULT#BackupJob';" | atl_psql -tAXq)"
+	if [[ "$enabled" = 1 ]]; then
+		addwarning "WARNING: Confluence XML backups are enabled. Delete the backup service at $ATL_BASEURL/admin/scheduledjobs/viewscheduledjobs.action"
+	fi
+}
+
+confluence_broken_attachments() {
+	:
+	# The image isn't broken if <ri:content-entity's id is the actual ID of the page (contentid). Ideally we could craft a dynamic regex to include the actual contentid at the right part of the regex, but I don't know how to do this, so just check for contentid *anywhere* in the body. This will cause some false negatives but better than unfixable false positives.
+	# Tooo slow
+	(
+		broken="$(echo "select spacekey || ' | [' || content.title || '|/pages/viewpage.action?pageId=' || contentid || ']' from content JOIN bodycontent USING (contentid)  JOIN spaces USING (spaceid) where body ~ '<ac:image>\s*<ri:attachment ri:filename=\"[^\"]*\"\s?>\s*<ri:content-entity ri:content-id=\"\d+.\"\s?/>\s*</ri:attachment>\s*</ac:image>' and prevver is null  and body not like '%' ||contentid||'%';" | atl_psql -tAXq)"
+		if [[ -n "$broken" ]]; then
+			addwarning "WARNING: Confluence pages have broken attachments (CONFSERVER-60526):    $broken"
+		fi
+	) &
+	# We could also do this check for CONFSERVER-55928 'missing attachment' images, but if the page has 0 attachments (e.g. copy and pasted from somewhere else incorrectly) then attachment links would be legitimately broken, and I don't see what we could replace the placeholder with.
+	#broken="$(echo "select spacekey || ' | [' || content.title || '|https://confluence.example.com/pages/viewpage.action?pageId=' || contentid || ']' from content JOIN bodycontent USING (contentid)  JOIN spaces USING (spaceid) where body ~ '<ac:image>\s*<ri:url ri:value=\"https://[^/]+/plugins/servlet/confluence/placeholder/unknown-attachment.*</ac:image>' and prevver is null;" | atl_psql -tAXq)"
+	#if [[ -n "$broken" ]]; then
+	#	echo "WARNING: Confluence pages have broken attachments (CONFSERVER-55928):    $broken"
+	#	addwarning
+	#fi
+}
+
+confluence_gliffy_null_images() {
+	:
+	#(
+	# E.g. <ac:structured-macro ac:macro-id="7c43c0b6-c33c-42f1-93c2-ccc0ab9193db" ac:name="gliffy" ac:schema-version="1"><ac:parameter ac:name="macroId">8e090212-6171-4444-b652-6b1533fee78d</ac:parameter><ac:parameter ac:name="" />
+	# Fix with:
+	# update bodycontent set body = regexp_replace(body, '<ac:structured-macro( ac:name="gliffy"| ac:macro-id="[^"]+"| ac:schema-version="1"){3}><ac:parameter ac:name="macroId">[^<]+</ac:parameter><ac:parameter ac:name="" /></ac:structured-macro>', 'MISSING GLIFFY DIAGRAM', 'g') from content where content.contentid=bodycontent.contentid and content.prevver is null and content_status='current' and body ~ '<ac:structured-macro( ac:name="gliffy"| ac:macro-id="[^"]+"| ac:schema-version="1"){3}><ac:parameter ac:name="macroId">[^<]+</ac:parameter><ac:parameter ac:name="" /></ac:structured-macro>' returning bodycontent.contentid, content.title;
+	warn "FIXME: commented out slow Gliffy check"
+	#broken="$(echo "SELECT spacekey, '/pages/viewpage.action?pageId=' || contentid, title from spaces JOIN content USING (spaceid) JOIN bodycontent USING (contentid) WHERE prevver is null and content_status='current' AND body ~ '"'<ac:structured-macro( ac:name="gliffy"| ac:macro-id="[^"]+"| ac:schema-version="1"){3}><ac:parameter ac:name="macroId">[^<]+</ac:parameter><ac:parameter ac:name="" /></ac:structured-macro>'"'"';' | atl_psql -tAXq)"
+	#if [[ -n "$broken" ]]; then
+	#	echo -e "WARNING: Confluence pages have Gliffy macros with empty attachment names. If edited, such pages will fail to render with 'java.lang.RuntimeException: Error rendering template for decorator root. The affected pages are:\n$broken'"  # LO 10/Sep/21
+	#	addwarning
+	#fi
+	#) &
+}
+
+confluence_user_mapping() {
+	broken="$(echo "select * from user_mapping where lower(username)!=lower_username;" | atl_psql -tAXq)"
+	if [[ -n "$broken" ]]; then
+		echo -e "WARNING: user_mapping table has inconsistent values. Can generate Space import errors like https://confluence.atlassian.com/confkb/restore-of-a-site-xml-backup-fails-due-to-duplicate-entry-for-key-unq_lwr_username-error-998896818.html\n$broken"
+		addwarning "Fix with: update user_mapping set lower_username=lower(username) where username is not null and lower(username)!=lower_username returning *;"
+	fi
+
+}
+
+confluence_recommended_updates_email() {
+	if [[ $(atl_pg_get confluence recommended-updates-email | atl_psql -tAXq) = true ]]; then
+		addwarning "WARNING: The evil 'Recommended Updates Email' is enabled. Turn it off at $ATL_BASEURL/admin/dailysummary/admin.action"
+	fi
+
+}
+
+jethro_null_assignees() {
+	require_table action_plan # This must come first
+	broken=$(atl_mysql -sNBe 'select id,name from action_plan where actions like '"'"'%"assignee";s:0:""%'"'"';')
+	if [[ -n $broken ]]; then
+		addwarning "WARNING: Jethro affected by https://github.com/tbar0970/jethro-pmm/issues/807: $broken"
+	fi
+}
+
+jethro_archived_staff() {
+	require_table staff_member
+	require_table _person
+	broken=$(atl_mysql -sNBe "select username from staff_member JOIN _person USING (id) where status='archived';")
+	if [[ -n $broken ]]; then
+		addwarning -e "WARNING: The staff members' «$broken» person record is archived. This causes adding a planned absence in the members section to break. https://github.com/tbar0970/jethro-pmm/issues/812"
+	fi
+
+}
+jethro_planned_absence_creator() {
+	require_table planned_absence
+	local createddl
+	createddl=$(atl_mysql -sNBe "show create table planned_absence;")
+
+	# Check for:   CONSTRAINT `planned_absencecreator` FOREIGN KEY (`creator`) REFERENCES `staff_member` (`id`),
+
+	if [[ $createddl =~ REFERENCES\ .staff_member.\ \(.id.\) ]]; then
+		addwarning "WARNING: Non-staff members cannot create planned absences. https://github.com/tbar0970/jethro-pmm/issues/813"
+	fi
+
+}
+
+jethro_charactersets() {
+	local charset collation
+	local expected='utf8mb4'
+	echo "SELECT DEFAULT_CHARACTER_SET_NAME FROM information_schema.SCHEMATA where SCHEMA_NAME=DATABASE() and DEFAULT_CHARACTER_SET_NAME != '$expected';" | atl_mysql -sB | while read -r charset; do
+		echo "WARNING: Database '$ATL_DATABASE' character set is '$charset', not '$expected' as expected. See https://github.com/tbar0970/jethro-pmm/pull/754"
+	done
+
+	local badtables
+	badtables=$(
+		echo 'SELECT T.table_name, CCSA.character_set_name FROM information_schema.`TABLES` T, information_schema.`COLLATION_CHARACTER_SET_APPLICABILITY` CCSA WHERE CCSA.collation_name = T.table_collation AND T.table_schema = DATABASE() and character_set_name!='"'$expected'"';' | atl_mysql -sB | while read -r table charset; do
+			printf "%-30s %s\n" "$table" "$charset"
+		done
+	)
+	if [[ -n $badtables ]]; then
+		echo "WARNING: Some tables have the wrong (non-$expected) character set:"
+		echo "$badtables"
+		echo
+		echo "To fix, run: cat $ATL_MANAGE/templates/sql/mysql_jethro_fix_bad_charsets.sql | atl_mysql -sB"
+	fi
+
+	local expected='utf8mb4_general_ci'
+	echo "SELECT DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA where SCHEMA_NAME=DATABASE() and DEFAULT_COLLATION_NAME != '$expected';" | atl_mysql -sB | while read -r collation; do
+		echo "WARNING: Database '$ATL_DATABASE' default collation is '$collation', not '$expected' as expected. This will cause LIKE searches to not be case-insensitive."
+	done
+
+}
+
+jethro_members_enabled_but_no_from_address() {
+	local fromaddr members_enabled
+	members_enabled=$(atl_mysql -sBe "select value from setting where symbol='MEMBER_LOGIN_ENABLED';")
+	if [[ $members_enabled == 1 ]]; then
+		fromaddr="$(atl_mysql -sBe "select value from setting where symbol='MEMBER_REGO_EMAIL_FROM_ADDRESS';")"
+		if [[ $fromaddr =~ ^\s*$ ]]; then
+			addwarning "WARNING: Member Login is enabled, but the 'Member Rego Email From Address' field is unset. This will cause stacktraces if members try to register. See https://github.com/tbar0970/jethro-pmm/issues/480"
+		else
+			:
+			#log "Member rego From address correctly set ('$fromaddr')"
+		fi
+	else
+		:
+		#log "Members area disabled"
+	fi
+}
+
+jethro_bug845_nuked_fields() {
+	local nuked_users
+	nuked_users=$(
+		#shellcheck disable=SC2028
+		echo "select id,first_name, last_name, email,mobile_tel from _person where history REGEXP '(.* changed from \".+?\" to \"\"\n){5}';" | atl_mysql -sB | while read -r id first_name last_name email _tel; do
+			printf "%-40s\t%-30s\t%-60s\n" "$first_name $last_name <$email>" "" "$ATL_BASEURL/?view=persons&personid=$id"
+		done
+	)
+	if [[ -n "$nuked_users" ]]; then
+		echo "Nuked users (https://github.com/tbar0970/jethro-pmm/issues/845):"
+		echo "$nuked_users"
+		# This is no longer worth warning about, as we have false positives
+		#addwarning
+	fi
+
+}
+
+jethro_233_upgrades_not_run() {
+	local sym
+	for sym in ATTENDANCE_LIST_ORDER MEMBER_REGO_EMAIL_CC; do
+		_jethro_assert_setting_not_present "$sym" "2023-upgrade-to-233.sql was not applied ($sym setting present in db)"
+	done
+	_jethro_assert_setting_present MEMBER_REGO_HELP_EMAIL "2023-upgrade-to-233.sql was not applied"
+}
+
+jethro_233_missing_member_rego_fields() {
+	_jethro_assert_setting_present MEMBER_REGO_EMAIL_FROM_NAME "Jethro 233+ requires the 'Member Rego Email From Name' field, set at $ATL_BASEURL/?view=admin__system_configuration. Without it the members/ section breaks"
+	_jethro_assert_setting_present MEMBER_REGO_EMAIL_SUBJECT "Jethro 233+ requires the 'Member Rego Email Subject' field, set at $ATL_BASEURL/?view=admin__system_configuration. Without it the members/ section breaks"
+}
+
+jethro_whitespace_in_emails() {
+	# When viewing a group, one will see errors " Error: <email> is not a valid value for email field "email" and has not been set" if any person records have whitespace in emails. It isn't possible to enter whitespace-trailing emails when creating persons normally. Perhaps it is from CSV.
+	local whitespaceemail_users
+	whitespaceemail_users=$(
+		#shellcheck disable=SC2028
+		echo "select id,email from _person where email regexp ' $';" | atl_mysql -sB | while read -r id email; do
+			printf "%-40s\t%-30s\n" "$email" "$ATL_BASEURL/?view=persons&personid=$id"
+		done
+	)
+	if [[ -n "$whitespaceemail_users" ]]; then
+		echo "Emails with whitespace: "
+		echo "$whitespaceemail_users"
+		addwarning
+	fi
+}
+
+jethro_yearless_date_customfields() {
+	echo "select data_type from information_schema.columns where table_schema=database() and table_name='custom_field_value' and column_name='value_date';" | atl_mysql -sB | while read -r coltype; do
+	if [[ $coltype = date ]]; then
+		local affected_cfs
+		affected_cfs="$(echo "select group_concat(name) from custom_field where type='date' and params like '%\"allow_blank_year\";b:1%';" | atl_mysql -sB)"
+		addwarning "Yearless dates will break (https://github.com/tbar0970/jethro-pmm/issues/994). To fix, run SQL 'alter table custom_field_value modify value_date char(10);'. Affected custom fields: $affected_cfs"
+	fi
+	done
+}
+
+jethro_invisible_roles() {
+	local rostertitles
+	rostertitles="$(echo "select title from roster_role where congregationid=0;" | atl_mysql -sB)"
+	[[ -n $rostertitles ]] || return 0
+	addwarning "The following roster roles are in congregation '0' instead of NULL, and so won't show up on the roster role page: $rostertitles.\nTo fix:\n1) Ensure roles are not used in any Roster Views\n2) Run SQL: update roster_role set congregationid = null, active=0  where congregationid=0 and not exists (select * from roster_view_role_membership where roster_role_id = roster_role.id); -- Deactivate unused roster roles with wrong '0' congregation\nupdate roster_role set congregationid = null where congregationid = 0; -- Fix 'no congregation' role"
+}
+
+jethro_check_custom_reports_for_broken_comments() {
+	local badlines
+	if [[ -d $ATL_DATADIR/custom_reports ]]; then
+		if badlines="$(grep -h -- '--[^ ]' "$ATL_DATADIR"/custom_reports/*.sql | grep -v '^\s*-- ' | grep -v "^\s*'")"; then
+			adderror "There are custom reports containing broken MySQL commas, that will fail silently: $badlines"
+		fi
+	fi
+}
+
+jethro_check_for_windows_newlines() {
+	return 0
+	# UPDATE: I don't think this is a real problem. Tons of EJ instances have \r\n and work find
+	local count
+	count="$(echo "select count(*) from _person where history like '%\r\n%';" | atl_mysql -sB)"
+	if [[ $count != 0 ]]; then
+		# Fix with: UPDATE _person SET history = REPLACE(history, '\r\n', '\n') WHERE history LIKE '%\r\n%' ;
+		adderror "ERROR: $count _person histories have windows newlines. See https://github.com/tbar0970/jethro-pmm/issues/1092"
+	fi
+	count="$(echo "select count(*) from family where history like '%\r\n%';" | atl_mysql -sB)"
+	if [[ $count != 0 ]]; then
+		adderror "ERROR: $count family histories have windows newlines. See https://github.com/tbar0970/jethro-pmm/issues/1092"
+	fi
+	count="$(echo "select count(*) from abstract_note where history like '%\r\n%';" | atl_mysql -sB)"
+	if [[ $count != 0 ]]; then
+		adderror "ERROR: $count abstract_note histories have windows newlines. See https://github.com/tbar0970/jethro-pmm/issues/1092"
+	fi
+	count="$(echo "select count(*) from action_plan where actions like '%\r\n%';" | atl_mysql -sB)"
+	if [[ $count != 0 ]]; then
+		adderror "ERROR: $count action_plan actions have windows newlines. See https://github.com/tbar0970/jethro-pmm/issues/1092"
+	fi
+}
+
+jethro_check_configsettings() {
+	:
+	local locklen
+	local TOOLONG_MINS=60
+	locklen="$(echo "select value from setting where symbol = 'LOCK_LENGTH'" | atl_mysql -sB)"
+	if (( locklen > TOOLONG_MINS )); then
+		addwarning "LOCK_LENGTH setting value $locklen is greater than $TOOLONG_MINS. People starting editing rosters etc will lock out other people"
+	fi
+}
+
+_jethro_assert_setting_present() {
+	local sym="$1"
+	if [[ 1 != "$(echo "select count(*) from setting where symbol='$sym';" | atl_mysql -sB)" ]]; then
+		adderror "ERROR: $* ($sym setting not present)"
+	fi
+}
+
+_jethro_assert_setting_not_present() {
+	local sym="$1"
+	local errmsg="$2"
+	echo "select * from setting where symbol='$sym';" | atl_mysql -sB | while read -r result; do
+		adderror "ERROR: $errmsg"
+	done
+}
+
+usage() {
+	echo >&2 "Purpose: Checks the $ATL_DATABASE database for evidence of runtime problems (data inconsistencies, causes of slowness etc)"
+	cat >&2 <<-EOF
+
+		Usage:
+		$0 [--runslowqueries]
+
+		The --runslowqueries option triggers slower consistency checks. These are run in a background proces.
+	EOF
+	exit 0
+}
+
+errors=0
+warnings=0
+
+main "$@"
+wait # Wait for backgrounded checks to finish
+[[ $errors = 0 ]] || exit 2
+[[ $warnings = 0 ]] || exit 1

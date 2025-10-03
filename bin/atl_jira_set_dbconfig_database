@@ -1,0 +1,26 @@
+#!/bin/bash -eu
+# Ensures that dbconfig.xml has the correct JDBC URL for this profile
+
+dbconfig="$ATL_DATADIR/dbconfig.xml"
+# The %-* converts 'postgresql-rds' to 'postgresql'
+correct_jdbc="jdbc:${ATL_DATABASE_TYPE%-*}://$ATL_DATABASE_HOST:$ATL_DATABASE_PORT/$ATL_DATABASE"
+if [[ $* =~ -h ]]; then
+	echo "Usage:   $(basename "$0") [--verbose] [--help]"
+	echo "Purpose: Edits $dbconfig and modifies the JDBC URL to be correct for this profile ($correct_jdbc)"
+	echo
+	exit
+fi
+
+if [[ ! -f $dbconfig ]]; then
+	echo >&2 "$dbconfig missing"
+	exit 1
+fi
+old=$(grep -E '<(url|username|password)>' "$dbconfig")
+perl -i -pe "s,<url>jdbc:.*</url>,<url>jdbc:${ATL_DATABASE_TYPE%-*}://$ATL_DATABASE_HOST:$ATL_DATABASE_PORT/$ATL_DATABASE</url>,g; s,<username>.*</username>,<username>$ATL_DATABASE_USER</username>,; s,<password>.*</password>,<password>$ATL_DATABASE_PASSWORD</password>," "$dbconfig"
+new=$(grep -E '<(url|username|password)>' "$dbconfig")
+if [[ $* =~ -v ]]; then
+	echo "JDBC url in $dbconfig changed from:"
+	echo "	$old"
+	echo "to:"
+	echo "	$new"
+fi

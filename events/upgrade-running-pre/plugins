@@ -1,0 +1,9 @@
+#!/bin/bash -eu
+# Save plugin JSON before upgrade, for post-upgrade comparisons
+
+upgrade-running-pre() {
+	atl_plugins --save
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

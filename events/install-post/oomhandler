@@ -1,0 +1,38 @@
+#!/bin/bash -eu
+
+set -o pipefail
+
+servicename="${ATL_SYSTEMD_SERVICENAME}-oomhandler@.service"
+socketname="${ATL_SYSTEMD_SERVICENAME}-oomhandler.socket"
+
+install-post() {
+	[[ ! -v ATL_SERVICE_INSTALLED_EXTERNALLY ]] || return 0
+
+	installservice "oomhandler/$servicename"
+	installservice "oomhandler/$socketname"
+	systemctl start "$socketname"
+}
+
+uninstall-pre() {
+	if [[ -v ATL_SERVICE_INSTALLED_EXTERNALLY ]]; then
+		# E.g. if we rely on the system'd php-fpm
+		return 0
+	fi
+
+	local servicename="${ATL_SYSTEMD_SERVICENAME}-oomhandler@.service"
+	local socketname="${ATL_SYSTEMD_SERVICENAME}-oomhandler.socket"
+
+	uninstallservice "$servicename"
+	uninstallservice "$socketname"
+	warn "Did the uninstall of '$servicename' and $socketname' work??"
+}
+
+upgrade-running-pre() {
+	:
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh
+
+# Our systemd script now executes $ATL_APPDIR/bin/event, which in turn invokes $ATL_MANAGE/lib/event
+# vim: set ft=sh:

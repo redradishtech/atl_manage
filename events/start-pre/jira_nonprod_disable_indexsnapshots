@@ -1,0 +1,14 @@
+#!/bin/bash
+## Disable potentially slow index snapshots in non-prod.
+
+# shellcheck source=/opt/atl_manage/events/start-pre/../.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+PATH=$ATL_MANAGE/bin:$PATH
+
+require_app jira
+require_table serviceconfig
+only_in_nonproduction
+
+log "Disabling index snapshots (potentially) slow) on $ATL_ROLE"
+echo "delete from serviceconfig where clazz = 'com.atlassian.jira.index.ha.IndexSnapshotService';" | atl_psql -tAXq

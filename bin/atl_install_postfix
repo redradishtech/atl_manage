@@ -1,0 +1,34 @@
+#!/bin/bash -eu
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
+
+main() (
+	# pcre is needed for bounce rewriting https://www.postfix.org/postconf.5.html#smtp_reply_filter
+	# # libsasl2-modules is needed for smtp_sasl_security_options=noanonymous
+	pkginstall postfix postfix-pcre libsasl2-modules
+	pkginstall procmail
+	ln -sf /opt/atl_manage/templates/postfix/Makefile /etc/postfix
+	cd /etc/postfix
+	make
+	localonly
+)
+
+localonly() {
+	interface="$(postconf inet_interfaces)"
+	if [[ $interface != 'inet_interfaces = loopback-only' ]]; then
+		if postconf -p mydestination | grep -qF monitoring.redradishtech.com; then
+			:  # It's normal for monitoring.redradisthech.com
+		else
+			warn "Postfix sets '$interface'. Does this postfix really need to listen on external interfaces for incoming mail? If not set this to 'loopback-only' instead ('postconf inet_interfaces=loopback-only')"
+		fi
+	fi
+}
+
+usage() {
+	echo >&2 "Purpose: Installs and configures Postfix. See https://www.redradishtech.com/pages/viewpage.action?pageId=24641590#ReplaceyourJira/ConfluencemailqueuewithPostfixpart2-Postfixconfiguration%E2%80%93relaying"
+	echo >&2 "Usage: $0"
+	echo >&2
+	exit 1
+}
+
+main "$@"

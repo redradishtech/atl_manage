@@ -1,0 +1,165 @@
+#!/bin/bash -eu
+
+# A Nagios event_handler script that will invoke a relevant atl_event ('slowness', 'servicedown', 'highload') on Nagios service/host events.
+# Effectively a translation layer between Nagios events and atl events.
+# See $ATL_APPDIR/monitoring/nagios.cfg for command definitions and event use, where this script is used in blocks like:
+# 
+# define command{
+#         command_name    redradish_jira_eventhandler_host
+#         command_line    sudo -E /opt/atlassian/redradish_jira/current/bin/event nagios -- responsetime $HOSTSTATE$ $HOSTATTEMPT$
+# }
+#
+# FIXME (kinda) the 'nagios' event is a bit of a hack. Nagios should just call this script directly - however it needs ATL_* variables, so 
+# that means we'd need to define $ATL_APPDIR/bin/nagios_eventhandler delegating to $ATL_MANAGE/monitoring/nagios_eventhandler. Alsokj
+# Some ugliness here: there shouldn't really be a 'nagios' event. It would be nicer just invoke '/opt/atl_manage/monitoring/nagios_eventhandler' or something, 
+# but the invokee needs to be customized with the current profile variables (invoked under atl_env), which is exactly what
+# $ATL_APPDIR/bin/event does. Perhaps we should define $ATL_APPDIR/bin/nagios_eventhandler.
+
+#shellcheck source=/opt/atl_manage/lib/jeventutils/lib/jeventutils.sh
+. "$ATL_MANAGE/lib/jeventutils/lib/jeventutils.sh"
+#shellcheck source=/opt/atl_manage/lib/logging.sh
+. "$ATL_MANAGE/lib/logging.sh"
+
+main()
+{
+	set -x
+	export PATH=$ATL_MANAGE/bin:$PATH  # For atl_event
+	log "Invoked: $ATL_MANAGE/monitoring/eventhandler $*"
+
+	triggertype="$1"; shift   # The type of alert: responsetime (service down), meanresponsetime, activethreads,  load (hypothetically)
+
+	# What state is the HTTP service in?
+	case "$1" in
+		# ============================ HOST STATES ================================
+		UP)
+			log "Host is UP"
+			;;
+		DOWN)
+			[[ $2 =~ [0-9]+ ]] || error "<count> arg must be 1 or greater. See --help"
+			# $attempt starts at 1, and is the number of times Nagios has encountered this state so far.
+			((attempt=$2))
+
+			log "Host is DOWN, attempt $attempt"
+			# If a passive check result is manually submitted, both NAGIOS_HOSTCHECKCOMMAND and NAGIOS_HOSTOUTPUT will be missing, and failing is probably the right thing to do.
+			# NAGIOS_HOSTCHECKCOMMAND will be missing if a passive check result is manually submitted.
+
+			HOSTCHECKCOMMAND=$(getvar HOSTCHECKCOMMAND)
+
+			# Note: ${!..} evaluates the variable
+			[[ $HOSTCHECKCOMMAND =~ check_.*_online ]] || error "$0 $*: *_HOSTCHECKCOMMAND was $HOSTCHECKCOMMAND, not the expected check_${ATL_SHORTNAME}_online command"
+
+			HOSTOUTPUT=$(getvar HOSTOUTPUT)
+			# NAGIOS_HOSTOUTPUT=HTTP CRITICAL - Invalid HTTP response received from host on port 443: HTTP/1.1 503 Service Unavailable
+			if [[ $HOSTOUTPUT =~ (50[0-9] .*) ]]; then
+				# 50x response
+				log "$ATL_MONITORING detected server error: ${BASH_REMATCH[1]:-}"
+				if (( attempt == 1)); then
+					atl_event servicedown
+				else
+					log "Previously triggered servicedown, not doing again"
+				fi
+			else
+				log "Host is DOWN, attempt ${attempt}. Host output: '$HOSTOUTPUT'"
+				if (( attempt == 1 || attempt == 5 || attempt == 10)); then
+					log "Triggering 'slowness' event"
+					atl_event slowness
+				else
+					log "Not triggering event on attempt ${attempt} (we trigger on attempts 1, 5 and 10)"
+				fi
+			fi
+			;;
+		UNREACHABLE)
+			log "Host state unknown"
+			;;
+
+
+
+
+		# ============================ SERVICE STATES ================================
+		OK)
+			# The service just came back up, so don't do anything...
+			;;
+		WARNING)
+			# We don't really care about warning states, since the service is probably still running...
+			;;
+		UNKNOWN)
+			# We don't know what might be causing an unknown error, so don't do anything...
+			;;
+		CRITICAL)
+			# A service within a running host is broken.
+			((attempt=$3))
+
+			# Is this a "soft" or a "hard" state?
+			case "$2" in
+
+				# We're in a "soft" state, meaning that Nagios is in the middle of retrying the
+				# check before it turns into a "hard" state and contacts get notified.
+				# Active services ('Mean HTTP response times', 'Active threads') retry 3 times.
+				SOFT)
+				# Take no diagnostics for the first 3 minutes (max_check_attempts(3) * retry_interval(1)) until we get to HARD state
+					;;
+
+				HARD)
+					log "Service ${SERVICEDESC:-} is CRITICAL (hard). Contacts will have been alerted. We should have already triggered an event on the last SOFT occurrence"
+					# Active services ('Mean HTTP response times', 'Active threads') retry 3 times.
+					if [[ $triggertype = load ]]; then
+						log "Triggering 'highload' event"
+						atl_event highload
+					elif [[ $triggertype = meanresponsetime ]]; then
+						log "Triggering 'slowness' event"
+						atl_event slowness
+
+					elif [[ $triggertype = activethreads ]]; then
+						log "Triggering 'toomanyactivethreads' event"
+						atl_event toomanyactivethreads
+					else
+						log "Unknown Nagios trigger: '$triggertype'"
+						atl_event slowness
+					fi
+				;;
+			esac
+			;;
+	*)
+		error "Error: $0 invoked with unknown event '$1'"
+	esac
+	exit 0
+}
+
+getvar()
+{
+	local varname
+	if [[ -v NAGIOS_$1 ]]; then
+		varname="NAGIOS_$1"
+	elif [[ -v ICINGA_$1 ]]; then
+		varname="ICINGA_$1"
+	else
+		if [[ $1 == HOSTOUTPUT ]]; then
+			fail "No variable NAGIOS_$1 or ICINGA_$1. Expected NAGIOS_HOSTOUTPUT='503 Service Unavailable' or similar. Perhaps you need to set enable_environment_macros=1 in nagios.cfg"
+		else
+			fail "No variable NAGIOS_$1 or ICINGA_$1. Perhaps you need to set enable_environment_macros=1 in nagios.cfg. Env: $(set | grep -P '^(NAGIOS_|ICINGA_)')"
+		fi
+	fi
+	echo "${!varname}"
+}
+
+if [[ $# -lt 2 || $# -gt 4 || $* =~ --help ]]; then
+	echo >&2 "Usage for services:   eventhandler [load|meanresponsetime] [OK|WARNING|UNKNOWN|CRITICAL] [HARD|SOFT] <count>"
+	echo >&2 "Usage for hosts:      eventhandler responsetime [UP|DOWN|UNKNOWN] <count>"
+	echo >&2
+	echo >&2 "If invoked from the command-line, variables must be supplied, e.g.:"
+	echo >&2 "NAGIOS_HOSTCHECKCOMMAND=check_${ATL_SHORTNAME}_online NAGIOS_HOSTOUTPUT='503 Service Unavailable' \$ATL_APPDIR/monitoring/.eventhandler responsetime DOWN 1"
+	echo >&2 "This script emits nothing to stdout, but writes to $JLOGDIR/nagios.log"
+	exit 1
+fi
+
+# If there is a tty, the caller is a human testing stuff - write to stdout instead of logs
+if [[ -t 1 ]]; then
+	main "$@"
+else
+	export -f main
+	jwritelock nagios \
+		jlog nagios \
+		jrun nagios \
+		main "$@" \
+		3> >(jeventlog nagios)
+fi

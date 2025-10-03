@@ -1,0 +1,15 @@
+#!/bin/bash
+## For reasons unknown to me, issues sometimes end up with 'disabled' workflows, i.e. no workflow actions. A race condition or something in Jira that will never be fixed. See also the 'jira_deactivated_workflows' check in $ATL_MANAGE/bin/atl_check_data_health
+## This script re-enables workflows on affected issues on startup.
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+PATH=$ATL_MANAGE/bin:$PATH
+
+require_app jira
+require_table os_wfentry
+
+echo "update os_wfentry set state=1 from jiraissue JOIN project ON project.id = jiraissue.project WHERE jiraissue.workflow_id = os_wfentry.id AND os_wfentry.state=0 RETURNING project.pkey || '-' || jiraissue.issuenum AS issuekey;" | atl_psql -tAXq | while read -r issue; do
+	log "Issue $issue workflow was disabled; re-enabling"
+done

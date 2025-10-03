@@ -1,0 +1,22 @@
+Nagios/icinga plugin to aggregate results of multiple other nagios
+plugin checks, returning most critical status of them all and joining
+performance data. 
+
+Based on idea presented on https://nagios-plugins.org/doc/check-many.html 
+as other two implementations on https://exchange.nagios.org were lacking.
+
+Currently it only supports reading commands from STDIN.
+
+- if all checks are OK, it will return:
+  MSG="All OK"
+  PERF = msg1 --- perf1
+         msg2 --- perf2
+         msg3 --- perf3
+
+- if at least one check is not OK:
+  find most problematic last errorlevel and its MSG
+  MSG="(Y non-OK): msgX" (msgX is message from worst errorlevel, and Y is  number of failed checks)
+  PERF = msg1 --- perf1
+         msg2 --- perf2
+         msg3 --- perf3
+

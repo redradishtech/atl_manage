@@ -1,0 +1,12 @@
+#!/bin/bash -eu
+
+if (($# < 2)); then
+	echo >&2 "Purpose: SQL to print Confluence pages containing the given macro name"
+	echo >&2 "E.g.: atl_pg_usage_conf_macros smile"
+	echo >&2
+	echo "See also: atl_pg_usage_conf_plugin <pluginkey>		# Prints use of all macros in a plugin"
+	exit 1
+fi
+
+#echo "select lastmoddate, title, substring(body from '.{50}${1}.{160}' ) from content JOIN bodycontent USING (contentid) where body ~ 'ac:name=\"${1}' order by lastmoddate desc LIMIT ${2:-10};"
+echo "select to_char(content.lastmoddate, 'YYYY-MM'), spaces.spacekey, title from spaces JOIN content ON spaces.spaceid = content.spaceid JOIN bodycontent USING (contentid) where body ~ 'ac:name=\"${1}' and prevver is null order by 1 desc LIMIT ${2:-10};"

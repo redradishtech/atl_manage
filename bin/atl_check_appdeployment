@@ -1,0 +1,904 @@
+#!/bin/bash
+# Check for deployment sanity.
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+# shellcheck source=/opt/atl_manage/lib/monitoring.sh
+. "$ATL_MANAGE/lib/monitoring.sh"
+# shellcheck source=/opt/atl_manage/lib/remote/sshd/check_installed_correctly.sh
+source "$ATL_MANAGE/lib/remote/sshd/check_installed_correctly.sh"
+
+# atl_psql isn't available otherwise
+export PATH="$ATL_MANAGE/bin:$ATL_MANAGE/venv/bin:$PATH"
+export PATH="/usr/lib/nagios/plugins:$PATH" # For check_http
+
+errors=()
+warnings=()
+
+main() {
+	if [[ $* =~ checkperms ]]; then
+		sudo -u "$ATL_GROUP" test -r "$ATL_APPDIR" || fail "Group cannot read appdir"
+		if sudo -u "www-data" test -r "$ATL_APPDIR/app/index.php"; then
+			fail "www-data should not be able to read ATL_APPDIR/app/index.php. What happened? Fix with chmod -R o-r \$ATL_APPDIR/app/"
+		fi
+		exit
+	fi
+
+	[[ $EUID = 0 ]] || fail "atl_check_appdeployment must run as root or sudo"  # Note, we'll be running as root if invoked with systemd's =+ notation in "ExecStartPre=+...atl_event start-pre"
+	check_setenv_snippets
+	cd /tmp || : # notice we're in a subshell - change to /tmp so psql doesn't panic if $PWD isn't readable by our user, which will be $ATL_USER if called from cron
+	#check_http_statuspage
+	check_runtime
+	check_directories_exist
+	continue_if_database_accessible
+	check_users
+	check_permissions
+	ensure_sshkeys
+	ensure_jndi
+	show_scripts_needing_rerun
+	check_connection_pool_size
+	ensure_webserver_logrotate
+	ensure_locate_not_installed
+	warn_on_utc_server_timezone
+	check_jira_upgrades_do_not_auto_reindex
+	check_obsolete_atl_variables
+	check_profiledir_matches_profilerepo
+	check_java_home_not_set
+	check_java_encoding
+	check_configfile_writable
+	check_no_old_acl_directory
+	check_etckeeper_works_as_root
+	check_apache_mpm
+	check_apache_maxrequestworkers_is_sufficient
+	check_seraph_authenticator
+	check_patchqueue_repo_online
+	check_zfs
+	check_postfix
+	# The go command coredumps when there is no stdout
+	#check_udp
+	check_misc
+	monitoring_enabled
+	monitoring_enable_environment_macros
+	monitoring_definitions_uptodate
+	check_patchqueue_variables
+	ssh_for_atlassianapps_installed_correctly
+	old_replication_services
+	check_ignored_by_app
+	check_database_encoding
+	check_database_encoding
+	check_apport_disabled
+
+	printwarnings
+}
+
+adderror() {
+	errors+=("$*")
+}
+
+addwarning() {
+	warnings+=("$*")
+}
+
+continue_if_database_accessible() {
+	[[ $ATL_DATABASE_TYPE != none ]] || return 0
+	#if [[ $ATL_DATABASE != ALL ]]; then
+	if [[ -n $ATL_DATABASE && ! -v ATL_MULTITENANT ]]; then
+		atl_sql <<<'select 1' >/dev/null || {
+			addwarning "Database '$ATL_DATABASE' not set up / contactable"
+		}
+	fi
+}
+
+check_users() {
+	if [[ -v ATL_USER ]]; then  # not multitenant, for instance, where the runtime user isn't known right now
+		getent passwd "$ATL_USER" >/dev/null || fail "ATL_USER '$ATL_USER' does not exist"
+	fi
+	getent passwd "$ATL_SERVICES_USER" >/dev/null || fail "ATL_SERVICES_USER '$ATL_SERVICES_USER' does not exist"
+}
+
+check_permissions() {
+	_perm() {
+		local rwx="$1"   		# 'read', 'write' or 'execute'
+		local grantordeny="$2"	# 'grant' or 'deny'
+
+		local uservar			
+		local user
+		# $3 is either a username e.g. 'nobody' OR a variable containing a username e.g. ATL_USER
+		if [[ -v "$3" ]]; then
+			# It's a var, e.g. 'ATL_USER'
+			uservar="$3"
+			user="${!uservar}"
+		else
+			if [[ $3 =~ ^[A-Z]+ ]]; then
+				return 0
+			else
+				user="$3"
+			fi
+		fi
+		local pathvar
+		local path
+		# $4 is either a path or a variable containing a path (e.g. 'ATL_DATALOGDIR')
+		if [[ -v "$4" ]]; then
+			pathvar="$4"
+			path="${!pathvar}"
+		else
+			path="$4"
+		fi
+		local explanation="$(echo "$5" | envsubst)"   # Evaluate variables like $USER in the explanation now, rather than earlier, as now if the first time we know the variable is even defined.
+		[[ -e "$path" || $grantordeny = deny ]] || fail "checkpermissions($*): $path ${pathvar+(defined by $pathvar) }does not exist" # Fail if we were asked to grant access to a nonexistent dir. It's not our job to check the dir exists (e.g. ATL_BACKUP_TMP is created by a install-post event)
+		cmd=(sudo -u "${user}" "test")
+		case "$grantordeny" in
+		deny) cmd+=('!') ;;
+		esac
+		case "$rwx" in
+		read) cmd+=(-r) ;;
+		write) cmd+=(-w) ;;
+		execute) cmd+=(-x) ;;
+		esac
+		cmd+=("$path")
+		if "${cmd[@]}"; then
+			:
+			# Uncomment for debugging
+			# printf "✓ %-20s %s %s %s\n" "$user" "$path" "$wrx" "$grantordeny"
+		else
+			fail "Filesystem should $grantordeny $user ${uservar+(defined by $uservar) }$rwx access to $path${pathvar+ (defined by $pathvar)}. $explanation."
+		fi
+	}
+
+	_writeperm() { _perm "write" "$1" "$2" "$3" "$4"; }
+	_readperm() { _perm "read" "$1" "$2" "$3" "$4"; }
+	_executeperm() { _perm "execute" "$1" "$2" "$3" "$4"; }
+	denywrite() { _writeperm "deny" "$1" "$2" "${3:-}"; }
+	grantwrite() { _writeperm "grant" "$1" "$2" "${3:-}"; }
+	denyread() { _readperm "deny" "$1" "$2" "${3:-}"; }
+	grantread() { _readperm "grant" "$1" "$2" "${3:-}"; }
+	denyexecute() { _executeperm "deny" "$1" "$2" "${3:-}"; }
+	grantexecute() { _executeperm "grant" "$1" "$2" "${3:-}"; }
+
+	[[ -d "$ATL_APPDIR_BASE" ]] || return 0
+
+	denyread nobody ATL_APPDIR_BASE
+
+	grantread ATL_USER ATL_APPDIR_BASE
+	grantexecute ATL_USER ATL_APPDIR_BASE
+
+	grantread ATL_SERVICES_USER ATL_APPDIR_BASE
+	grantexecute ATL_SERVICES_USER ATL_APPDIR_BASE
+
+	denyread ATL_USER ATL_PROFILEDIR
+	denywrite ATL_USER ATL_APPDIR_BASE
+
+	[[ -d "$ATL_APPDIR" ]] || return 0
+
+	grantread ATL_USER ATL_APPDIR
+	denywrite ATL_USER ATL_APPDIR
+
+	# These perms are granted in $ATL_MANAGE/lib/appfetcher.sh
+	grantwrite ATL_SERVICES_USER ATL_LOGDIR 'Should be owned by $ATL_USER:$ATL_GROUP and setfacl-granted perms to ATL_SERVICES_USER in customize_atlmanage_apps()'
+	grantwrite ATL_SERVICES_USER ATL_LOCKDIR 'Should be owned by $ATL_USER:$ATL_GROUP and setfacl-granted perms to ATL_SERVICES_USER in customize_atlmanage_apps()'
+
+	if [[ ! -v ATL_MULTITENANT ]]; then
+		grantwrite ATL_USER ATL_LOGDIR 'Should be owned by $ATL_USER:$ATL_GROUP'
+		grantwrite ATL_USER ATL_LOCKDIR 'Should be owned by $ATL_USER:$ATL_GROUP'
+	fi
+	if [[ -d "$ATL_APPDIR/.appinfo" ]]; then
+		warn "Old $ATL_APPDIR/.appinfo/ dir found. Please rerun atl_freeze"
+	fi
+	if [[ -d "$ATL_APPDIR/.env" ]]; then
+		denywrite ATL_USER "$ATL_APPDIR/.env/ATL_SHORTNAME" "Only ATL_SERVICES_USER should have (read-only) access. ATL_USER may, as a side-effect, also have read access, but not write"
+		grantread ATL_SERVICES_USER "$ATL_APPDIR/.env/ATL_SHORTNAME" "ATL_SERVICES_USER needs read access to .env/"
+		if [[ $ATL_SERVICES_USER != root ]]; then
+			denywrite ATL_SERVICES_USER "$ATL_APPDIR/.env/ATL_SHORTNAME" "ATL_SERVICES_USER needs read access to .env/"
+		fi
+		if [[ -v ATL_REPLICATION_SYNCUSER ]]; then
+			grantread ATL_REPLICATION_SYNCUSER "$ATL_APPDIR/.env/ATL_REPLICATION_PRIMARY_HOST" "ATL_REPLICATION_SYNCUSER needs read access to ATL_REPLICATION vars in .env/"
+		fi
+	else
+		# This should be an error, but we're using this function for testing intermediate states
+		warn "\$ATL_APPDIR/.env/ does not exist. Please run 'atl_freeze'"
+	fi
+
+	if [[ $ATL_DATADIR_BASE != "$ATL_DATADIR" ]]; then
+		denywrite ATL_USER ATL_DATADIR_BASE "Should be owned by root:$ATL_GROUP"
+	fi
+	case "$ATL_PRODUCT" in
+	# Special-case Jethro, for which the 'home' directory can/is read-only, and only logs/ need be writable
+	jethro)
+		denywrite ATL_USER ATL_DATADIR "Should be owned by root:$ATL_GROUP"
+		grantexecute ATL_USER ATL_DATADIR "$ATL_DATADIR (ATL_DATADIR) should at least be executable (traversable) by runtime user $ATL_USER (\$ATL_USER), which needs to access logs/ within it."
+		#find "$ATL_DATADIR" -name '*.log' | while read -r  logfile; do grantwrite ATL_USER "$logfile" "Should be owned by $ATL_USER:$ATL_GROUP"; done
+
+		#			if SMS_SEND_LOGFILE=$("$ATL_MANAGE/lib/jethro/get_php_constant" SMS_SEND_LOGFILE); then
+		#				if [[ -f "$SMS_SEND_LOGFILE" ]]; then
+		#					grantwrite	ATL_USER	SMS_SEND_LOGFILE
+		#				else
+		#					dir="$(dirname "$SMS_SEND_LOGFILE")"
+		#					if [[ -d "$dir" ]]; then
+		#						grantwrite	ATL_USER	"$dir"	"App may need to write sms.log to this directory"
+		#					else
+		#						warn "SMS_SEND_LOGFILE value does not look valid: $SMS_SEND_LOGFILE"
+		#					fi
+		#				fi
+		#			else
+		#				addwarning "Could not find Jethro constant SMS_SEND_LOGFILE"
+		#			fi
+		#			if DOCUMENTS_ROOT_PATH=$("$ATL_MANAGE/lib/jethro/get_php_constant" DOCUMENTS_ROOT_PATH); then
+		#				if [[ -d "$DOCUMENTS_ROOT_PATH" ]]; then
+		#					grantwrite	ATL_USER	DOCUMENTS_ROOT_PATH
+		#				else
+		#					grantwrite	ATL_USER	"$(dirname "$DOCUMENTS_ROOT_PATH")"	"App may need to create a documents/ directory below this directory"
+		#				fi
+		#			else
+		#				addwarning "Could not find Jethro constant DOCUMENTS_ROOT_PATH"
+		#			fi
+
+		;;
+	jira | confluence)
+		grantwrite ATL_USER ATL_DATADIR "Should be owned by $ATL_USER:$ATL_GROUP"
+		if [[ -d $ATL_APPDIR/flightrecordings ]]; then grantwrite ATL_USER "$ATL_APPDIR"/flightrecordings; fi
+		# $ATL_APPDIR/.hgpatchscript/oomhandler should have chown'd to ATL_GROUP and chmod g+x'd the oomhandler script
+		if [[ -f $ATL_APPDIR/oomhandler/oomhandler ]]; then grantexecute ATL_USER "$ATL_APPDIR/oomhandler/oomhandler"; fi
+		# App directories should have g+s so that patchqueue operations don't lose group ownership. Here we test one such file
+		grantread ATL_USER "$ATL_APPDIR/bin/setenv.sh" "bin/setenv.sh should be owned by group $ATL_GROUP"
+		;;
+	*) grantwrite ATL_USER ATL_DATADIR "Should be owned by $ATL_USER:$ATL_GROUP" ;;
+	esac
+
+	if [[ -d "$ATL_DATALOGDIR" ]]; then
+		# May legitimately not exist on a fresh install or after restoring a backup. It will be created
+		grantwrite ATL_USER ATL_DATALOGDIR "Log dir should be writable by runtime user $ATL_USER, and thus owned by $ATL_USER:$ATL_GROUP"
+		if [[ -f $ATL_DATALOGDIR/sms.log ]]; then
+			grantwrite ATL_USER "$ATL_DATALOGDIR/sms.log" "ATL_DATALOGDIR/sms.log should be writable by runtime user $ATL_USER"
+		fi
+
+		grantread ATL_SERVICES_USER ATL_DATALOGDIR "Log dir should be writable by runtime user $ATL_USER, and thus owned by $ATL_USER:$ATL_GROUP"
+	fi
+	denyread ATL_USER ATL_BACKUP_ROOT
+	grantwrite root ATL_BACKUP_TMP
+	denyread ATL_USER ATL_BACKUP_TMP
+	denyread ATL_USER ATL_BACKUP_DATABASEDUMP
+
+	if [[ $ATL_SERVICES_USER != root ]]; then
+		denywrite ATL_SERVICES_USER ATL_APPDIR
+	fi
+
+	case "$ATL_PRODUCT" in
+	jira | confluence | crowd | bitbucket | fisheye)
+		grantwrite ATL_USER "$ATL_APPDIR/${ATL_TOMCAT_SUBDIR}logs"
+		grantwrite ATL_USER "$ATL_APPDIR/${ATL_TOMCAT_SUBDIR}temp"
+		;;
+	esac
+	case "$ATL_PRODUCT" in
+	jira | confluence | crowd | bitbucket)
+		grantwrite ATL_USER "$ATL_APPDIR/${ATL_TOMCAT_SUBDIR}work"
+		denyread nobody "$ATL_APPDIR/${ATL_TOMCAT_SUBDIR}conf"
+		;;
+	esac
+	case "$ATL_PRODUCT" in
+	jira)
+		if [[ -d "$ATL_DATADIR/export" ]]; then
+			grantwrite ATL_USER "$ATL_DATADIR/export" "This will cause Jira to complain that it cannot write to its home directory"
+		fi
+		;;
+	esac
+	if [[ -d $ATL_APPDIR/monitoring ]]; then
+		denyread nobody "$ATL_APPDIR/monitoring"
+		denyread ATL_USER "$ATL_APPDIR/monitoring" "Is ATL_APPDIR g+s? It should not be - only ATL_APPDIR/app is meant to be. Please 'atl_reinstall --force'"
+		grantread ATL_SERVICES_USER "$ATL_APPDIR/monitoring" "Some monitoring/*.healthcheck scripts are invoked via cron as ATL_SERVICES_USER, so that user may have read access to monitoring/"
+		grantexecute ATL_SERVICES_USER "$ATL_APPDIR/monitoring" "Some monitoring/*.healthcheck scripts are invoked via cron as ATL_SERVICES_USER, so that user may have read access to monitoring/"
+	fi
+	if [[ -d "$ATL_APPDIR/SQL" ]]; then
+		denyread nobody "$ATL_APPDIR/SQL"
+		denyread ATL_USER "$ATL_APPDIR/SQL"
+		if [[ $ATL_SERVICES_USER != root ]]; then
+			denyread ATL_SERVICES_USER "$ATL_APPDIR/SQL" "Is there any reason ATL_SERVICES_USER needs SQL/ access?"
+		fi
+	fi
+
+	if [[ -d "$ATL_APPDIR/app" ]]; then
+		local webroot="$ATL_APPDIR/app"
+		if [[ -d "$ATL_APPDIR/app/webroot" ]]; then
+			webroot="$ATL_APPDIR/app/webroot"
+		fi
+
+		if [[ $ATL_PRODUCT = jethro ]]; then
+			grantread ATL_USER "$webroot/index.php" "ATL_USER executes and thus must be able to read"
+			denyread www-data "$webroot/index.php" "Apache (www-data) should not have access to *.php (which is read and served by php-fpm, not apache)"
+			denyread www-data "$webroot/conf.php" "Apache (www-data) should not have access to *.php (which is read and served by php-fpm, not apache)"
+			grantread www-data "$webroot/resources/css/bootstrap.css" "Apache (www-data) should have access to resources/*, in order to serve css/js"
+			grantread www-data "$webroot/resources/js/tb_lib.js" "Apache (www-data) should have access to resources/*, in order to serve css/js"
+			grantread www-data "$webroot/favicon.ico" "Apache (www-data) should have access to favicon.ico"
+			if [[ -f $webroot/robots.txt ]]; then
+				grantread www-data "$webroot/robots.txt" "Apache (www-data) should have access to robots.txt"
+			fi
+		fi
+
+		local executable
+		executable="$(find "$ATL_APPDIR/app"  \( -name .git -o -name .jj \) -type d -prune -o -type f -perm /111 -print )"
+		if [[ -n $executable ]]; then
+			addwarning "Some files in app/ are executable. This will cause the .hgpatchscript/webserver-apache line 'setfacl -R -m u:www-data:rX app/resources app/favicon.ico app/robots.txt' to make them generally executable by www-data, which will cause jujutsu to start noticing.  The files are: $executable"
+		fi
+
+
+	fi
+
+	if [[ -d "$ATL_APPDIR/app" ]]; then
+		denyread www-data "$ATL_DATADIR" "Apache (www-data) should not have access to read the Jethro home directory. PHP should be running as a tenant-specific user. ?? surely www-data needs it to read app/webroot/resources??"
+	fi
+
+	if [[ -d "$ATL_APPDIR/php" ]]; then
+		denyread nobody "$ATL_APPDIR/php" "Only php-fpm reads ATL_APPDIR/php, and that runs as root, so nobody else needs access"
+	fi
+
+	#local nonsetguid
+	# Find directories that are not setgid, but are group-readable. The last part avoids finding $ATL_APPDIR/logs/events/*/.links2/ directories
+	#nonsetguid="$(find -L "$ATL_APPDIR" -type d -not -perm -2000 -a -perm -040)"
+	#[[ -z $nonsetguid ]] || fail "The following directories under \$ATL_APPDIR are not set g+s, which will make files in them unreadable to the app's auxiliary scripts running as ATL_SERVICES_USER ($ATL_SERVICES_USER), which is a member of ATL_GROUP. g+s should be set on deploy and inherited:\n$nonsetguid"
+
+	grantread nagios "$ATL_APPDIR/.env/atl_env"
+	if [[ -d "$ATL_APPDIR/local" ]]; then
+		grantread www-data "$ATL_APPDIR/local/" "Apache (www-data) needs access to local/ to serve files"
+		grantexecute www-data "$ATL_APPDIR/local/" "Apache (www-data) needs access to local/ to serve files"
+	fi
+}
+
+monitoring_enabled() {
+
+	if out=$(atl_monitoring check 2>&1); then
+		:
+	else
+		if [[ $? = 1 ]]; then
+			# It is not a prevent-app-startup level error for monitoring notifications to be disabled.
+			#adderror
+			# $? = 1 means disabled. $? = 2 means an error, like ATL_MONITORING disabled
+			addwarning "$out"
+		fi
+	fi
+}
+
+monitoring_definitions_uptodate() {
+	if [[ -v ATL_MONITORING_TYPES ]] && [[ $ATL_MONITORING_TYPES =~ nagios4 ]]; then
+		set_monitoring_vars
+		local conffile="$monitoring_confdir"/atlmanage.cfg
+		if [[ -f $conffile ]]; then
+			if [[ $(grep -o "TemplateVer.*" "$ATL_MANAGE"/monitoring/templates/atlmanage.nagios.cfg) != $(grep -o "TemplateVer.*" "$conffile") ]]; then
+				log "$conffile is not up to date with template; please run atl_install_monitoring"
+			fi
+		else
+			log "Need to run atl_install_monitoring; $conffile does not exist"
+		fi
+	fi
+}
+
+check_patchqueue_variables() {
+	local p="$ATL_APPDIR/.hg/patches"
+	[[ -d $p ]] || return 0
+	output="$(grep '%{ATL_NEWVER}' "$p"/* || :)"
+	if [[ -n $output ]]; then
+		addwarning "There should not be references to %{ATL_NEWVER} in $p/*: $output"
+	fi
+}
+
+# When replication is enabled, a lsyncd process will be continually syncing the versioned data directory, e.g.
+# /var/atlassian/application-data/jira/8.2.2/
+# When the app is being upgraded, there will be a period when two lsyncd services are running, syncing e.g.
+# /var/atlassian/application-data/jira/8.2.2/ and /var/atlassian/application-data/jira/9.0/
+# After a successful upgrade, no further changes will occur in the old data directory.
+# Only when the new version (9.0) is well-established can we remove the old version's lsyncd. Currently we don't have an event to trigger for this - upgrade-running-post runs too soon to declare the upgrade a success.
+# Hence this appdeployment check, which will prompt the user to remove old lsyncd services.
+old_replication_services() {
+	[[ -v ATL_REPLICATION_PRIMARY && $ATL_REPLICATION_PRIMARY = true ]] || return 0
+	[[ -v ATL_REPLICATION_TYPE && $ATL_REPLICATION_TYPE = lsyncd ]] || return 0
+	local servicename="$ATL_SHORTNAME-$ATL_VER-replication"
+	chronic systemctl -q is-active "$servicename" || addwarning "Lsyncd replication service $servicename is not enabled"
+	local prevlink="$ATL_APPDIR_BASE/previous"
+	if [[ -L "$prevlink" ]]; then
+		prevver="$(readlink "$prevlink")"
+		is_valid_version_pattern "$prevver" || error "$prevlink does not point to a valid version"
+		servicename="$ATL_SHORTNAME-$prevver-replication"
+		if systemctl -q is-active "$servicename"; then
+			addwarning "Lsyncd for an old/previous version ($prevver) is still running, and should be stopped if $ATL_VER is the new current version. Do it with: systemctl stop $servicename && systemctl disable $servicename && rm /etc/systemd/system/$servicename.service"
+		fi
+	fi
+}
+
+sanoid_dont_snapshot_backups() {
+	local conf=/etc/sanoid/sanoid.conf
+	[[ -v ATL_ZFS ]] || return 0
+	[[ $ATL_BACKUP_TYPES =~ rsnapshot ]] || return 0
+	[[ -f $conf ]] || return 0
+	grep -q /backups "$conf" || fail "Please disable snapshots of backups by adding to $conf:\n [${ATL_ZFSPOOL}${ATL_BACKUP_ROOT}]\n\tuse_template = backup\n\tmonitor = no\n\nIf necessary, define 'template_backup' from /usr/share/doc/sanoid/examples/sanoid.conf"
+}
+
+sanoid_dont_snapshot_nix() {
+	local conf=/etc/sanoid/sanoid.conf
+	[[ -v ATL_ZFS ]] || return 0
+	grep -q /nix "$conf" || fail "Please disable snapshots of /nix by adding to $conf:\n [${ATL_ZFSPOOL}/nix]\n\tuse_template = ignored\n\tmonitor = no\n\nIf necessary, define 'template_ignored' from /usr/share/doc/sanoid/examples/sanoid.conf"
+}
+check_ignored_by_app() {
+	if grep b/.ignored_by_app$ "$ATL_APPDIR/.hg/patches"/*; then
+		addwarning "Found single-file .ignored_by_app in patches. These should be converted to .ignored_by_app/<patch> subfiles"
+	fi
+}
+
+check_database_encoding() {
+	local encoding cmd
+	if [[ $ATL_DATABASE_TYPE = postgresql ]]; then
+		if [[ ${ATL_DATABASE_HOST:-} = localhost ]]; then
+			encoding="$(pg_lsclusters -j "$ATL_DATABASE_VERSION" "$ATL_DATABASE_CLUSTER"   | jq -r .[].config.lc_messages)"
+			if [[ ! ${encoding,,} =~ utf-8 ]]; then
+				adderror "Database cluster $ATL_DATABASE_CLUSTER has encoding $encoding, which is not utf-8. This will cause problems with a UTF-8 backup is restored, e.g. rows with exactly 255 characters will fail to be added, and pg_restore will fail.
+				To fix:
+				# Create a new temp cluster
+				ATL_DATABASE_CLUSTER=fixed ATL_DATABASE_PORT=5999 atl_install_postgresql &&
+				atl_pg_dumpall | atl_pg_sql_encoding_change_ascii2utf8 | ATL_DATABASE_CLUSTER=fixed ATL_DATABASE_PORT=5999 atl_psql -tAq --super postgres && 
+				atl_stop && 
+				pg_ctlcluster $ATL_DATABASE_VERSION $ATL_DATABASE_CLUSTER stop &&
+				pg_renamecluster $ATL_DATABASE_VERSION $ATL_DATABASE_CLUSTER oldmain && 
+				pg_ctlcluster $ATL_DATABASE_VERSION fixed stop &&
+				pg_renamecluster $ATL_DATABASE_VERSION fixed $ATL_DATABASE_CLUSTER && 
+				perl -i -pe 's/5999/5432/g' /etc/postgresql/$ATL_DATABASE_VERSION/$ATL_DATABASE_CLUSTER/postgresql.conf &&
+				pg_ctlcluster $ATL_DATABASE_VERSION $ATL_DATABASE_CLUSTER  start &&
+				atl_start "
+			fi
+		fi
+		encoding=
+		cmd=(atl_psql -tAXqc "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname = '$ATL_DATABASE';")
+		encoding="$("${cmd[@]}")"
+		if [[ $encoding != UTF8 ]]; then
+			adderror "Database $ATL_DATABASE has encoding $encoding, not UTF8 as expected. See output of: ${cmd[*]@Q}"
+		fi
+	fi
+}
+
+check_apport_disabled() {
+	# Ubuntu's apport intercepts crashes and writes huge /var/crash/_usr_lib_jvm_java-11-openjdk-amd64_bin_java.*.crash files with base64-encoded binary. This causes slowdowns when recovering from OutOfMemoryErrors. apport should be off in production.
+	if [[ $ATL_ROLE = prod ]] && [[ -f /etc/default/apport ]] && grep -qF 'enabled=1' /etc/default/apport; then
+		addwarning "Please dpkg -P apport, as it slows down crash recovery"
+	fi
+}
+
+
+monitoring_enable_environment_macros() {
+	set_monitoring_vars
+	if [[ -v ATL_MONITORING ]]; then
+		grep -q 'enable_environment_macros=1' "$monitoring_mainconf" || warn "Please set enable_environment_macros=1 in $monitoring_mainconf"
+	fi
+}
+
+ensure_sshkeys() {
+	[[ $EUID = 0 ]] || return 0 # We need root to peek in other users' authorized_keys
+	# Note that we may not have permission, or the files might not exist, hence the xargs
+	local keycount="$(
+		shopt -s nullglob
+		echo /home/*/.ssh/authorized_keys /root/.ssh/authorized_keys | xargs --no-run-if-empty egrep 'jeff@redradishtech.com|jturner|gh:jefft' | wc -l
+	)"
+	if [[ -n $keycount && $keycount -lt 1 ]]; then
+		# If the server doesn't permit root login then there's not much we can do about this
+		log "Warning: jeff@redradishtech.com SSH public key is not present in any .ssh/authorized_keys file."
+	fi
+}
+
+ensure_jndi() {
+	if [[ -d $ATL_DATADIR ]]; then
+		if [[ $ATL_PRODUCT != confluence ]]; then # Confluence doesn't like JNDI
+			local xmlfiles=("$ATL_DATADIR"/*.xml)
+			if [[ -f "${xmlfiles[0]}" ]]; then
+				grep -q java:comp/env/jdbc/ "$ATL_DATADIR"/*.xml || warn "WARNING: the config file $(echo "$ATL_DATADIR"/*.xml) does not contain a JNDI path. We need to use JNDI for JavaMelody to do its thing"
+			fi
+		fi
+	fi
+}
+
+check_connection_pool_size() {
+	if [[ $ATL_PRODUCT = confluence ]]; then
+		local cfgfile="$ATL_DATADIR/confluence.cfg.xml"
+		if [[ -f $cfgfile ]]; then
+			grep -qF '<setupStep>complete</setupStep>' "$cfgfile" || return 0 # Setup incomplete; exit
+
+			## Anticipate the 'Database: Your database connection pool size is not configured. The recommended minimum size is 60.' error (https://confluence.atlassian.com/confkb/startup-check-database-connection-pool-size-960713815.html), and offer a correction.
+			# shellcheck disable=SC2034
+			xmlstarlet sel --noblanks --template --match "/confluence-configuration/properties/property[@name='hibernate.connection.datasource']" -v . "$cfgfile" | while read -r datasource; do
+				: # Don't do this any more. We probably shouldn't have such large connection pools anyway, per https://github.com/brettwooldridge/HikariCP#youre-probably-doing-it-wrong
+				#local max_size=$(cat "$ATL_APPDIR"/${ATL_TOMCAT_SUBDIR}conf/server.xml | xmlstarlet sel --noblanks --template --match "/Server/Service/Engine/Host/Context/Resource[@name='jdbc/ConfluenceDS']/@maxTotal"  -v .)
+				#if ((max_size < 60)); then   # Evaluates to true if max_size is blank
+				#	warn "Your database connection pool size is too small ('$max_size' allowed, 60 recommended). Confluence will complain on startup. Edit "$ATL_APPDIR"/${ATL_TOMCAT_SUBDIR}conf/server.xml, find the ConfluenceDS datasource and change the @maxTotal property value to 60. See https://confluence.atlassian.com/confkb/startup-check-database-connection-pool-size-960713815.html"
+				#fi
+			done || {
+				# No datasource - database details given directly to Confluence (this is now (since 7.13.x) our preferred setup
+				xmlstarlet sel --noblanks --template --match "/confluence-configuration/properties/property[@name='hibernate.c3p0.max_size']" -v . "$cfgfile" | while read -r max_size; do
+					if ((max_size < 60)); then # Evaluates to true if max_size is blank
+						warn "Your database connection pool size is too small ('$max_size' allowed, 60 recommended). Confluence will complain on startup. Edit $ATL_DATADIR/confluence.cfg.xml and change the 'hibernate.c3p0.max_size' property value to 60. See https://confluence.atlassian.com/confkb/startup-check-database-connection-pool-size-960713815.html"
+					fi
+				done
+			} || fail "No c3po max_size param in $cfgfile"
+		fi
+	fi
+}
+
+check_jira_upgrades_do_not_auto_reindex() {
+	if [[ $ATL_PRODUCT = jira ]]; then
+		local cfgfile="$ATL_DATADIR/jira-config.properties"
+		if [[ -f $cfgfile ]]; then
+			if ! grep -q "^upgrade.reindex.allowed *= *false" "$cfgfile"; then
+				warn "Please add 'upgrade.reindex.allowed = false' to $cfgfile, otherwise reindex upgrades (e.g. 7.1.x to 8.3.x) will lock out users. https://confluence.atlassian.com/jirakb/how-to-disable-automatic-re-indexes-after-upgrading-935383670.html"
+			fi
+		fi
+		if [[ $ATL_WEBSERVER = nginx ]]; then
+			# Check that nginx is serving gzipped JS (it doesn't by default).
+			# It's really ugly having this check here, but we don't really have a post-setup-and-app-is-running hook for checks like this. I don't want to pollute Icinga monitoring with what is really a setup check.
+			check_http --header='Accept-Encoding: gzip' --no-body --header-string='Content-Encoding: gzip' --ssl --sni -H "$ATL_FQDN" -u '/static-assets/metal-all.js' -e '200' >/dev/null || warn "Nginx is not serving JS gzipped. Everything will be slow"
+		fi
+	fi
+}
+
+check_obsolete_atl_variables() {
+	if [[ -v ATL_PRECONDITION_BASEURL ]]; then
+		error "ATL_PRECONDITION_BASEURL no longer has any effect. baseurl is always set by  $ATL_MANAGE/events/start-pre/set_baseurl"
+	fi
+	if [[ -v ATL_PRECONDITION_BANNERTEXT ]]; then
+		error "Please replace ATL_PRECONDITION_BANNERTEXT with ATL_BANNERTEXT"
+	fi
+	if [[ -v ATL_PRECONDITION_BANNERCOLOUR ]]; then
+		error "Please replace ATL_PRECONDITION_BANNERCOLOUR with ATL_BANNERCOLOUR"
+	fi
+
+}
+
+check_profiledir_matches_profilerepo() {
+	command -v hg >/dev/null || return 0 # If hg isn't present for some reason, don't break catastrophically. This script is used in systemd startup
+	local profiledir="$ATL_PROFILEDIR/$ATL_ORGANIZATION"
+	[[ -d "$profiledir"/.hg ]] || profiledir="$ATL_PROFILEDIR"
+	[[ -d "$profiledir"/.hg ]] || fail "$profiledir is not under mercurial control??"
+	local actualrepo
+	actualrepo="$(cd "$profiledir" && hg paths default 2>/dev/null)"
+	if [[ ! -v ATL_PROFILE_REPO ]]; then
+		error "Please set ATL_PROFILE_REPO, so we can check that profile directory '$profiledir' was checked out from it"
+	elif [[ "$actualrepo" = "$ATL_PROFILE_REPO" ]]; then
+		:
+		#log "$ATL_PROFILEDIR points to correct repo ($repo_ssh)"
+	else
+		# A warning not an error, so unusual deployments are allowed
+		warn "Profiles in $profiledir pull from $actualrepo, not the expected $ATL_PROFILE_REPO. Please fix, or set ATL_PROFILE_REPO=$actualrepo probably in $profiledir/[org=$ATL_ORGANIZATION]"
+	fi
+}
+
+check_java_home_not_set() {
+	[[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ java ]] || return 0
+	# Tomcat's catalina.sh will use JAVA_HOME if present, rather than whatever 'java' is in the path. Specifically, the 'oracle-java8-set-default' package will set JAVA_HOME in /etc/profile.d/jdk.sh. We generally don't want that, so fail if that package is installed
+	if dpkg -s oracle-java8-set-default &>/dev/null; then
+		error "Please 'dpkg -P oracle-java8-set-default'. We don't want it messing with JAVA_HOME"
+	fi
+
+}
+
+check_java_encoding() {
+	locale  | grep -q "LC_CTYPE=.*UTF-8" || error "System locale is not utf-8. This will cause Java's file encoding to be ascii, not utf-8"
+	if [[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ java ]]; then
+		[[ UTF-8 = "$(java -XshowSettings |& awk '/file.encoding = / {print $3}')" ]] || error "Java default encoding isn't UTF-8. Note: the app itself might see a different encoding due to a different locale. See https://stackoverflow.com/questions/1006276/what-is-the-default-encoding-of-the-jvm"
+	fi
+}
+
+
+check_configfile_writable() {
+	local configfile
+	case "$ATL_PRODUCT" in
+	jira) configfile="$ATL_DATADIR"/dbconfig.xml ;;
+	confluence) configfile="$ATL_DATADIR"/confluence.cfg.xml ;;
+	esac
+	[[ -v configfile ]] || return 0
+	[[ -f "$configfile" ]] || return 0 # New install?
+	sudo -u "$ATL_USER" test -r "$configfile" || error "User '$ATL_USER' cannot read config file: $(ls -la "$configfile")"
+	# The $ATL_MANAGE/events/start-pre/check_for_database_connection_settings script had a bug circa Nov 2021 where it rewrote config files to be owned by root.
+	sudo -u "$ATL_USER" test -w "$configfile" || error "User '$ATL_USER' cannot write to config file: $(ls -la "$configfile")"
+}
+
+check_no_old_acl_directory() {
+	[[ ! -d "$ATL_APPDIR/.acl" ]] || error "Please move contents of $ATL_APPDIR/.acl to $ATL_APPDIR/.hgpatchscript"
+
+}
+
+ensure_webserver_logrotate() {
+	# Because we put logs in subdirs of /var/log, the default logrotate scripts don't rotate them. The atl_install script
+	if [[ $ATL_WEBSERVER = apache2 ]]; then
+		if [[ -r /etc/logrotate.d/apache2 ]] && grep -q '^/var/log/apache2/\*.log {$' /etc/logrotate.d/apache2; then
+			log "Warning: apache2 log files are not being rotated"
+			log "Run: perl -i -pe 's,^/var/log/apache2/\*.log \{$,/var/log/apache2/*.log /var/log/apache2/*/*.log {,g' /etc/logrotate.d/apache2"
+		fi
+		grep -E -q 'rotate [0-9]{3,}$' /etc/logrotate.d/apache2 || log "Warning: the 'rotate' count in /etc/logrotate.d/apache2 needs increasing from its current double-digit value"
+
+	elif [[ $ATL_WEBSERVER = nginx ]]; then
+		if [[ -r /etc/logrotate.d/nginx ]] && grep -q '^/var/log/nginx/\*.log {$' /etc/logrotate.d/nginx; then
+			log "Warning: nginx log files are not being rotated"
+			log "Run: perl -i -pe 's,^/var/log/nginx/\*.log \{$,/var/log/nginx/*.log /var/log/nginx/*/*.log {,g' /etc/logrotate.d/nginx"
+		fi
+
+	fi
+	# USER isn't set in cron
+	if [[ -r /etc/shadow && -v USER ]]; then
+		# chage only works if we're root. This means this section only runs when a regular user runs 'sudo -sE'
+		chage -l "$USER" | grep -q 'Password expires.*never' || log "Warning: '$USER' account has password expiry set. Remove password expiry with: chage -m 0 -M 99999 -I -1 -E -1 $USER"
+	fi
+
+	if [[ -v ATL_MONITORING ]]; then
+		local cfg=/etc/nsca-ng/nsca-ng.cfg
+		if [[ -f $cfg ]]; then
+			if ! grep -q "^command_file=.*$monitoring_commandfile" $cfg; then
+				log "nsca-ng was pointing to the wrong command_file: $(grep command_file $cfg). Changing to the correct command file '$monitoring_commandfile'"
+				perl -i -pe 's,^command_file=.*,command_file="'$monitoring_commandfile'",' $cfg
+				systemctl restart nsca-ng-server
+			fi
+		fi
+	fi
+}
+
+ensure_locate_not_installed() {
+	if [[ $ATL_ROLE = prod ]] && command -v locate >/dev/null; then
+		addwarning "'locate' is installed, which will cause an IO spike daily at midnight. Disable with dpkg -P mlocate"
+	fi
+}
+
+warn_on_utc_server_timezone() {
+	if [[ $(cat /etc/timezone) =~ UTC ]]; then
+		addwarning "System timezone is UTC, which is now good for Confluence. Change with e.g. timedatectl set-timezone 'Australia/Sydney'.  See https://www.redradishtech.com/display/KB/-Duser.timezone+considered+harmful%2C+and+why+your+Atlassian+server+shouldn%27t+be+on+UTC"
+	fi
+}
+
+check_etckeeper_works_as_root() {
+	dpkg -s etckeeper &>/dev/null || return 0
+	local git_email=$(echo "git config --global --get user.email" | sudo su - || :)
+	if [[ -z "$git_email" ]]; then
+		echo "Warning: There is no git user configure for root. This will cause etckeeper will fail when running as root via unattended-upgrades (see logs in /var/log/unattended-upgrades/unattended-upgrades-dpkg.log), which causes apache2 to fail to start after being upgraded. To fix, become root ('sudo su -') and run: git config --global user.email 'root@$(uname -n).$ATL_BASEDOMAIN'; git config --global user.name root"
+	fi
+
+}
+
+check_apache_mpm() {
+	[[ $ATL_WEBSERVER = apache2 ]] || return 0
+	local mpm
+	# If apache isn't running this will fail. It's not our place to detect that, so just return 1
+	mpm="$(atl_diagnostic server-info | grep -oP '(?<=MPM Name: ).*')" || return 1
+	if [[ $mpm != event ]]; then
+		warn "Apache is using $mpm MPM, not event MPM as expected. That should have been handled by atl_event install-post webserver-apache"
+	fi
+}
+
+check_apache_maxrequestworkers_is_sufficient() {
+	[[ $ATL_WEBSERVER = apache2 ]] || return 0
+	if ps -e -o user:20,pid,cmd:50 | grep [j]ava | grep -qvF "$ATL_APPDIR"; then
+		# Other Java processes (not ours) running. We assume they are proxied by Apache
+		if atl_diagnostic server-info | grep -q 'MaxRequestWorkers 150'; then
+			warn "Apache is configured to allow at most 150 workers. This will not saturate the multiple webapps installed. Please increase 'MaxRequestWorkers' in /etc/apache2/mods-available/mpm_event.conf"
+		fi
+	fi
+}
+
+check_http_statuspage() {
+	chronic "$ATL_MANAGE/monitoring/plugins/check_http_statuspage" "$@" || :
+}
+
+check_runtime() {
+	if [[ ${ATL_PRODUCT_RUNTIME_TECHNOLOGY:-} =~ php([0-9\.]+)-fpm ]]; then
+		local phpver
+		phpver="${BASH_REMATCH[1]}"
+		local exe="php-fpm$phpver"
+		if command -v "$exe" >/dev/null; then
+			if ! chronic "$exe" -t; then
+				adderror "$ATL_PRODUCT_RUNTIME_TECHNOLOGY is not in a usable state (try $exe -t)"
+			fi
+		else
+			addwarning "Can't find $exe to test configuration"
+		fi
+	fi
+}
+
+check_directories_exist() {
+	#vars=(ATL_APPDIR ATL_LOCKDIR ATL_LOGDIR)
+	# FIXME: this is not the right place to check for feature-dependent directories. 'atl_event validateperms' is the correct place.
+	#if [[ $ATL_BACKUP_TYPES =~ rsnapshot && $ATL_DATABASE_TYPE = postgresql  ]]; then
+	#	set -x
+	#	if id postgres >/dev/null; then
+	#		sudo -u postgres test -r "$ATL_BACKUP_DATABASEDUMP"
+	#		sudo -u postgres test -x "$ATL_BACKUP_DATABASEDUMP"
+	#	fi
+	#	vars+=(ATL_BACKUP_DATABASEDUMP)
+	#fi
+	[[ -v ATL_APPDIR ]]|| fail "ATL_APPDIR not defined"
+	if [[ -d "$ATL_APPDIR" ]]; then
+		for var in ATL_LOCKDIR ATL_LOGDIR; do
+			if [[ ! -v $var ]]; then
+				local varenvfile="$ATL_APPDIR/.env/$var"
+				if [[ -f $varenvfile ]]; then
+					if [[ ! -r $varenvfile ]]; then
+						fail "$var is not defined, as runtime user $USER cannot read $varenvfile" 
+					else
+						fail "$var is not defined, but $varenvfile is readable. Strange!"
+					fi
+				else
+					fail "$var is not defined, possibly because $varenvfile is missing (or we can't execute an intermediate dir)"
+				fi
+			fi
+			[[ -d "${!var}" ]] || fail "$var directory ${!var} does not exist"
+		done
+	fi
+}
+
+# After spending a whole day investigating why auth wouldn't work, I've added this check for whether seraph-config.xml is modified to accommodate Crowd
+check_seraph_authenticator() {
+	[[ $ATL_PRODUCT = jira || $ATL_PRODUCT = confluence ]] || return 0
+	require_table cwd_directory || return 0
+	case "$ATL_PRODUCT" in
+	jira) classes="$ATL_APPDIR/atlassian-jira/WEB-INF/classes" ;;
+	confluence) classes="$ATL_APPDIR/confluence/WEB-INF/classes" ;;
+	*) return 0 ;;
+	esac
+	local cwdcount md5_expected md5_actual
+	cwdcount=$(echo "select count(*) from cwd_directory where lower_impl_class='com.atlassian.crowd.directory.remotecrowddirectory' and active::text~'[T1]'" | atl_sql)
+	md5_expected=$(cat "$classes/hash-registry.properties" | awk -F= '$1=="cp.seraph-config.xml" {print  $2}')
+	md5_actual=$(md5sum "$classes/seraph-config.xml" | awk '{print $1}')
+	if [[ $md5_expected = "$md5_actual" ]] && ((cwdcount == 0)); then
+		# The usual case
+		debug "Validated seraph-config.xml is correct for non-Crowd usage"
+		return 0
+	fi
+	local authenticator_expected authenticator_actual
+	case "$ATL_PRODUCT" in
+	jira)
+		if ((cwdcount > 0)); then
+			authenticator_expected="com.atlassian.jira.security.login.SSOSeraphAuthenticator"
+		else
+			authenticator_expected="com.atlassian.jira.security.login.JiraSeraphAuthenticator"
+		fi
+		;;
+	confluence)
+		#log "Debugging: cwdcount is $cwdcount"
+		if ((cwdcount > 0)); then
+			authenticator_expected="com.atlassian.confluence.user.ConfluenceCrowdSSOAuthenticator"
+		else
+			authenticator_expected="com.atlassian.confluence.user.ConfluenceAuthenticator"
+		fi
+		;;
+	esac
+
+	authenticator_actual=$(xq -r '."security-config".authenticator."@class"' "$classes/seraph-config.xml")
+	if [[ $authenticator_actual != "$authenticator_expected" ]]; then
+		if ((cwdcount)); then
+			log "Because $cwdcount Crowd directory is used, to attain SSO you may wish to configure $classes/seraph-config.xml with authenticator $authenticator_expected, not '$authenticator_actual'"
+		else
+			fail "$classes/seraph-config.xml is expected to use non-Crowd authenticator $authenticator_expected, not '$authenticator_actual'"
+		fi
+	else
+		: #log "Validated seraph-config.xml authenticator ($authenticator_actual)"
+	fi
+}
+
+check_patchqueue_repo_online() {
+	return 0 # Disable for now. The localhost:8610 portforward will only be present when I am ssh'd in
+	if [[ "$ATL_PATCHQUEUE_REPO" =~ (https?)://(.*):([0-9]+)(/.*)? ]]; then
+		local scheme="${BASH_REMATCH[1]}"
+		local host="${BASH_REMATCH[2]}"
+		local port="${BASH_REMATCH[3]}"
+		local path="${BASH_REMATCH[4]}"
+		if ! chronic check_http -H $host -p $port -u $path -e 200 -t 2 -w 1 -c 2; then
+			warn "Could not contact patchqueue repo host $ATL_PATCHQUEUE_REPO"
+		fi
+	fi
+}
+
+check_zfs() {
+	# Mar 31 12:59:02 jturner-desktop atl_event[1937107]: Failed to initialize the libzfs library.
+	# Mar 31 12:59:02 jturner-desktop atl_event[1936882]: atl_check_appdeployment:587 → check_zfs !!! The ZFS 'xattr' property should be set to 'sa', not ''. See 'man zfsprops'. Fix this with: 'zfs set xattr=sa tank2020'
+	if [[ ! -v ATL_USER ]]; then
+		# FIXME: not running the ZFS check under systemd/cron until the 'Failed to initialize the libzfs library' error is investigated"
+		return 0
+	fi
+	if [[ -v ATL_ZFS && -v ATL_ZFSPOOL ]]; then
+		local xattr acltype
+		xattr="$(zfs get -H -o value xattr "$ATL_ZFSPOOL")"
+		if [[ $xattr = off ]]; then
+			warn "The ZFS 'xattr' property should be set to 'sa', not '$xattr'. See 'man zfsprops'. Fix this with: 'zfs set xattr=sa $ATL_ZFSPOOL'"
+		fi
+		acltype="$(zfs get -H -o value acltype "$ATL_ZFSPOOL")"
+		if [[ $acltype != posix ]]; then
+			addwarning "The ZFS 'acltype' property should be set to 'posix', not '$acltype', otherwise atl_upgrade_database_backup will fail. See 'man zfsprops'. Fix this with: 'zfs set acltype=posix $ATL_ZFSPOOL'"
+		fi
+	fi
+}
+
+check_postfix() {
+	[[ -d /etc/postfix ]] || return 0
+	localonly() {
+		local interface
+		interface="$(postconf -h inet_interfaces)"
+		if [[ $interface != 'loopback-only' ]]; then
+			if [[ ! -v ATL_POSTFIX_PUBLIC ]]; then
+				addwarning "Postfix sets inet_interfaces = '$interface'. If this Postfix is delivery-only, set this to 'loopback-only' instead. Be sure apps deliver to 'localhost' not $ATL_SHORTNAME.localhost"
+			fi
+		fi
+	}
+	# Prevent accidentally leaving Postfix blackholes on in production
+	blackhole() {
+		[[ $ATL_ROLE =~ prod ]] || return 0
+		if [[ -v ATL_CHECK_DEPLOYMENT_POSTFIX_BLACKHOLE_OVERRIDE ]]; then
+			return 0
+		fi
+		local vmaps vmapfile wildcards
+		vmaps="$(postconf -h virtual_alias_maps)"
+		if [[ $vmaps =~ ^regexp:(.+)$ ]]; then
+			vmapfile="${BASH_REMATCH[1]}"
+			wildcards="$(awk '/^[^#]/ && ($1 ~ /\.\*/) {print}' <"$vmapfile")"
+			if [[ -n "$wildcards" && ! $wildcards =~ redradishtech\.com ]]; then # Ignore linode /.*@monitoring.redradishtech.com/ redirect
+				addwarning "Postfix has a wildcard virtual alias map, possibly indicating a match-all that should not be present in production: $wildcards (file $vmapfile)"
+			fi
+		fi
+	}
+
+	localonly
+	blackhole
+
+	if [[ -f /etc/postfix/sasl_passwd ]]; then
+		denyread nobody /etc/postfix/sasl_passwd
+	fi
+
+}
+
+check_udp() {
+	# DNS 'what is my IP' query to ensure UDP round-tripping works, AS IT DOESN'T ON HETZNER
+	# https://old.reddit.com/r/hetzner/comments/ha87jn/robot_default_firewall_blocks_udp_outgoing_traffic/
+	# https://community.cloudflare.com/t/resolved-connection-issues-with-cloudflared-due-to-ingress-udp-traffic/515241/6
+	local cmd=(dig -4 TXT +short o-o.myaddr.l.google.com @ns1.google.com)
+	"${cmd[@]}" >/dev/null || addwarning "UDP blocked? command failed: ${cmd[*]}"
+}
+
+
+check_misc() {
+	local f
+	if f="$(grep -lP '(?<!\.env)/atl_env' /etc/cron.d/*)"; then
+		warn "Cron job(s) references non-.env atl_env: $f"
+	fi
+	# We set 'umask 027' in lib/common.sh, which is fine normally except when following typical instructions to add keyring files, which must be 644 or GPG validation breaks
+	if stat -c '%a %n' /usr/share/keyrings/* | grep -v ^644; then
+		warn "Permissions wrong on apt keyring file - should be 644. This happens because of our excessively strict umask."
+	fi
+}
+
+# $ATL_APPDIR/bin/setenv-*.sh files should only set JVMOPTS+=" ...", and then JVMOPTS will be reassigned to the actual variable the app uses. 
+
+check_setenv_snippets() (
+	shopt -s nullglob || :
+	for f in "$ATL_APPDIR/${ATL_TOMCAT_SUBDIR}bin"/setenv-*.sh; do
+		if out=$(grep -P '^\b(?!JVMOPTS\b)[A-Z]+\+?=' "$f"); then
+			addwarning "It appears you are setting a variable that isn't JVMOPTS in $f: «$out»"
+		fi
+		if out="$(grep 'JVMOPTS=' "$f")"; then
+			addwarning "Prefer JVMOPTS+=\" ...\" in $f, rather than JVMOPTS=..: «$out»"
+		fi
+	done
+)
+
+require_table() {
+	# https://stackoverflow.com/questions/20582500/how-to-check-if-a-table-exists-in-a-given-schema
+	if [[ $(atl_psql -tAXqc "SELECT EXISTS ( SELECT 1 FROM pg_tables WHERE  schemaname = 'public' AND tablename = '$1');") != t ]]; then
+		warn "Database not set up (no $1 table)"
+		# Our database isn't set up. No point doing any consistency checks
+		exit 0
+	fi
+}
+
+printwarnings() {
+	wait # Wait for backgrounded checks to finish
+	if (( ${#warnings[@]} )); then
+		for w in "${warnings[@]}"; do
+			echo -e >&2 "Warning: $w"
+		done
+		if (( ! ${#errors[@]} )); then exit 1; fi
+	fi
+	if (( ${#errors[@]} )); then
+		for e in "${errors[@]}"; do
+			echo -e >&2 "Error: $e"
+		done
+		exit 2
+	fi
+}
+
+main "$@"

@@ -1,0 +1,3 @@
+#!/bin/bash -eu
+# shellcheck source=/opt/atl_manage/events/install-pre/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

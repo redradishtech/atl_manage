@@ -1,0 +1,121 @@
+#!/bin/bash -eu
+#shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+set -o pipefail
+## Given a plugin key or keys, returns a regex matching every JIRA 'action' in the plugin(s)
+
+# This is done by examining the plugin descriptor, e.g. extracting '/secure/JqtFieldCodesPage' from::
+
+# <atlassian-plugin>
+# ...
+#   <webwork1 key="jwt-field-code-page" name="JWT Field Code Page" roles-required="sysadmin">
+#    <actions>
+#      <action name="com.fca.jira.plugins.workflowToolbox.parser.FieldCodesPage" alias="JwtFieldCodesPage" roles-required="use">
+#        <view name="input">/templates/shared/available-string-fields-page.vm</view>
+#      </action>
+#    </actions>
+#  </webwork1>
+
+# Another example from the com.greffon.folio plugin:
+#
+# <atlassian-plugin>
+# ...
+#  <webwork1 key="folio_webactions" i18n-name-key="kt.plugin.webactions" class="java.lang.Object">
+#    <description key="kt.plugin.webactions.desc"/>
+#    <actions>
+#      <action name="com.tempoplugin.folio.actions.FolioAction" alias="FolioAction">
+#        <command name="globalSettings" alias="FolioGlobalSettings">
+#          <view name="success">/templates/global/settings.vm</view>
+#          <view name="error">/templates/common/error.vm</view>
+#        </command>
+#        <command name="manageFolio" alias="ManageFolio">
+#          <view name="success">/templates/folio/manage.vm</view>
+#          <view name="error">/templates/common/error.vm</view>
+#        </command>
+
+# The latter gives URL /secure/secure/ManageFolio.jspa?  (yes, double /secure)
+#
+# Confluence is different. An example from Scroll Office Word Exporter:
+#
+#  <servlet name="Scroll Exporter REST API Servlet" key="rest-api-servlet" class="com.k15t.scroll.exporter.infra.WordJerseyServletContainer">
+#    <description>Servlet container for the Scroll Exporter REST API.</description>
+#    <url-pattern>/scroll-office/api/*</url-pattern>
+#  </servlet>
+#  <servlet name="UI Servlet" key="spark-servlet" class="com.k15t.scroll.exporter.web.staticcontent.ExporterConfluenceIframeContentServlet">
+#    <url-pattern>/scroll-office/ui/*</url-pattern>
+#    <init-param>
+#      <param-name>resource-path</param-name>
+#      <param-value>/com/k15t/scroll/exporter/static</param-value>
+#    </init-param>
+#  </servlet>
+#
+# Confluence SpaceAuditor:
+# <web-item key="spaceauditor-admin-web-item" name="SpaceAuditor Reports" section="system.admin/administration" weight="1000">
+#    <description>SpaceAuditor Statistics for all Confluence spaces</description>
+#    <label key="SpaceAuditor Reports"/>
+#    <link linkId="spaceauditor-stats-report-admin-link">/admin/vertuna/spaceauditor/stats.action</link>
+#  </web-item>
+
+main() {
+	if [[ $1 = --filter-rest ]]; then
+		shift
+		filter_rest=true
+	else filter_rest=false; fi
+
+	for pluginkey in "$@"; do
+		# Note: the xpath selects don't print a newline on the last entry, which makes the bash loop miss them. Fixed with a hack from:
+		# https://stackoverflow.com/questions/12916352/shell-script-read-missing-last-line
+		# We need pipefail set so that if atl_plugin_descriptor fails (plugin doesn't exist), we fail early. But that also causes xmlstarlet to terminate the script if e.g. this first section doesn't match. Hence we wrap xmlstarlet in ( ... || :) to ignore its exit code
+		atl_plugin_descriptor "$pluginkey" |
+			(xmlstarlet sel --noblanks --template --match '//action[@roles-required="admin"]//@alias' -n -v . || :) |
+			while read -r action || [ -n "$action" ]; do
+				[[ -n $action ]] || continue
+				echo "/secure/admin/$action"
+			done
+
+		atl_plugin_descriptor "$pluginkey" |
+			(xmlstarlet sel --noblanks --template --match '//action[not(@roles-required) or @roles-required!="admin"]//@alias' -n -v . || :) |
+			while read -r action || [ -n "$action" ]; do
+				[[ -n $action ]] || continue
+				echo "/secure/$action"
+			done
+
+		atl_plugin_descriptor "$pluginkey" |
+			(xmlstarlet sel --noblanks --template --match '//servlet/url-pattern' -n -v . || :) |
+			while read -r action || [ -n "$action" ]; do
+				[[ -n $action ]] || continue
+				echo "/plugins/servlet${action%\*}" # Strip any '*' at the end
+			done
+
+		atl_plugin_descriptor "$pluginkey" |
+			(xmlstarlet sel --noblanks --template --match '//rest/@path' -n -v . || :) |
+			while read -r path || [ -n "$path" ]; do
+				[[ -n $path ]] || continue
+				echo "/rest$path"
+			done
+		# web-item links can have parametrized query strings (?.*) which we strip out, and then sort|uniq to eliminate dups
+		atl_plugin_descriptor "$pluginkey" |
+			(xmlstarlet sel --noblanks --template --match '//web-item/link' -n -v . || :) |
+			perl -pe 's/\?.*//g' | sort | uniq |
+			while read -r path || [ -n "$path" ]; do
+				[[ -n $path ]] || continue
+				echo "$path"
+			done
+	done | (if $filter_rest; then grep -v '/rest/'; else cat -; fi) | echo "($(paste -s -d"|"))"
+}
+
+usage() {
+	echo >&2 "Purpose: prints a regex that will match access logs of requests pertaining to the given plugin"
+	echo >&2 "E.g. $(basename "$0") com.tempoplugin.tempo-planner com.tempoplugin.tempo-accounts com.tempoplugin.tempo-plan-core"
+	echo >&2 "E.g. $(basename "$0") com.radiantminds.roadmaps-jira com.atlassian.jpo com.atlassian.teams"
+	exit 2
+}
+
+if [[ $# -eq 0 || $* =~ --help ]]; then
+	usage "$@"
+elif [[ $# = 1 && $1 = com.radiantminds.roadmaps-jira ]]; then
+	echo >&2 "For Portfolio, please include sub-plugins:  com.radiantminds.roadmaps-jira com.atlassian.jpo com.atlassian.teams"
+	exit 2
+else
+	main "$@"
+fi

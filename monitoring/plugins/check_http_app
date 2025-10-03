@@ -1,0 +1,42 @@
+#!/bin/bash -eu
+# Nagios check of the apps's HTTP endpoint.
+# Clever enough to do the right thing on a standby (ATL_ROLE=standby), or if the frontend is unreachable (ATL_BASEURL_IS_AUTH_PROXIED)
+# Usage: check_http_app [/path] [check_http args]
+
+#logfile="/tmp/out"
+#exec > >(tee "$logfile") 2>&1
+case "$ATL_PRODUCT" in
+	jethro) 
+		check_http_statuspage_jethro "$@"
+		;;
+	jira|confluence)
+		if (( $# )); then
+			if ! [[ ${1:0:1} = - ]]; then 
+				# It's not a --param, so it must be a url path
+				path="$1"
+				shift
+			fi
+		else
+			path="/status"
+			responsecode=200
+		fi
+
+		# In addition to checking the prod instance (below), ensure that the standby is not running
+		if [[ "$ATL_ROLE" = standby ]]; then
+			dir="$(dirname "${BASH_SOURCE[0]}")"
+			negate -t1 -T OK "$dir"/check_httpurl "${ATL_BASEURL_INTERNAL}${path}" ${responsecode:+-e $responsecode} "$@"
+		fi
+
+		# Check the real frontend if we can, e.g. not behind Cloudflare Access, otherwise the internal
+		if [[ ${ATL_BASEURL_IS_AUTH_PROXIED:-} ]]; then
+			# We cannot access our public URL, so check the internal one instead
+			baseurl="${ATL_BASEURL_INTERNAL}"
+		else
+			baseurl="${ATL_BASEURL}"
+		fi
+		exec check_httpurl "${baseurl}${path}" ${responsecode:+-e $responsecode} "$@"
+		;;
+	*) 
+		echo >&2 "Unhandled app: $ATL_PRODUCT"; exit 1
+		;;
+esac

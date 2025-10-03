@@ -1,0 +1,72 @@
+#!/bin/bash -eu
+## Shows Postgresql queries associated with this app's database
+
+. "$ATL_MANAGE/lib/logging.sh"
+
+if [[ $* =~ -v ]]; then prettyprint=true; else prettyprint=false; fi
+
+main() {
+	echo "select pid, state, runtime, query from (select *, now()-query_start AS runtime from pg_stat_activity where datname=current_database() and pid!=pg_backend_pid()) AS x ${where:+where $where} order by query_start desc ;" | atl psql --super -X -tAF $'\t' -q | while IFS=$'\t' read -r pid state runtime query; do
+		printf "%s %-20s %-20s %s\n" "$pid" "$state" "$runtime" "$(formatquery "$query")"
+	done
+	querysize
+}
+
+querysize() {
+	((querysize = $(atl_psql -tAXqc "select pg_size_bytes(current_setting('track_activity_query_size'));")))
+	if ((querysize <= 1024)); then
+		warn "The SQL shown is truncated to 1024 bytes. Increase with: SET SYSTEM track_activity_query_size=10240;"
+	fi
+}
+formatquery() {
+	local sql="$1"
+	if $prettyprint; then
+		echo "$sql" | sqlformat -a -
+	else
+		echo "$sql"
+	fi
+}
+
+usage() {
+	cat <<EOF
+## Shows Postgresql queries associated with this app's database
+
+Usage:
+$(basename "$0") [OPTIONS]
+
+Options:
+
+--prettyprint			Reformat SQL
+--where <whereclause>		Clause to refine select on pg_stat_activity table.
+
+E.g.:
+$(basename "$0") bash      # For making ad-hoc changes
+$(basename "$0") $ATL_MANAGE/lib/create_patchqueue   # Redeploy the whole patchqueue
+
+
+EOF
+	exit 2
+}
+
+PARSED=$(getopt --options 'ph' --longoptions 'prettyprint,where:,help' --name "$0" -- "$@")
+eval set -- "$PARSED"
+prettyprint=false
+# now enjoy the options in order and nicely split until we see --
+while true; do
+	case "$1" in
+	-p | --prettyprint) prettyprint=true ;;
+	--where)
+		shift
+		where="$1"
+		;;
+	--)
+		shift
+		break
+		;;
+	-h | --help) usage ;;
+	*) usage "Invalid options" ;;
+	esac
+	shift
+done
+
+main "$@"

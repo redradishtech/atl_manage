@@ -1,0 +1,49 @@
+#!/usr/bin/perl
+# Given catalina.out logs as a file or stdin, writes threaddump-$date.txt files of each thread dump encountered.
+
+use strict;
+use warnings;
+use Data::Dumper;
+use 5.22.0;
+
+
+my $print;
+my $prev;
+my $cur;
+
+my $fname;
+my $undated_counter = 0;
+my $td = "";
+
+while (<>) {
+	$prev = $cur;
+	$cur = $_;
+	if (/Full thread dump (Java|OpenJDK)/) {
+		#Dec 12 02:34:13 2018-12-12 02:34:13
+		#Dec 12 02:34:13 Full thread dump Java HotSpot(TM) 64-Bit Server VM (25.171-b11 mixed mode):
+		#
+
+		say "Found thread dump";
+		$print = 1;
+
+		my $re = qr/(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/;
+		if ($_ =~ $re or (defined $prev && $prev =~ $re)) {
+			say "Matched date $1";
+			$fname = "threaddump-" . $1 =~ s/ /_/gr . ".txt";
+		} else {
+			say "No date: $_";
+			$fname = "threaddump-$undated_counter.txt";
+			$undated_counter++;
+		}
+	}
+	if (/class space *used/) {
+		$print = 0;
+		say "Writing thread dump $fname";
+		open(my $fh, '>', $fname) or die;
+		print $fh $td; 
+		$td = "";
+	}
+	if ($print) {
+		$td .= $_;
+	}
+}

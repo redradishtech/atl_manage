@@ -1,0 +1,56 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	PARSED=$(getopt --options 'fth' --longoptions 'help,from:,to:' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	from=
+	to=
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		-f | --from)
+			from=$2
+			shift
+			;;
+		-t | --to)
+			to=$2
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	# }}}
+	[[ $from ]] && args=(-c ":hide-lines-before $from")
+	[[ $to ]] && args+=(-c ":hide-lines-after $to")
+	set -x
+	# The args thing must be quoted
+	set -x
+	lnav ${args[@]:-} "$@"
+}
+
+usage() {
+	echo >&2 "Usage: $(basename "$0") --from <date> --to <date> <lnavfile>"
+	echo >&2 " E.g.: $(basename "$0") --from "$(date -d'1 hour ago' +'%Y-%m-%d %H:%M:%S')" \$ATL_MANAGE/lib/lnav/jira-user-requestpairs-hourly.sql"
+	cat <<-EOF
+		lnav /var/log/apache2/jira.example.com/access.log-{2018-07-04-0625-2018-07-05-0625,2018-07-05-0625-2018-07-06-0624}.gz \\
+			>  -c ":hide-lines-before  $(date -d'1 hour ago' +'%H:00:00')" \\
+			>  -c  ':hide-lines-after 2018-07-05 03:00:00.000' \\
+			>  -f \$ATL_MANAGE/lib/lnav/jira-user-requestpairs-hourly.sql
+	EOF
+	exit
+}
+
+main "$@"

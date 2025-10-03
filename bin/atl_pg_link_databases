@@ -1,0 +1,51 @@
+#!/bin/bash -eu
+
+. /opt/atl_manage/lib/common.sh
+
+main() {
+	if (($# == 0)) || [[ $* =~ -h ]]; then usage; fi
+
+	[[ -v ATL_DATABASELINK_CHILD_DATABASE ]] || fail "Please set ATL_DATABASELINK_CHILD_DATABASE to the database you wish to remotely query"
+	[[ -v ATL_DATABASELINK_CHILD_DATABASE_PORT ]] || fail "Please set ATL_DATABASELINK_CHILD_DATABASE_PORT to the port of the database you wish to remotely query"
+	[[ -v ATL_DATABASELINK_CHILD_DATABASE_USER ]] || fail "Please set ATL_DATABASELINK_CHILD_DATABASE_USER=${ATL_DATABASE_USER}_fdwuser"
+	[[ -v ATL_DATABASELINK_CHILD_DATABASE_PASSWORD ]] || fail "Please set ATL_DATABASELINK_CHILD_DATABASE_PASSWORD to something random, e.g. '$(pwgen -s 15 1)'"
+	log "Making database $ATL_DATABASELINK_CHILD_DATABASE available for remote querying"
+	if [[ $ATL_DATABASE = "$ATL_DATABASELINK_CHILD_DATABASE" ]]; then
+		log "We are the remotely-queried instance"
+
+		if ! pg_user_exists; then
+			log "Creating fdw user '$ATL_DATABASELINK_CHILD_DATABASE_USER'"
+			ATL_DATABASE_PASSWORD="$ATL_DATABASELINK_CHILD_DATABASE_PASSWORD" atl_createuser -v "$ATL_DATABASELINK_CHILD_DATABASE_USER"
+		else
+			log "User already exists: $ATL_DATABASELINK_CHILD_DATABASE_USER"
+		fi
+		log "Granting $ATL_DATABASELINK_CHILD_DATABASE_USER select permissions"
+		echo "grant select on all tables in schema public to \"$ATL_DATABASELINK_CHILD_DATABASE_USER\";" | atl_psql --super --echo-queries
+		log "All done"
+	else
+		log "We are the instance from which we query $ATL_DATABASELINK_CHILD_DATABASE"
+		[[ -v ATL_DATABASELINK_CHILD_SCHEMA ]] || fail "Please define ATL_DATABASELINK_CHILD_SCHEMA to a short schema name, into which the $ATL_DATABASELINK_CHILD_DATABASE database tables will be available"
+		cat <<-EOF | atl_psql --super --echo-queries
+			CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+			create server if not exists "$ATL_DATABASELINK_CHILD_DATABASE" foreign data wrapper postgres_fdw options (host '$ATL_DATABASE_HOST', dbname '$ATL_DATABASELINK_CHILD_DATABASE', fetch_size '10000');
+			create user mapping for postgres server "$ATL_DATABASELINK_CHILD_DATABASE" options (user '$ATL_DATABASELINK_CHILD_DATABASE_USER', password '$ATL_DATABASELINK_CHILD_DATABASE_PASSWORD');
+			create user mapping for "$ATL_DATABASE_USER" server "$ATL_DATABASELINK_CHILD_DATABASE" OPTIONS (user '$ATL_DATABASELINK_CHILD_DATABASE_USER', password '$ATL_DATABASELINK_CHILD_DATABASE_PASSWORD');
+			drop schema if exists "$ATL_DATABASELINK_CHILD_SCHEMA" cascade;
+			create schema "$ATL_DATABASELINK_CHILD_SCHEMA";
+			--grant usage on schema "$ATL_DATABASELINK_CHILD_SCHEMA" to "$ATL_DATABASE_USER";
+			grant all on schema "$ATL_DATABASELINK_CHILD_SCHEMA" to "$ATL_DATABASE_USER";
+			import foreign schema public from server "$ATL_DATABASELINK_CHILD_DATABASE" into "$ATL_DATABASELINK_CHILD_SCHEMA";
+			grant select on all tables in schema "$ATL_DATABASELINK_CHILD_SCHEMA" to "$ATL_DATABASE_USER";
+		EOF
+	fi
+}
+
+pg_user_exists() {
+	[[ -n "$(atl_psql -tAXqc "select 1 from pg_roles where rolname='$ATL_DATABASELINK_CHILD_DATABASE_USER';")" ]]
+}
+
+usage() {
+	echo >&2 "Usage:"
+}
+
+main "$@"

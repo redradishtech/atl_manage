@@ -1,0 +1,462 @@
+#!/bin/bash -eu
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed --record_last_run
+source "$ATL_MANAGE/lib/monitoring.sh"
+# If we ever figure out make SCRIPT_CHANGED dependent on other files: depend on monitoring/templates/atlmanage.nagios.cfg
+
+main() {
+	set_monitoring_vars # Sets $monitoring_confdir and other monitoring_* variables
+
+	if ! $SCRIPT_CHANGED && atl_monitoring check && [[ ! "$*" =~ --force ]] &>/dev/null; then
+		# We've run atl_install_monitoring before, but perhaps not for this product. Just install the product template and reload
+		monitoring_install_servicetemplate "$ATL_PRODUCT"
+		# Some time after Jan/22 we can assume that all installations have this working:
+		make_logdir_readable_by_frontend
+		systemctl reload "$ATL_MONITORING"
+		return
+	fi
+
+	if [[ $ATL_MONITORING = nagios4 ]]; then
+		pkginstall nagios4
+		pkginstall nagios-images
+		pkginstall whois   # The check_domain in atlmanage.cfg needs this
+		if [[ -v ATL_PRODUCT_RUNTIME_TECHNOLOGY && ! $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ php ]]; then
+			# On dlp-dev I found nagios broken after this. I had to
+			warn "Not installing php-fpm and nagios4-cgi although they may be needed, as it may interfere with the PHP installed for $ATL_PRODUCT"
+			apt install php-fpm
+			#pkginstall nagios4-cgi
+			# Poorly thought out and breaks:
+			#local conf="$(basename $(echo /etc/apache2/conf-available/php*-fpm.conf))"
+			#a2enconf "$conf"
+		fi
+		a2enmod proxy_fcgi setenvif
+		#systemctl reload apache2
+
+	elif [[ $ATL_MONITORING = icinga2 ]]; then
+		error "Icinga2 is not supported. The /icingaweb2 setup wizard breaks with https://github.com/Icinga/icingaweb2/issues/3459 unless we install a custom repo. We don't generate config snippets in the new format, and icinga2 is not backwards-compatible"
+		pkginstall icinga2
+		pkginstall vim-icinga2
+		pkginstall icingacli  # Needed to enable 'notification' module
+		pkginstall icingaweb2 # needed for icingacli: https://github.com/Icinga/icingaweb2/issues/2705
+		pkginstall vim-icinga2
+	elif [[ $ATL_MONITORING = icinga ]]; then
+		pkginstall icinga-cgi
+		pkginstall icinga-core
+		# Bugfix for icinga 1.14.2: https://bugs.launchpad.net/ubuntu/+source/icinga/+bug/1817807
+		perl -i -pe 's,[^#]Require all granted,#Require all granted # https://bugs.launchpad.net/ubuntu/+source/icinga/+bug/1817807,g' /etc/icinga/apache2.conf
+	elif [[ $ATL_MONITORING = nagios3 ]]; then
+		pkginstall nagios3
+		pkginstall nagios3-cgi
+		pkginstall nagios-images
+	fi
+	if [[ $ATL_WEBSERVER = nginx ]]; then
+		# https://atlgeek.wordpress.com/2014/05/12/nagios-4-nginx-ubuntu-14-04-lts/
+		pkginstall php-fpm fcgiwrap
+	fi
+	monitoring_only_on_localhost
+	monitoring_use_real_hostname
+
+	monitoring_fix_diskusage_command
+	monitoring_fix_swap_check
+	monitoring_install_generic_servicetemplates
+	monitoring_install_servicetemplate_sudosnippet
+	monitoring_install_opsgenie
+	monitoring_enable_external_commands
+	monitoring_fix_default_checks
+	monitoring_check_permissions
+	monitoring_fix_contacts
+
+	if [[ -v ATL_MONITORING_HOST && $ATL_MONITORING_HOST != localhost ]]; then
+		install_nsca_ng
+		configure_nsca_ng
+		configure_send_nsca
+	else
+		log "Not installing nsca-ng - will use localhost (ATL_MONITORING_HOST=${ATL_MONITORING_HOST:-})"
+		pkguninstall -P nsca-ng-{server,client}
+	fi
+	monitoring_fix_prefix
+	monitoring_enable_handler_environment_vars
+	monitoring_images
+	# We must install the app-specific template before we call monitoring_restart, as the latter does a 'check' which will fail if the template isn't installed.
+	monitoring_install_servicetemplate "$ATL_PRODUCT"
+	monitoring_restart
+	verify_writable_commandfile
+	make_logdir_readable_by_frontend
+	install_log_cleanup
+	install_monitoring_runcheck
+	#reload_webserver
+}
+
+monitoring_installed_globally_and_happy() {
+	# This returns 'dead' if no $ATL_MONITORING service exists, 'failed' if it has a problem, and 'running' if the service is running fine
+	local existing_monitoring_state=$(systemctl show -p SubState "$ATL_MONITORING" | sed -e 's/SubState=//g')
+	[[ $existing_monitoring_state = running ]]
+}
+
+monitoring_fix_diskusage_command() {
+	if [[ $ATL_MONITORING = nagios4 ]]; then
+		warn "FIXME: Does nagios's disk check break on gvfs? We assume not"
+		return
+	fi
+	if ! grep -q check_all_physical_disks /etc/$ATL_MONITORING/commands.cfg; then
+		cat - <<-EOF >>/etc/$ATL_MONITORING/commands.cfg
+			# https://bugs.launchpad.net/ubuntu/+source/nagios-plugins/+bug/1516451
+			# The '-A -i .gvfs' is for https://bugs.launchpad.net/ubuntu/+source/nagios-plugins/+bug/615848
+			# The -i /\.mount_* is for when appImage apps like SP create /tmp/.mount_* filesystems
+			define command{
+				command_name check_all_physical_disks
+				# Note: we only check known filesystem types, as it was getting ridiculous excluding tracefs, tmpfs, cgroups, lxcfs and keybase fuse filesystems at unpredictable locations
+				command_line /usr/lib/nagios/plugins/check_disk -w '\$ARG1$' -c '\$ARG2$' -e -A --include-type=ext4 --include-type=zfs --include-type=xfs
+			}
+		EOF
+
+	fi
+	perl -i -pe 's,check_all_disks,check_all_physical_disks,g' ${monitoring_staticconfs[@]}
+}
+
+monitoring_fix_swap_check() {
+	local configfile
+	if configfile=$(grep -l '^ +check_command +check_local_swap' ${monitoring_staticconfs[@]}) && [[ -z "$(swapon -s)" ]]; then
+		fail "This server does not use swap. Please comment out Swap check in $configfile"
+	fi
+}
+
+monitoring_install_servicetemplate() {
+	local configfile="$1"
+	local template="$ATL_MANAGE/monitoring/templates/$configfile.nagios.cfg"
+	[[ -f $template ]] || fail "No monitoring template defined for $ATL_PRODUCT: $template"
+	log "Installing $monitoring_confdir/$configfile.cfg"
+	tmpfile="$(mktemp)"
+	cat "$template" | ATL_HOSTNAME="$(uname -n)" replace_tokens >"$tmpfile"
+	chown root:nagios "$tmpfile"
+	chmod 644 "$tmpfile"
+	mv "$tmpfile" "$monitoring_confdir/$configfile.cfg"
+}
+
+monitoring_install_generic_servicetemplates() {
+	# Install our atlassian-products template, while also allowing for product-specific templates (like jethro) on particular servers
+	for configfile in atlmanage atlmanage-contacts; do
+		monitoring_install_servicetemplate "$configfile"
+	done
+}
+
+monitoring_install_servicetemplate_sudosnippet() {
+	sudosnippet_systemwide monitoring_postfix_mailqueue_checks "# This /etc/sudoers.d/ snippet allows $ATL_MONITORING to check the Postfix mail queue for buildups of email or bounces.\nnagios  ALL=(ALL)NOPASSWD:SETENV:$ATL_MANAGE/monitoring/plugins/check_postfix_mailqueue"
+}
+
+monitoring_install_opsgenie() {
+	# This doesn't hurt if none of the apps actually use opsgenie
+	monitoring_install_servicetemplate "opsgenie"
+}
+
+monitoring_enable_external_commands() {
+	# Icinga comes with this enabled
+	if [[ $ATL_MONITORING = nagios3 ]] && ! grep -q 'check_external_commands=1' /etc/nagios3/nagios.cfg; then
+		log "Enabling Nagios external commands..."
+		perl -i -pe 's/check_external_commands=0/check_external_commands=1/g' /etc/nagios3/nagios.cfg
+	fi
+	if [[ $ATL_MONITORING = icinga2 ]]; then
+		# https://icinga.com/docs/icingaweb2/latest/modules/monitoring/doc/02-Installation/
+		# 31/Aug/20: breaks with: ERROR: Icinga\Exception\ConfigurationError in /usr/share/php/Icinga/Application/Modules/Manager.php:246 with message: Cannot enable module "notification". Module is not installed.
+		#icingacli module enable notification
+		:
+	fi
+	# FIXME: Why did we stop nagios here?
+	#systemctl stop $ATL_MONITORING
+	dpkg-statoverride --remove "$monitoring_commanddir" || true
+	#dpkg-statoverride --remove /var/lib/$ATL_MONITORING
+	# The '2' here means setguid, meaning files created in rw/ will have group www-data.
+	dpkg-statoverride --update --add nagios www-data 2710 "$monitoring_commanddir"
+	#dpkg-statoverride --update --add nagios nagios 751 /var/lib/$ATL_MONITORING
+	# We want new files in rw/ to be read/writable by www-data (Apache). This is set in the directory's default ACL, which rw/*.cmd files will inherit
+	#setfacl -R -m g:www-data:rwX /var/lib/$ATL_MONITORING/rw
+	# Usually resolves to /var/lib/$ATL_MONITORING/rw except with icinga2
+	chgrp www-data "$monitoring_commanddir"
+	chmod g+rxs "$monitoring_commanddir" # Set SGID bit so rw/nagios.cmd gets group 'www-data'
+	# This setfacl intends to achieve the same thing as g+s - possibly not necessary
+	setfacl -R -d -m g:www-data:rwX "$monitoring_commanddir"
+}
+
+monitoring_use_real_hostname() {
+	# ..so that in emails from multiple systems we can see the real hostname
+	perl -i -pe 's~\blocalhost\b~qx{hostname}~eg' "${monitoring_staticconfs[@]}" # localhost.cfg + templates.cfg in nagios4
+}
+
+monitoring_fix_default_checks() {
+	# Set proc, load and disk alerts to just-before-disaster levels. This is not (we hope!) the primary means of monitoring these levels, just a failsafe.
+	if grep -P -q 'use\s+generic-service' "${monitoring_staticconfs[@]}"; then
+		log "Updating default checks to use our service/host templates so alerts go to the right place"
+		perl -i -pe 's/use(\s+)generic-service/use\1atl-service/g' "${monitoring_staticconfs[@]}" # Replace uses of generic-service with atl-service, and generic-host with atl-host, so alerts go to the right people
+	fi
+	if grep -P -q 'check_procs!(?!700!900)' "${monitoring_staticconfs[@]}"; then
+		log "Updating check_procs default check"
+		perl -i -pe 's/check_procs\![0-9]+\![0-9]+/check_procs!700!900/' "${monitoring_staticconfs[@]}"
+	fi
+	if ! grep -qF 'check_load!20' "${monitoring_staticconfs[@]}" && grep -E -q '^[^#]+check_load!' "${monitoring_staticconfs[@]}"; then
+		log "Adjusting $ATL_MONITORING check_load levels"
+		perl -i -pe 's/check_load![0-9\.\!]+/check_load!20.0!16.0!12.0!40.0!24.0!16.0/' "${monitoring_staticconfs[@]}"
+	fi
+	if grep -qF 'check_all_physical_disks!20%' "${monitoring_staticconfs[@]}"; then
+		log "Adjusting $ATL_MONITORING disk usage levels"
+		perl -i -pe 's/check_all_physical_disks![0-9\.%\!]+/check_all_physical_disks!10%!5%/' "${monitoring_staticconfs[@]}"
+	fi
+}
+
+monitoring_check_permissions() {
+	# This should be the case, as atl_setup grants 'other' rX
+	validate_user_can_read_all nagios "$ATL_MANAGE/monitoring"
+}
+
+monitoring_fix_contacts() {
+	if grep atlassian-app-admins "${monitoring_staticconfs[@]}"; then fail "Found a really old nagios definition, 'atlassian-app-admins', that should not be present"; fi
+	#	perl -i -pe 's/^(\s*contact_groups\s+)admins(\s*$)/\1atlassian-app-admins\2/g' "${monitoring_staticconfs[@]}"
+	# The default 'generic' host/service definitions are used by the default checks, notably Disk Space. Instead of notifying the default 'admins' group, let's notify noncritical-notificants.
+	# 5/Feb/20: change group names from 'atlassian-app-admins' to {critical,noncritical}-notificants
+	perl -i -pe 's/^(\s*contact_groups\s+)atlassian-app-admins(\s*$)/\1noncritical-notificants\2/g' "${monitoring_staticconfs[@]}"
+	perl -i -pe 's/^(\s*contact_groups\s+)atlassian-app-admins(\s*$)/\1noncritical-notificants\2/g' "${monitoring_staticconfs[@]}"
+}
+
+install_nsca_ng() {
+	pkginstall nsca-ng-client
+	# apt install nsca-ng-server fails with:
+	#   Process: 21440 ExecStartPre=/bin/mkdir /run/nsca-ng (code=exited, status=1/FAILURE)
+	# if /run/nsca-ng/ exists due to the presence of nsca-ng-client. The service is actually running, so just ignore the error
+	pkginstall nsca-ng-server || true
+}
+
+configure_nsca_ng() {
+	localcfg="/etc/nsca-ng/nsca-ng.local.cfg"
+
+	if sha1sum --quiet -c <(echo "589128a2e4251e66718a271528059d3853671e8d  $localcfg") >/dev/null 2>&1; then
+		log "$localcfg already customized appropriately"
+
+	elif sha1sum --quiet -c <(echo "66617a98d934311b65e2c14a32433ce43146cb7e  $localcfg") >/dev/null 2>&1; then
+		echo "max_command_size = 65536                # Default: 16384." >>"$localcfg"
+		log "$localcfg tweaked to include max_command_size"
+		# HACK: || true to avoid nsca-ng-server bug
+		systemctl restart nsca-ng-server || true
+	elif sha1sum --quiet -c <(echo "11ff8ba78d6b9aba9af0788c639301a3cb9e07fb  $localcfg") >/dev/null 2>&1; then
+		# It's the default empty config file
+		cat >$localcfg <<-EOF
+			authorize "checker" {
+			password = "s2LDCy4CiK6yrlcHhTXT6agFh067XYE3"
+			hosts = ".*"
+			services = ".*"
+			}
+			max_command_size = 65536                # Default: 16384.
+		EOF
+		setfacl -m "user:$ATL_USER:r" "$localcfg" || true # keep going on NFS
+		# HACK: || true to avoid nsca-ng-server bug
+		systemctl restart nsca-ng-server || true
+	else
+		error "$localcfg file already modified, but not by us"
+	fi
+	# Older versions of nca-ng-server (1.2.1) had this file that needed tweaking
+	if [[ -f /etc/default/nsca-ng-server ]]; then
+		perl -i -pe 's/NSCA_NG=no/NSCA_NG=yes/g' /etc/default/nsca-ng-server
+		service nsca-ng-server start
+	fi
+}
+
+configure_send_nsca() {
+	localcfg=/etc/send_nsca.cfg
+
+	if sha1sum --quiet -c <(echo "f0a633d31ef709e07a49d95efdc1dcad78c572bc  $localcfg") >/dev/null 2>&1; then
+		log "$localcfg already customized appropriately"
+	else
+		if grep -q monitoring.example.com "$localcfg"; then
+			rm "$localcfg"
+		else
+			warn "$localcfg file already modified, but not by us, and it doesn't look like the default. Does this content look overwriteable?? "
+			cat $localcfg
+			read -rp "Shall we overwrite the above contents in $localcfg? (y/N): " yesno
+			case $yesno in
+			y | Y) rm $localcfg ;;
+			esac
+		fi
+	fi
+	if [[ ! -f $localcfg ]]; then
+		cat >$localcfg <<-EOF
+			server = localhost
+			identity = checker
+			password = "s2LDCy4CiK6yrlcHhTXT6agFh067XYE3"
+		EOF
+		log "Hooray, wrote $localcfg"
+	fi
+	set -x
+	setfacl -m "user:$ATL_USER:r" "$localcfg" || true # Keep going on NFS
+	set +x
+}
+
+# Our nginx config does not like a /nagios3 prefix
+monitoring_fix_prefix() {
+	if [[ $ATL_WEBSERVER = nginx ]]; then
+		perl -i -pe 's,^url_html_path=/'$ATL_MONITORING'"$,url_html_path=/,' "/etc/$ATL_MONITORING/cgi.cfg"
+	fi
+}
+
+monitoring_enable_handler_environment_vars() {
+	perl -i -pe 's/enable_environment_macros=0/enable_environment_macros=1/g' "$monitoring_mainconf"
+}
+
+make_logdir_readable_by_frontend() {
+	# Out the box the web frontend cannot read log archives unless we do this. https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=869679
+	setfacl -R -m u:www-data:rX "$monitoring_logdir"
+
+}
+
+install_log_cleanup() {
+	# Remove a pointless/old logrotate we previously installed
+	local old_log_cleanup_file=/etc/log_cleanup.d/${ATL_MONITORING}_commands
+	if [[ -f $old_log_cleanup_file ]]; then rm "$old_log_cleanup_file"; fi
+	local log_cleanup_file="/etc/cron.d/${ATL_MONITORING}_log_cleanup"
+	cat >"$log_cleanup_file" <<-EOF
+		## Nagios and Icinga appear to just write logs to $monitoring_logdir/archives forever
+		## Delete logs older than 3 months
+		## This cronjob was automatically added by $0 on $(date)
+		0 0 * * * root test -d "$monitoring_logdir/archives" && find "$monitoring_logdir/archives" -mtime +$((3 * 30)) -delete
+	EOF
+}
+
+install_monitoring_runcheck() {
+	local monitoring_isrunning="/etc/cron.d/${ATL_MONITORING}_running"
+	cat >"$monitoring_isrunning" <<-EOF
+		## Nagios and Icinga appear to just write logs to $monitoring_logdir/archives forever
+		## Delete logs older than 3 months
+		## This cronjob was automatically added by $0 on $(date)
+		SHELL=/bin/bash
+		0 0 * * * root  [[ \$(systemctl show $ATL_MONITORING.service --property=SubState) = SubState=running ]] || echo "Warning: $ATL_MONITORING service is not active. Services may be failing silently on $HOSTNAME"
+	EOF
+}
+
+# By default Nagios is available at /nagios3 or /nagios4 on all vhosts and the IP. This is bad - we want it just on localhost:80, and we'll SSH to it
+monitoring_only_on_localhost() {
+	if [[ $ATL_WEBSERVER = apache2 ]]; then
+		local snippetfile=/etc/apache2/conf-available/"$monitoring_apachesnippetname".conf
+		[[ -f "$snippetfile" ]] || error "Could not find $snippetfile"
+		a2disconf -q "$monitoring_apachesnippetname"
+		# Debian's 000-default.conf includes a commented-out snippet at just the right place. Rewrite it:
+		#Include conf-available/serve-cgi-bin.conf
+		conf=/etc/apache2/sites-enabled/000-default.conf
+		if [[ -f $conf ]]; then
+			#a2dissite 000-default
+			log "$conf exists, but should not as it exposes Nagios to the world. There should be no reason for the '000-default.conf' site to be enabled. It has been disabled"
+		fi
+		conf=/etc/apache2/sites-available/000-localhost.conf
+		log "Installing $conf"
+		local htdigestfile=$monitoring_etc/htdigest.users
+		cat - >"$conf" <<-EOF
+			# Make $ATL_MONITORING accessible on localhost:80
+			# Note that the $ATL_MONITORING.conf snippet is NOT enabled anywhere else.
+			# Use *:80 rather than localhost:80 so that this vhost doesn't grab precedence over other localhost-mapped vhosts. "Do not mix IP:port and *:port definitions" - https://serverfault.com/questions/815473/how-to-debug-apache2-virtual-hosts
+			<VirtualHost *:80>
+				ServerName localhost
+				<LocationMatch "/nagios4|/cgi-bin/nagios4">
+					AuthDigestDomain "Nagios4"
+					AuthDigestProvider file
+					# Edit this file with: htdigest $htdigestfile Nagios4 nagiosadmin
+					AuthUserFile    "$htdigestfile"
+					AuthGroupFile   "/etc/group"
+					AuthName        "Nagios4"
+					AuthType        Digest
+					#Require all    granted
+					Require valid-user
+				</LocationMatch>
+
+				Include conf-available/$monitoring_apachesnippetname.conf
+			</VirtualHost>
+			# vim: syntax=apache ts=4 sw=4 sts=4 sr noet
+		EOF
+		if [[ ! -s "$htdigestfile" ]]; then
+			# Hash is 'nagiosadmin'
+			echo "nagiosadmin:Nagios4:85043cf96c7f3eb0884f378a8df04e4c" >"$htdigestfile"
+			chown root:www-data "$htdigestfile"
+		fi
+
+		if grep -q '^use_authentication=0' "${monitoring_cgiconf}"; then
+			log "Setting use_authentication=0 in $ATL_MONITORING config files"
+			set -x
+			perl -i -pe 's,^use_authentication=0,use_authentication=1,g' "${monitoring_cgiconf}"
+			set +x
+		fi
+		a2enmod auth_digest
+		a2enmod authz_groupfile
+		a2ensite 000-localhost
+	elif [[ $ATL_WEBSERVER = nginx ]]; then
+		local conf=/etc/nginx/sites-available/$ATL_MONITORING.conf
+		local template=$ATL_MANAGE/monitoring/templates/$ATL_MONITORING-$ATL_WEBSERVER.conf
+		if [[ -f "$template" ]]; then
+			if [[ ! -f "$conf" ]]; then
+				log "Generating $conf from template $template"
+				cat "$template" | replace_tokens >"$conf"
+			else
+				log "$conf is already present"
+			fi
+			if [[ -f "$conf" && ! -f /etc/nginx/sites-available/$ATL_MONITORING.conf ]]; then
+				(
+					cd /etc/nginx/sites-enabled
+					ln -sf "$conf" .
+				)
+			fi
+			nginx -t
+		else
+			fail "Could not find template $template"
+		fi
+	else
+		warn "On $ATL_WEBSERVER I don't know how to expose /$ATL_MONITORING without configuring a vhost."
+		local samplevhost="$ATL_MANAGE/templates/$ATL_MONITORING-$ATL_WEBSERVER.conf"
+		if [[ -f $samplevhost ]]; then
+			warn "Good news! A sample vhost is available in $samplevhost. Please copy this to /etc/$ATL_WEBSERVER/sites-available/, customize to a specific vhost, and enable"
+		fi
+	fi
+}
+
+monitoring_images() {
+	if [[ -d $monitoring_logodir ]]; then
+		debug "Installing $ATL_MONITORING images"
+		install -m 644 "$ATL_MANAGE"/monitoring/images/*.{png,ico} "$monitoring_logodir"
+
+	else
+		warn "Could not find expected $ATL_MONITORING images directory: $monitoring_logodir"
+	fi
+}
+
+monitoring_restart() {
+	systemctl restart "$ATL_MONITORING" || error "$ATL_MONITORING is not happy. Run 'atl_monitoring check' or '$ATL_MONITORING -v /etc/$ATL_MONITORING/$ATL_MONITORING.cfg' to debug"
+}
+
+verify_writable_commandfile() {
+	# Give Nagios a bit of time to start up and create $commandfile
+	local total_x=250 # My nagios4 routinely takes 20s to start
+	((x = total_x))
+	while [[ ! -e "$monitoring_commandfile" ]] && ((x--)); do
+		sleep 0.1
+	done
+	log "Nagios took $(((total_x - x))) * 0.1s to create nagios.cmd"
+	[[ -e "$monitoring_commandfile" ]] || {
+		systemctl status "$ATL_MONITORING"
+		error "$monitoring_commandfile does not exist. This should have been created when $ATL_MONITORING started. Evidently $ATL_MONITORING has not started. Check why with 'systemctl status $ATL_MONITORING' output above."
+	}
+
+	sudo -u www-data -g www-data test -w "$monitoring_commandfile" || error "www-data unable to write to $monitoring_commandfile. Command: sudo -u www-data -g www-data test -w \"$monitoring_commandfile\""
+}
+
+reload_webserver() {
+	if [[ $ATL_WEBSERVER = apache2 ]]; then
+		# Did you know that if a private key file is empty/corrupt, 'apachectl configtest' exits successfully but then 'apachectl graceful' breaks? Happens if the privkey.pem file contains just '%{ATL_SSLCERTKEY}' and the replacement fails.
+		cat /etc/apache2/sites-enabled/*.conf | grep -iPo '(?<=SSLCertificateFile ).*.pem' | while read -r cert; do openssl x509 -in "$cert" >/dev/null; done
+		cat /etc/apache2/sites-enabled/*.conf | grep -iPo '(?<=SSLCertificateChainFile ).*.pem' | while read -r cert; do openssl x509 -in "$cert" >/dev/null; done
+		cat /etc/apache2/sites-enabled/*.conf | grep -iPo '(?<=SSLCertificateKeyFile ).*' | while read cert; do
+			echo "Testing $cert"
+			openssl rsa -in $cert -noout >/dev/null
+		done
+
+		apachectl configtest && apachectl graceful
+	else
+		warn "Please reload $ATL_WEBSERVER yourself"
+	fi
+}
+
+main "$@"

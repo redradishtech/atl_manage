@@ -1,0 +1,54 @@
+#!/bin/bash -eu
+# Sends passive result check to Nagios/Icinga via local command file or send_nsca.
+# 
+# This file replaces replaces:
+# 1) /usr/share/$ATL_MONITORING/plugins/eventhandlers/submit_check_result	# submitting to local command file
+# 2) /usr/share/doc/nsca-ng-client/examples/invoke_check			# submitting to nsca-ng
+#
+# 1) has a strange bug that exhibits under Debian 9.6, only in cron, where /bin/echo [12345] emits '1' instead of [12345]. It also doesn't handle newlines in the output correctly
+# 2) works and handles newlines properly, but must be invoked with /usr/lib/nagios/plugins/check_dummy which is unnecessary in our case.
+
+#shellcheck source=../lib/monitoring.sh
+. "$(dirname "${BASH_SOURCE[0]}")"/../lib/logging.sh
+. "$(dirname "${BASH_SOURCE[0]}")"/../lib/monitoring.sh
+set_monitoring_vars   # Sets $monitoring_commandfile
+
+main()
+{
+	[[ -w $monitoring_commandfile ]] || error "User ${USER:-} (EUID $EUID) ran 'notify_nagios4 $*' but is unable to write the results to $monitoring_commandfile"
+
+	host="$1"
+	service="$2"
+	state="$3"
+	output="$4"
+
+	(( state <= 3 )) || { echo >&2 "State must be 0, 1 or 2"; exit 2; }
+
+	if [[ ! -v ATL_MONITORING_HOST || $ATL_MONITORING_HOST = localhost ]]; then
+		printf "[%lu] PROCESS_SERVICE_CHECK_RESULT;%s;%s;%s;%s\n" "$(date +%s)" "$host" "$service" "$state" "${output//$'\n'/\\n}" > "$monitoring_commandfile"
+	else
+		printf '%b' "$host\t$service\t$state\t$output\n" | send_nsca
+	fi
+}
+
+usage()
+{
+	echo >&2 "Usage: notify_nagios4 <host> <service> <state> <output>"
+	echo >&2 "Where:"
+	echo >&2 "        state is 0, 1 or 2"
+	exit 2
+}
+
+
+fail()
+{
+	echo >&2 "$1"
+	exit 2
+}
+
+if [[ $# -ne 4 || $* =~ --help ]]
+then
+	usage
+else
+	main "$@"
+fi
