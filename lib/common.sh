@@ -105,7 +105,8 @@ statedir() {
 
 # After defining statedir
 # shellcheck source=/opt/atl_manage/lib/scriptlastrun.sh
-. "$ATL_MANAGE/lib/scriptlastrun.sh"
+# Broken since migrating from hg to git
+#. "$ATL_MANAGE/lib/scriptlastrun.sh"
 
 # When sourcing common.sh, args may be given, which set $@ here but not in the caller
 # If we used the usual 'eval set -- $OPTS' getopt technique we would clobber the caller's $@, so instead

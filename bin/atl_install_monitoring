@@ -2,21 +2,24 @@
 set -o pipefail
 
 # shellcheck source=/opt/atl_manage/lib/common.sh
-source "$ATL_MANAGE/lib/common.sh" --no_profile_needed --record_last_run
+#source "$ATL_MANAGE/lib/common.sh" --no_profile_needed --record_last_run
+# --record-last-run is broken after migrating from hg to git.
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
 source "$ATL_MANAGE/lib/monitoring.sh"
 # If we ever figure out make SCRIPT_CHANGED dependent on other files: depend on monitoring/templates/atlmanage.nagios.cfg
 
 main() {
 	set_monitoring_vars # Sets $monitoring_confdir and other monitoring_* variables
 
-	if ! $SCRIPT_CHANGED && atl_monitoring check && [[ ! "$*" =~ --force ]] &>/dev/null; then
-		# We've run atl_install_monitoring before, but perhaps not for this product. Just install the product template and reload
-		monitoring_install_servicetemplate "$ATL_PRODUCT"
-		# Some time after Jan/22 we can assume that all installations have this working:
-		make_logdir_readable_by_frontend
-		systemctl reload "$ATL_MONITORING"
-		return
-	fi
+	# --record-last-run and $SCRIPT_CHANGED is broken after migrating from hg to git.
+	#if ! $SCRIPT_CHANGED && atl_monitoring check && [[ ! "$*" =~ --force ]] &>/dev/null; then
+	#	# We've run atl_install_monitoring before, but perhaps not for this product. Just install the product template and reload
+	#	monitoring_install_servicetemplate "$ATL_PRODUCT"
+	#	# Some time after Jan/22 we can assume that all installations have this working:
+	#	make_logdir_readable_by_frontend
+	#	systemctl reload "$ATL_MONITORING"
+	#	return
+	#fi
 
 	if [[ $ATL_MONITORING = nagios4 ]]; then
 		pkginstall nagios4

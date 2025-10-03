@@ -35,7 +35,8 @@ main() {
 	check_permissions
 	ensure_sshkeys
 	ensure_jndi
-	show_scripts_needing_rerun
+	# Broken since moving from hg to git
+	#show_scripts_needing_rerun
 	check_connection_pool_size
 	ensure_webserver_logrotate
 	ensure_locate_not_installed
