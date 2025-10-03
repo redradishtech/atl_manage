@@ -6,14 +6,17 @@
 #test -d /opt/atl_manage || hg clone ssh://hg@bitbucket.org/redradish/atl_manage /opt/atl_manage
 
 # shellcheck source=/opt/atl_manage/lib/common.sh
-source "$ATL_MANAGE/lib/common.sh" --no_profile_needed --required_vars=ATL_ORGANIZATION --record_last_run
+#source "$ATL_MANAGE/lib/common.sh" --no_profile_needed --required_vars=ATL_ORGANIZATION --record_last_run
+# --record-last-run is broken after migrating from hg to git.
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed --required_vars=ATL_ORGANIZATION
 source "$ATL_MANAGE/lib/http.sh"
 
 main() {
-	$SCRIPT_CHANGED || [[ $* =~ "--force" ]] || {
-		log "No changes since last run. Add --force"
-		exit 0
-	}
+	# --record-last-run and $SCRIPT_CHANGED is broken after migrating from hg to git.
+	#$SCRIPT_CHANGED || [[ $* =~ "--force" ]] || {
+	#	log "No changes since last run. Add --force"
+	#	exit 0
+	#}
 	# Can't remember what this achieved..
 	#if [[ ! -f ~/.ssh/config ]]; then
 	#	touch ~/.ssh/config
@@ -51,7 +54,8 @@ main() {
 	pkginstall dos2unix           # for appfetcher
 	#if apt-cache show python2 >/dev/null; then  pkginstall python2; fi	# For nagios-cli. 'python2' isn't present in ubuntu 18.04 (it's just 'python')
 	remove_ubuntu_weekly_reminder
-	install_atl_manage_permissionhooks
+	# No longer do this after switching to git. We'll just have to set permissions once with .hgpatchscript/worldreadable
+	#install_atl_manage_permissionhooks
 	# Perhaps we shouldn't be setting up the database here, as we may not have a profile loaded.
 	if [[ -v ATL_DATABASE ]]; then atl_install_database; fi
 	setup_firewall

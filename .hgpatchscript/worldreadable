@@ -5,7 +5,7 @@ shopt -s globstar dotglob
 
 
 # I'm pretttty sure we can assume PWD is the hg repo's directory, but it would be pretty disastrous if this were not the case. Leave this check in here for a few years.
-if [[ $(basename "$(pwd)") = atl_manage && -d .hg ]]; then
+if [[ $(basename "$(pwd)") = atl_manage ]]; then
 	# Everything should be owned by root, rather than whatever used did the checkout. The practical reason for this is that if root tries to run a hg command, and .hg/hgrc isn't owned by root, hg throws a 'not trusting file' error. This happens e.g. when the start-pre event runs atl_check_appdeployment as root, which then runs hg commands in $ATL_MANAGE and $ATL_PROFILEDIR. The 'sudo' group then allows admins to see $ATL_PROFILEDIR (root or 'sudo -sE' required to modify)
 	chown -R root:sudo . "${ATL_PROFILEDIR:?}"
 	# The sudo group needs write access, e.g. when jturner runs 'hg serve' and a remote client pushes /opt/atl_manage
