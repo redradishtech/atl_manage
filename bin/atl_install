@@ -1,0 +1,5 @@
+#!/bin/bash -eu
+
+# Note we don't --rebase. We may be deploying an old version that can't be rebased
+atl_deploy "$@"
+atl_activate

@@ -1,0 +1,13 @@
+#!/bin/bash
+## When upgrading, clear our 'atl_plugins' data cache
+
+upgrade-stopped-pre() {
+	cachedir="$(cachedir)"
+	if [[ -d $cachedir ]]; then
+		log "Clearing cached plugin REST resources from old app version"
+		find "$(cachedir)" -name '_rest_*' -delete
+	fi
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

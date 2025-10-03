@@ -1,0 +1,18 @@
+#!/bin/bash -eu
+## Upgrading to Jira 8.x will block on startup while it reindexes, potentially locking users and upgraders out for hours. Require the 'upgrade.reindex.allowed = false' flag so this doesn't happen.
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+require_app jira
+
+cfgfile="$ATL_DATADIR/jira-config.properties"
+if [[ -f "$cfgfile" ]]; then
+	if ! grep -q "^upgrade.reindex.allowed *= *false" "$cfgfile"; then
+		log "Appending 'upgrade.reindex.allowed = false' to $cfgfile to prevent user lockouts.."
+		{
+			echo "# Prevent reindex on upgrade locking out all users. We will reindex manually."
+			echo "upgrade.reindex.allowed = false"
+		} >>"$cfgfile"
+	fi
+fi

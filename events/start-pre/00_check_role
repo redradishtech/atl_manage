@@ -1,0 +1,9 @@
+#!/bin/bash -eu
+## Prevent standbys from starting by accident
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+if [[ $ATL_ROLE =~ standby ]]; then
+	error "This is the standby server; we should not be starting. To override this in an emergency, try again after running: echo 'prod' > $ATL_APPDIR/.env/ATL_ROLE"
+fi

@@ -1,0 +1,5 @@
+#!/bin/bash
+. "$(
+	cd "$(dirname "$0")"
+	pwd
+)"/../.getcommands-enabled-by-patchqueue | tac

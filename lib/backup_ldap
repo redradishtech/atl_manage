@@ -1,0 +1,85 @@
+#!/bin/bash -eu
+set -o pipefail
+shopt -s extglob
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+export PATH=$ATL_MANAGE/bin:$PATH # For atl_pg_dump
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	PARSED=$(getopt --options='hdn' --longoptions 'help,destination:' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	destination=
+	verbose=
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		-d | --dest*)
+			shift
+			if [[ ! -e $1 ]]; then
+				mkdir -p $1 || error "We do not have write permission to create destination directory $1"
+			fi
+			[[ -d $1 ]] || error "destination $1 is not a valid directory"
+			[[ -r $1 ]] || error "destination $1 is readable by us"
+			[[ -w $1 ]] || error "destination $1 is writable by us"
+			if [[ $(ls -A $1 2>/dev/null) ]]; then
+				if [[ -f $1/tstamp ]]; then
+					: # Looks like a backup directory; continue
+				else
+					error "$1 is not empty, but does not contain a 'tstamp' file that would have been created by $(basename $0). Not deleting"
+				fi
+			else
+				: # Empty directory
+			fi
+			destination=$1
+			;;
+		-v | --verbose) verbose=yes ;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage "Invalid options" ;;
+		esac
+		shift
+	done
+
+	[[ $destination ]] || error "--destination is required"
+	# }}}
+	rm -r "$destination"
+	# The tstamp file must be present even if pg_dump fails; however pg_dump won't run if the directory is not completely empty. We get around this catch-22 by creating the tstamp on exit
+	# The date format is relied upon by bin/atl_backupmirror_restore
+	trap "date --iso-8601=seconds > $destination/tstamp" SIGINT SIGTERM EXIT
+	backup_ldap "$@"
+}
+
+backup_ldap() {
+	tmpdest="$(mktemp --dry-run)"
+	slapcat -b "$ATL_LDAP_BASEDN" | pigz --no-time --rsyncable >"$tmpdest"
+	# https://wiki.debian.org/ReproducibleBuilds/TimestampsInGzipHeaders
+	mkdir -p "$destination"
+	mv "$tmpdest" "$destination/$ATL_LDAP_BASEDN.ldif.gz"
+}
+
+usage() {
+	cat <<EOF
+$*
+Purpose: Dumps a given database into the specified directory.
+Usage:
+atl_backup <[options]>
+
+Options:
+	--database		Name of the database to back up (e.g. 'jira')
+	--databasetype		'ldap' or 'mysql'
+	--destination		Directory to write backup to
+
+
+EOF
+	exit
+}
+
+main "$@"

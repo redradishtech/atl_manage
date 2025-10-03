@@ -1,0 +1,13 @@
+#!/bin/bash -eu
+## If our monitoring system is broken, fail earlier rather than later in the install process.
+
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh
+
+(
+
+	flock -x 200 # lock in case atl_install_monitoring_services is running for another profile
+	# If Icinga is stopped for whatever reason, try starting it. This will fail if we have a real config problem.
+	# FIXME: lib/create_patchqueue calls atl_event install-pre when @TOKENS@ have not been replaced in monitoring/nagios.cfg. The point of install-pre is to set guards, so probably we just can't rely on tokens, so this monitoring check isn't possible
+	#	atl_monitoring is-active || { atl_monitoring check && atl_monitoring restart; }
+	#	atl_monitoring is-active || error "$ATL_MONITORING is not running. To see why, run: atl_monitoring check"
+) 200>"$(lockdir --global)"/monitoring.lock

@@ -1,0 +1,24 @@
+-- This psqlrc is used by atl_psql when invoked as $ATL_USER, e.g. via the start-pre event. Also by the rrservices account (see atl_deploy).
+-- It is optimized for non-interactive script use.
+-- Return a nonzero exit code if SQL on stdin is invalid. Unlike 'psql -c "invalid"', 'echo invalid | psql' does not return nonzero without this.
+\set ON_ERROR_STOP on
+-- http://www.if-not-true-then-false.com/2009/postgresql-psql-psqlrc-tips-and-tricks/
+-- More goodies at https://gist.github.com/jaytaylor/e5aa89c8f3aaab3f576f
+\set missingindex 'SELECT schemaname, relname, seq_scan-idx_scan AS too_much_seq, case when seq_scan-idx_scan>0 THEN 'Missing Index?' ELSE 'OK' END, pg_relation_size(format('%I.%I', schemaname, relname)::regclass) AS rel_size, seq_scan, idx_scan FROM pg_stat_user_tables WHERE pg_relation_size(format('%I.%I', schemaname, relname)::regclass)>80000 ORDER BY too_much_seq DESC;'
+\set tablesize 'SELECT nspname || \'.\' || relname AS \"relation\", pg_size_pretty(pg_relation_size(C.oid)) AS "size" FROM pg_class C LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace) WHERE nspname NOT IN (\'pg_catalog\', \'information_schema\') ORDER BY pg_relation_size(C.oid) DESC LIMIT 40;'
+\set user select attribute_name, timestamp with time zone 'epoch'+cwd_user_attributes.attribute_value::numeric/1000 * INTERVAL '1 second' AS date from cwd_user_attributes where user_id = (select id from cwd_user where user_name='jeff@redradishtech.com') and attribute_name in ('passwordLastChanged', 'login.previousLoginMillis', 'lastAuthenticated', 'login.lastLoginMillis', 'password.reset.request.expiry'); select attribute_name, attribute_value from cwd_user_attributes where attribute_name not in ('passwordLastChanged', 'login.previousLoginMillis', 'lastAuthenticated', 'login.lastLoginMillis', 'password.reset.request.expiry') AND user_id = (select id from cwd_user where user_name='jeff@redradishtech.com');
+\set HISTFILE ~/.psql_history- :DBNAME
+\set HISTSIZE 50000
+\encoding unicode
+-- No timing info - this is for non-interactive scripts that don't care, and the extra output could break things
+\timing off
+\pset null '␀'
+-- http://www.craigkerstiens.com/2013/02/21/more-out-of-psql/
+\pset linestyle unicode
+\pset border 2
+--\set PROMPT1 '%[%033[33;1m%]%x%[%033[0m%]%[%033[1m%]%/%[%033[0m%]%R%# '
+-- https://gist.github.com/wesdotcool/5069050
+--\pset pager on
+--\pset format wrapped
+--set search_path=public;
+\x auto

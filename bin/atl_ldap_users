@@ -1,0 +1,40 @@
+#!/bin/bash -eu
+# If the app has a LDAP user directory, print a sample of the users/groups, or query for a specific item if a LDAP filter is given.
+
+. "$ATL_MANAGE/lib/common.sh" --nolog
+
+# 'users' or 'groups'
+querytype="$(basename "$0")"
+querytype="${querytype/atl_ldap_/}"
+
+main() {
+	atl_psql -tAXq <"$ATL_MANAGE/templates/sql/pg_ldap_$querytype.sql" | while read -r cmd; do
+		cmd="$(decode_password "$cmd")"
+		if (($# > 0)); then
+			echo "$cmd" | perl -spe "s/(?<=-s sub ')([^']+)(?=' )/\"(&(\$filter)\$1)\"/e" -- -filter="$1"
+		else
+			echo "$cmd"
+		fi
+	done | bash -x || {
+		# Our ldapsearch command restricts output to 5 (-z 5) and returns with exit code 4 is this limit is hit. We consider hitting the limit a success, not a failure
+		if (($? == 4)); then return 0; else return $?; fi
+	}
+}
+
+usage() {
+	echo "Usage: $(basename "$0") [extra_ldap_filter]"
+	echo "E.g. :  $(basename "$0") 'uid=costas'"
+	echo "E.g. :  $(basename "$0") 'mail=costas@$ATL_BASEDOMAIN'"
+	echo
+	echo "Where extra_ldap_filter is ANDed to the native filter configured in $ATL_PRODUCT"
+	echo
+	echo
+	echo "If no extra filter is given, the native filter configured in $ATL_PRODUCT is used alone"
+	exit 2
+}
+
+if [[ $# = 1 && $1 =~ "-h" ]]; then
+	usage
+else
+	main "$@"
+fi

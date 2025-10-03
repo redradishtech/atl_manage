@@ -1,0 +1,11 @@
+#!/bin/bash
+
+. /opt/atl_manage/lib/logging.sh
+
+main() {
+        log before_failure
+        false  # expected
+        log after_failure   # Should not print
+}
+
+main "$@"

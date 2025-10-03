@@ -1,0 +1,33 @@
+The icinga2opsgenie binary is built from git
+(https://github.com/opsgenie/opsgenie-integration.git) with the patch below to
+hardcode the correct config path,
+/opt/atl_manage/monitoring/opsgenie/conf/opsgenie-integration.conf
+
+
+jturner@jturner-desktop:~/src/github.com/opsgenie/opsgenie-integration$ git diff
+diff --git a/icinga/icinga/icinga2opsgenie b/icinga/icinga/icinga2opsgenie
+deleted file mode 100755
+index 7e1c901..0000000
+Binary files a/icinga/icinga/icinga2opsgenie and /dev/null differ
+diff --git a/icinga/icinga/icinga2opsgenie.go b/icinga/icinga/icinga2opsgenie.go
+index c1b3e8a..ca9f9e0 100644
+--- a/icinga/icinga/icinga2opsgenie.go
++++ b/icinga/icinga/icinga2opsgenie.go
+@@ -34,7 +34,7 @@ var configParameters = map[string]string{"apiKey": API_KEY,
+        "icinga2opsgenie.http.proxy.username": "",
+        "icinga2opsgenie.http.proxy.password": ""}
+ var parameters = make(map[string]string)
+-var configPath = "/etc/opsgenie/conf/opsgenie-integration.conf"
++var configPath = "/opt/atl_manage/monitoring/opsgenie/conf/opsgenie-integration.conf"
+ var levels = map [string]log.Level{"info":log.Info,"debug":log.Debug,"warning":log.Warning,"error":log.Error}
+ var logger log.Logger
+ 
+@@ -113,7 +113,7 @@ func configureLogger ()log.Logger{
+        var logFilePath = parameters["logPath"]
+ 
+        if len(logFilePath) == 0 {
+-               logFilePath = "/var/log/opsgenie/icinga2opsgenie.log"
++               logFilePath = "/var/log/icinga/icinga2opsgenie.log"
+        }
+ 
+        var tmpLogger log.Logger

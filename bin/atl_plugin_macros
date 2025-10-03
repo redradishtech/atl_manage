@@ -1,0 +1,28 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+if [[ $# -ne 1 ]]; then
+	echo >&2 "Usage: atl_plugin_macros <pluginkey>"
+	echo >&2 "Purpose: Prints Confluence macros provided by a particular plugin"
+	exit 1
+fi
+
+main() {
+	#atl_plugin_descriptor "$1" | sed -e 's/macro (key|name)="([^"]+)"/\1/'  | sort | uniq
+	# Also must be able to handle:
+
+	# <macro name="mockup" class="com.balsamiq.confluence.plugins.mockups.MockupsMacro" key="mockup">
+	#      <description>Required. The {mockup} macro displays the UI mockup in the page.</description>
+	# </macro>
+
+	# and:
+	# <macro key="gliffy-macro-key" name="gliffy" class="com.gliffy.plugin.confluence.macro.GliffyMacroClassic" icon="/download/resources/com.gliffy.integration.confluence/icons/gliffy_macro_browser.png">
+
+	#atl_plugin_descriptor "$1" | grep "macro .*key"|  sed -e 's/.*macro .*name="\([^"]\+\)".*/\1/g'  |uniq
+	atl_plugin_descriptor "$1" | xmlstarlet sel --template --value-of '/atlassian-plugin/xhtml-macro/@name' | uniq
+	atl_plugin_descriptor "$1" | xmlstarlet sel --template --value-of '/atlassian-plugin/macro/@name' | uniq # com.atlassian.labs.confluence.uml uses this variant
+}
+
+main "$@"

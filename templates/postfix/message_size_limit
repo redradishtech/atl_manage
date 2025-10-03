@@ -1,0 +1,2 @@
+# Increase the maximum email size from 10Mb to 50Mb. https://www.redradishtech.com/pages/viewpage.action?pageId=19103782
+message_size_limit = 50240000

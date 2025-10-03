@@ -1,0 +1,252 @@
+# [Plugin]
+# Name = Systemd
+# Description = Turns your script into a systemd service
+#
+# [Help:Service]
+# _Type = Whether the systemd service should run as current user ('user') or 'root'
+# _Name = Systemd service name
+# * = Any systemd.service vars, e.g. Type = oneshot
+#
+# [Help:Unit]
+# * = Any systemd.unit vars like After=... and Wants=... 
+# Description = systemd service description
+#
+# [Help:Install]
+# * = Install-time systemd.unit tags, like WantedBy
+#
+# [Help:Timer]
+# OnCalendar = If set, a systemd timer is installed
+#
+# [Unit]
+# Description = ${_script__description}
+#
+# [Service]
+# _Type = root
+# _Name = ${_script__name}
+# Type = simple
+# WorkingDirectory=${_script__basedir}
+#
+# [Install]
+# WantedBy = default.target
+#
+# [Timer]
+# OnCalendar =
+# Persistent = true
+
+_processtags() {
+	# Examine tags (either $_tags mapping func -> tags or per-tag $_tag_${tagname} resolving to
+	# funcs), and set _vars as appropriate. Here, we:
+	# - check for @execstart and friends and set e.g. _service__execstart
+	# - set the @sudo tag on install() if needed (if [Service] _Type=root)
+	local x
+	for x in Exec{Start,Stop} ExecStart{Pre,Post} ExecStop{,Post};
+	do
+		local tagname="_tag_${x,,}"
+		if [[ -v $tagname ]]; then
+			#echo "A function was tagged $x: $(declare -p $tagname)"
+			local k="_service__${x}"
+			local vvar="${!tagname}"
+			# Systemd supports >1 ExecStart (e.g.), but we do not as bash can't have an
+			# array as value in an assoc. array
+			if [[ $vvar =~ \  ]]; then __fail "Cannot have more than one function ($vvar) tagged with @${x,,}"; fi
+
+			# We now want to define new config vars, so setting @execstart tag on a function is equivalent to setting [Service] ExecStart = ...
+			# multitool has an unresolved conflict: should plugins use (and modify) the $_vars array, or $_section__variable string variables?
+			# Currently both are exposed, and systemd.bash illustrates (below, when rendering .service files) why $_vars is sometimes needed, 
+			# even though usually $_section__variable is simpler.
+			# So here, when we need to define a new config var, set update _vars and set the equivalent string variable.
+			local val="$_script__abspath ${vvar}"
+			# _vars is used later to generate .service and .timer files.
+			_vars["$k"]="$val"
+			# declare flattened form just to be consistent
+			declare -gx "$k"="$val"
+			declare -gx "${k,,}"="$val"
+		fi
+	done
+	# We can also update tags. Here we mark install() with @sudo if _Type=root.
+	if [[ -v _service___type && $_service___type = root ]]; then
+		_tags[install]=" sudo"
+		_tags[start]=" sudo"
+		_tags[stop]=" sudo"
+		_tags[restart]=" sudo"
+		_tag_sudo+=" install start stop restart"
+		#echo "Marked systemd functions @sudo"
+	else
+		:
+	fi
+}
+_processtags
+unset -f _processtags
+
+_validate_vars() {
+	[[ -v _script__name ]] || __fail "Please define [Script] Name = ..., for use in the Systemd service name"
+	[[ -v _script__description ]] || __fail "Please define [Script] Description = ..., for use in the Systemd descriptor"
+	[[ -v _script__productionhost ]] || __fail "Please define [Script] ProductionHost = ... to be the \$HOSTNAME in which the service primarily runs"
+	[[ -v _service__execstart ]] || __fail "Please tag a function with @execstart so the service knows what function to run"
+	if [[ -v _timer ]]; then
+		if [[ -z  ${_timer__oncalendar:-} ]]; then __fail "Please declare [Timer] -> OnCalendar = ... e.g. OnCalendar=daily, OnCalendar=*-*-* 00:01:00. Or remove the [Timer] section for a hand-started service"; fi
+	fi
+}
+_validate_vars
+
+
+# Install ${_service___name}.service Systemd service
+install() {
+	# FIXME: why would we ever want the systemd service installed on auxiliary?
+	#_service__isproduction || _service__isauxiliary || __fail "Can only be installed in [Script] -> ProductionHost (${_script__productionhost:-please set}) or [Script] -> AuxiliaryHost (${_script__auxiliaryhost:-please set})"
+	_service__isproduction || __fail "Can only be installed in [Script] -> ProductionHost (${_script__productionhost:-please set})"
+
+	if [[ -v _healthcheck ]]; then
+		for _servicefunc in $_service__execstart; do
+			if ! declare -f "$_servicefunc" | grep -q _healthcheck_start; then
+				__fail "Your script has [Healthcheck], but @service_execstart tagged function $_servicefunc does not appear to use _healthcheck_start or _healthcheck_end, and so healthchecks.io is not being informed of runs. Please fix."
+			fi
+		done
+	fi
+
+	__print_systemd_descriptor() {
+		local section="$1"
+		local headerprinted=false
+
+		for k in "${!_vars[@]}"; do
+			[[ $k =~ ^_${section,,}__ ]] || continue
+			local v="${_vars[$k]}"
+			local k="${k#_"${section,,}"__}"
+			if [[ ${k:0:1} = _ ]]; then continue; fi  # Underscore vars like _Name and _Type aren't for systemd. _Type is for us to determine if a service is --user or global.
+			if ! $headerprinted; then echo; echo "[$section]"; headerprinted=true; fi
+			echo "$k = $v"
+		done
+	}
+
+	{
+		echo "# Auto-generated by '$_script__basedir $_invokedfunc', $(date)"
+		__print_systemd_descriptor Unit
+		__print_systemd_descriptor Service
+		__print_systemd_descriptor Install
+	} > "$(_service__installdir)/$_service___name.service"
+	echo >&2 "Generated $(_service__installdir)/$_service___name.service"
+
+	systemctl enable "$_service___name.service"
+
+	local timer
+	timer="$(__print_systemd_descriptor Timer)"
+	# The $timer descriptor will be invalid (e.g. blank OnCalendar=) if it derived from the plugin template, and no actual [Timer] section was given; hence we check -v _timer
+	if [[ -v _timer && -n $timer ]]; then
+		{
+			echo "# Auto-generated by '$_script__basedir $_invokedfunc', $(date)"
+			echo "# https://www.freedesktop.org/software/systemd/man/systemd.time.html"
+			echo "$timer"
+			echo
+			echo "[Install]"
+			echo "WantedBy = timers.target"
+		}> "$(_service__installdir)/$_service___name.timer"
+
+		systemctl enable "$_service___name.timer"
+		systemctl start "$_service___name.timer"
+		systemctl list-timers --no-pager "$_service___name.timer"
+	else
+		# Remove timer file, if present. This is for that case when the [Timer] section was once present, and is now removed
+		local f
+		f="$(_service__installdir)/$_service___name.timer"
+		if [[ -f $f ]]; then
+			echo "Removing old timer: $f"
+			systemctl disable "$_service___name.timer"
+			rm -f "$(_service__installdir)/$_service___name.timer"
+		fi
+	fi
+	systemctl daemon-reload
+}
+
+
+# Uninstall $_service___name systemd service.
+uninstall() {
+	# Uninstall timer even if [Timer] isn't present, as the user may have removed it
+	if [[ -n $(systemctl -q list-timers "$_service___name.timer") ]]; then
+		systemctl list-timers "$_service___name.timer"
+		systemctl stop "$_service___name.timer"
+		systemctl disable "$_service___name.timer"
+		rm -f "$(_service__installdir)/$_service___name.timer"
+	fi
+	systemctl stop "$_service___name.service"
+	systemctl disable "$_service___name.service"
+	rm "$(_service__installdir)/$_service___name.service"
+	systemctl daemon-reload
+	systemctl reset-failed
+}
+
+_status()		{ systemctl status "$_service___name"; }
+
+if ! declare -F status >/dev/null; then
+# Prints status of the $_service___name systemd service
+status() { _status "$@"; }
+fi
+
+# Start the $_service___name systemd service
+start()		{ systemctl start "$_service___name"; }
+# Stop the $_service___name systemd service
+stop()			{ systemctl stop "$_service___name"; }
+# Restart the $_service___name systemd service
+restart()		{ systemctl restart "$_service___name"; }
+# Follow the systemd service logs (systemctl -fu $_service___name)
+logs()		{ set -x; journalctl -fu "$_service___name"; }
+_status() {
+	if _service__isproduction || _service__isauxiliary; then
+
+		systemctl -q is-enabled "$_service___name.timer" || :
+		systemctl -q is-enabled "$_service___name.service" || :
+		systemctl list-timers --no-pager "$_service___name" || :
+		systemctl status --no-pager "$_service___name" || : # non-zero = not running, which is fine
+	else
+		echo "$_service___name.service is not meant to be installed on $HOSTNAME (only $_script__productionhost)"
+	fi
+}
+
+# Run systemctl or systemctl --user as appropriate
+systemctl() {
+	case "${_service___type:-}" in
+		user) $(which systemctl) --user "$@";;
+		*) $(which systemctl) "$@";;
+	esac
+}
+
+# Run journalctl or journalctl --user as appropriate, with --user param preset
+journalctl() {
+	case "${_service___type:-}" in
+		user) $(which journalctl) --user --unit="$_service___name}" "$@";;
+		*) $(which journalctl) --unit="${_service___name}" "$@";;
+	esac
+}
+
+# Run systemd-run or systemd-run --user as appropriate
+systemd-run() {
+case "${_service___type:-}" in
+	user) $(which systemd-run) --user "$@";;
+	*) $(which systemd-run) "$@";;
+esac
+}
+
+_service__installdir() {
+	# Allow user to override install directory, e.g. for testing
+	if [[ -v _service___installdir ]]; then
+		echo >&2 "Using custom install dir $_service___installdir"
+		echo "$_service___installdir"
+	else
+		case "${_service___type:-}" in
+			user)
+				echo "$HOME/.config/systemd/user"
+				;;
+			*)
+				echo "/etc/systemd/system"
+				;;
+		esac
+	fi
+}
+
+_service__isproduction() {
+	[[ $HOSTNAME =~ $_script__productionhost ]]
+}
+
+_service__isauxiliary() {
+	[[ -v _script__auxiliaryhost ]] && [[ $HOSTNAME =~ $_script__auxiliaryhost ]]
+}
+

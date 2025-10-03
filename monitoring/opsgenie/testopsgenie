@@ -1,0 +1,3 @@
+#!/bin/bash -eu
+
+$ATL_MANAGE/monitoring/opsgenie/icinga2opsgenie -entityType=host -t=PROBLEM -hs=DOWN -hn=test_alert -logPath=/tmp/testopsgenie.log -v

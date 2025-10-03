@@ -1,0 +1,121 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
+
+main() {
+	if [[ $# -ne 1 ]]; then usage; fi
+	if [[ -f $1 ]]; then
+		parsefile "$1"
+	elif [[ -d $1 ]]; then
+		parsedir "$1"
+	else
+		usage
+	fi
+}
+
+boring=(ConditionObject
+	LockSupport.java:215
+	AbstractQueuedSynchronizer.java:2078
+	LinkedBlockingQueue.java:467
+	TaskQueue.java:85
+	TaskQueue.java:31
+	ThreadPoolExecutor.java:1073
+	ThreadPoolExecutor.java:1134
+	ThreadPoolExecutor.java:624
+	TaskThread.java:61
+	Thread.java:748)
+
+#Jan 21 05:24:15.654830  - parking to wait for  <0x0000000544daf6c0> (a java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject)
+#Jan 21 05:24:15.654841  at java.util.concurrent.locks.LockSupport.park(LockSupport.java:175)
+#Jan 21 05:24:15.654852  at java.util.concurrent.locks.AbstractQueuedSynchronizer$ConditionObject.await(AbstractQueuedSynchronizer.java:2039)
+#Jan 21 05:24:15.654863  at java.util.concurrent.LinkedBlockingQueue.take(LinkedBlockingQueue.java:442)
+#Jan 21 05:24:15.654873  at java.util.concurrent.ThreadPoolExecutor.getTask(ThreadPoolExecutor.java:1074)
+#Jan 21 05:24:15.654884  at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1134)
+#Jan 21 05:24:15.654895  at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+#Jan 21 05:24:15.654906  at java.lang.Thread.run(Thread.java:748)
+
+boring1="$(for c in "${boring[@]}"; do
+	echo -n "$c"
+	echo -n '(\N*\n\N*)'
+done)"
+boring2="parking to wait for\N+\n(\N+at (java\.util\.concurrent|com\.atlassian\.scheduler)\N+\n)+\N+Thread\.java"
+
+postgres_reading="java.lang.Thread.State: RUNNABLE\n\N+at java\.net\.SocketInputStream\.socketRead0(\N+\n)+\N+org\.postgresql\.core"
+ldap_reading="java.lang.Thread.State: RUNNABLE\n\N+at java\.net\.SocketInputStream\.socketRead0(\N+\n)+\N+com\.sun\.jndi\.ldap\.Connection\.run"
+waiting_on_index="java.lang.Thread.State: TIMED_WAITING(\N+\n)+\N+DefaultIndexManager\.await"
+waiting_on_index_nomanager="java.lang.Thread.State: WAITING(\N+\n)+\N+com.atlassian.jira.index.QueueingIndex.Task.index"
+waiting_on_index_searcher="java.lang.Thread.State: WAITING(\N+\n)+\N+DefaultIndexManager\.getIssueSearcher"
+lucene_closing_readercache="java.lang.Thread.State: RUNNABLE\n(\N+at com\.google\.common\.cache\.LocalCache\N+\n)+(\N+\n)+\N+com\.atlassian\.jira\.issue\.search\.DefaultReaderCache\.invalidateCacheForCoreCacheKey\N+\n(\N+\n)+\N+org\.apache\.lucene\.index\.IndexReader\.notifyReaderFinishedListener"
+lucene_closing_readercache2="java.lang.Thread.State: RUNNABLE\n(\N+\n)+\N+com\.atlassian\.jira\.issue\.search\.DefaultReaderCache\.invalidateCacheForCoreCacheKey\N+\n(\N+\n)+\N+org\.apache\.lucene\.index\.IndexReader\.notifyReaderFinishedListener"
+jruby="org.jruby"
+waiting_on_socket="java.lang.Thread.State: RUNNABLE\n\N+at sun\.nio\.ch\.EPollArrayWrapper\.epollWait"
+listening_on_socket="java.lang.Thread.State: RUNNABLE\n\N+at sun\.nio\.ch\.ServerSocketChannelImpl.accept0"
+threadpool="java.lang.Thread.State: TIMED_WAITING\N*\n\N+at sun\.misc\.Unsafe\.park\N+\n\N+parking to wait for\N+\n(\N+at java.util.concurrent\N+\n)+\N+java.security.AccessController\N+\n(\N+at java.util.concurrent\N+\n)+\N+at java.lang.Thread.run"
+innovalog_blocked="java.lang.Thread.State: BLOCKED\N*\n(\N+\n)+\N+locked \N+\(a bsh\.Name\)\n(\N+\n)+\N+com\.innovalog\.jmcf\.fields\.AbstractCalculatedFormulaField\.getValueFromIssue"
+innovalog_runnable="java.lang.Thread.State: RUNNABLE\N*\n(\N+\n)+\N+com\.innovalog\.jmcf\.fields\.AbstractCalculatedFormulaField\.getValueFromIssue"
+
+dvcs_sync="java\.lang\.Thread\.State: RUNNABLE\N*\n(\N+\n)+\N+com\.atlassian\.jira\.plugins\.dvcs\.sync\.impl\.DefaultSynchronizer\.doSync\("
+
+threadtypes=(boring1 boring2 postgres_reading waiting_on_index waiting_on_index_nomanager waiting_on_index_searcher lucene_closing_readercache lucene_closing_readercache2 ldap_reading jruby waiting_on_socket listening_on_socket threadpool innovalog_runnable innovalog_blocked dvcs_sync)
+
+reindex='java.lang.Thread.State: RUNNABLE(\N*\n)+\N+at com\.sun\.proxy\.\$Proxy14\.reIndex\(Unknown Source\)'
+happy_waiting_connectors='java.lang.Thread.State: WAITING(\N*\n)+\s+at org\.apache\.tomcat\.util\.threads\.TaskQueue\.take'
+categories=(reindex happy_waiting_connectors)
+
+parsefile() {
+	local tdfile="$1"
+	local tdfile_abs=$(readlink -f "$tdfile")
+	if [[ $tdfile =~ (.*).txt ]]; then
+		local dir="${BASH_REMATCH[1]}"
+	else
+		local dir="${tdfile}_parts"
+	fi
+	rm -rf "$dir"
+	mkdir -p "$dir"
+	cd "$dir"
+	cat "$tdfile_abs" | splitthreads
+	echo "There are $(ls -1 | wc -l) threads"
+	for threadtype in "${threadtypes[@]}"; do
+		for t in *.txt; do
+			if [[ -f "$t" ]] && grep -qPzo "${!threadtype}" "$t"; then
+				mkdir -p "$threadtype"
+				mv "$t" "$threadtype"
+			fi
+		done
+	done
+
+	for category in "${categories[@]}"; do
+		for t in **/*.txt; do
+			if [[ -f "$t" ]] && grep -qPzo "${!category}" "$t"; then
+				mkdir -p "$category"
+				(
+					cd "$category"
+					ln -sf ../"$t" .
+				)
+			fi
+		done
+	done
+
+	for var in "${categories[@]}" "${threadtypes[@]}"; do
+		if [[ -d $var ]]; then
+			echo "$var count: $(ls -1 "$var" | wc -l)"
+		fi
+	done
+}
+
+parsedir() {
+	echo >&2 "Parsedir ($*) unimplemented"
+	exit 1
+}
+
+usage() {
+
+	echo >&2 "Usage: atl_threaddumpanalyze [file|directory]"
+	echo >&2 "Where:"
+	echo >&2 "       <file> is a single thread dump text file"
+	echo >&2 "       <directory> is a directory of thread dumps"
+	exit 2
+}
+
+main "$@"

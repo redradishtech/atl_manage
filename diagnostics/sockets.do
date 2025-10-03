@@ -1,0 +1,1 @@
+ss -plant | column -t

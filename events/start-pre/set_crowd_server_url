@@ -1,0 +1,36 @@
+#!/bin/bash -eu
+## Fix the Crowd URL in Jira/Confluence database, on sandbox and other non-prod instances after syncing from production, e.g. changing 'http://crowd.internal' to 'http://crowd-test.internal'.
+
+# shellcheck source=/opt/atl_manage/events/start-pre/../.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+case "$ATL_PRODUCT" in
+jira | confluence)
+	require_table cwd_directory_attribute
+	if [[ -v ATL_CROWD_URL ]]; then
+		# Note: atl_psql will fail if the database is empty (first time the app is run)
+		atl_pg_get "$ATL_PRODUCT" crowd-server-url | atl_psql -F$'\t' -tAXq | while IFS=$'\t' read -r id currenturl; do
+			if [[ $currenturl != "$ATL_CROWD_URL" ]]; then
+				if [[ $ATL_ROLE != prod ]]; then
+					atl_pg_set "$ATL_PRODUCT" crowd-server-url "$id" "$currenturl" "$ATL_CROWD_URL" | atl_psql -tXAq | while read -r oldurl; do
+						log "Changed $ATL_SHORTNAME's Crowd URL (directory $id) from $oldurl to $ATL_CROWD_URL"
+					done
+				else
+					warn "Warning: ATL_CROWD_URL is '$ATL_CROWD_URL', but our directory $id Crowd URL is actually '$currenturl'. This is production - not adjusting Crowd. Please fix ATL_CROWD_URL or $ATL_PRODUCT"
+				fi
+			fi
+		done
+	else
+		atl_pg_get "$ATL_PRODUCT" crowd-server-url | atl_psql -F$'\t' -tAXq | while IFS=$'\t' read -r id currenturl; do
+			if [[ $ATL_ROLE != prod ]]; then
+				warn "Warning: our $ATL_ROLE $ATL_LONGNAME uses $currenturl as its user directory (the Crowd URL). As this is a $ATL_ROLE (non-production) instance, perhaps it needs updating to point to a $ATL_ROLE crowd? If so, set ATL_CROWD_URL"
+			fi
+		done
+	fi
+	;;
+*)
+	if [[ -v ATL_CROWD_URL ]]; then
+		warn "Warning: Unable to set ATL_CROWD_URL ('$ATL_CROWD_URL') for product $ATL_PRODUCT"
+	fi
+	;;
+esac

@@ -1,0 +1,78 @@
+#!/bin/bash -eu
+## Print statistics for the app or its monitoring services
+set -o pipefail
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+## FIXME: need to pass through args like -n to jevents
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	local PARSED
+	PARSED=$(getopt --options 'h' --longoptions 'help,annotate,full' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	# now enjoy the options in order and nicely split until we see --
+	subopts=
+	while true; do
+		case "$1" in
+		--)
+			shift
+			break
+			;;
+		--annotate) subopts+=(--annotate) ;;
+		--full) subopts+=(--full) ;;
+		-h | --help) usage ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	# }}}
+	(($# > 0)) || usage
+	monitor="$1"
+	shift
+	if [[ $monitor = index ]]; then
+		if [[ $ATL_PRODUCT = jira ]]; then
+			(
+				# shellcheck source=/opt/atl_manage/lib/atl_jira_indexstats
+				. "$ATL_MANAGE"/lib/atl_jira_indexstats
+				CMD="atl_logstats index" main "${subopts[@]}" "$@"
+			)
+		else
+			#shellcheck disable=SC2031
+			log "$ATL_PRODUCT does not current emit index statistics"
+		fi
+	else
+		jevents "$@" "$monitor"
+	fi
+}
+
+listmonitors() {
+	#shellcheck disable=SC2031
+	find "$JLOGDIR" -name "*.log.json" | perl -pe 's,(.*/)(.*)(.log.json),\2,g' | sort
+}
+
+usage() {
+	cat <<EOF
+Purpose: $(grep -m1 '##' "$0" | sed -e 's/## //')
+
+$(basename "$0") <monitor>     # Prints stats from one monitor:
+$(listmonitors | sed -e 's/^/atl_logstats /g')
+
+$(
+		if [[ $ATL_PRODUCT = jira ]]; then
+			# shellcheck source=/opt/atl_manage/lib/atl_jira_indexstats
+			. "$ATL_MANAGE"/lib/atl_jira_indexstats
+			CMD="atl_logstats index" usage 2>&1 "${subopts[@]}" "$@"
+		fi
+	)
+E.g.:
+$(basename "$0") slowreindex      # For making ad-hoc changes
+
+
+EOF
+	exit 2
+}
+
+main "$@"

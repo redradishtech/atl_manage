@@ -1,0 +1,14 @@
+#!/bin/bash -eu
+# Ensures time is not off, using either chrony or ntp depending what is installed.
+
+export PATH=/usr/lib/nagios/plugins:$PATH
+
+# Some servers (l*w) don't have NTP listening on localhost. We need to pass check_ntp_time a valid NTP server hostname. We can't hardcode one here, because this script doesn't know about ATL_* variables. check_chrony hardcodes 'localhost' so we can't generalize a -H flag. So here we assume the first arg is the host, and consume it before passing the remaining args to the real check_* command.
+host="$1"; shift
+
+if command -v chronyc >/dev/null; then
+	DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
+	"$DIR"/check_chrony "$@"
+elif command -v ntpq >/dev/null; then
+	check_ntp_time -H "$host" "$@"
+fi

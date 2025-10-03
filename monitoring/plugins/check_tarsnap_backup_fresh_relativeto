@@ -1,0 +1,39 @@
+#!/bin/bash -eu
+## Checks that there is at least 1 file matching <pattern> within <warningage> or <criticalage> of the latest file in <sourcedir>
+# This is useful for backups where we have access to the source files. We can check the newest file in the backup source, and specify that the backup file must be no staler than X days
+# FIXME: rewrite this in a sane language so we can take args that are fractions of a day
+
+#shellcheck source=common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh
+
+main()
+{
+	# {{{ Parseopts
+	set -eu	# Rely on quick failure from getopt if wrong arg is passed
+	if [[ "$#" -lt 2 || "$*" =~ -h ]]; then
+		usage "$@"
+	fi
+
+	criticaldelay="${1:-5}"; shift
+	[[ $criticaldelay =~ ^[0-9]+$ ]] || error "<criticaldelay> value $criticaldelay is not a number"
+
+	log "Now checking that files in latest tarsnap are not $criticaldelay days older than the youngest file in $*"
+	find_youngest_file "$@"
+	log "The youngest file is $newest_filename, $newest_file_age_secs seconds ($newest_file_age_days days) old"
+	check_tarsnap_backup_fresh $((newest_file_age_days + criticaldelay))
+}
+
+usage() {
+	cat <<EOF
+$*
+Purpose: Checks that there is at least 1 file matching <pattern> within <warningage> or <criticalage> of the latest file in <sourcedir>
+Usage:
+check_tarsnap_backup_fresh_relativeto <criticalage> <sourcedir> [rsync opts]
+
+e.g.:
+check_tarsnap_backup_fresh_relativeto  --exclude '.*/\(logs\|index\|analytics-logs\|journal\)/.*'
+check_tarsnap_backup_fresh_relativeto 1 "$ATL_DATADIR" --filter="merge $ATL_APPDIR/backups/rsync-excludes-local" --filter="merge $ATL_APPDIR/backups/rsync-excludes-generic"
+EOF
+	exit
+}
+main "$@"

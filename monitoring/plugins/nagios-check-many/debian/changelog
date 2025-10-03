@@ -1,0 +1,49 @@
+nagios-check-many (1.06b) wheezy; urgency=low
+
+  * fix warning only
+
+ -- Matija Nalis (Tomsoft Debian repo) <mnalis-debian@axe.tomsoft.hr>  Thu, 01 Feb 2018 12:52:12 +0100
+
+nagios-check-many (1.06) wheezy; urgency=medium
+
+  * fix total number of checks
+
+ -- Matija Nalis (Tomsoft Debian repo) <mnalis-debian@axe.tomsoft.hr>  Sun, 03 Sep 2017 03:11:42 +0200
+
+nagios-check-many (1.05) wheezy; urgency=medium
+
+  * do not show sensitive information in nagios output (like check command
+    arguments which may contain passwords etc)
+
+ -- Matija Nalis (Tomsoft Debian repo) <mnalis-debian@axe.tomsoft.hr>  Mon, 31 Oct 2016 10:45:28 +0100
+
+nagios-check-many (1.04) wheezy; urgency=medium
+
+  * separete output and perf data
+
+ -- Matija Nalis (Tomsoft Debian repo) <mnalis-debian@axe.tomsoft.hr>  Sun, 30 Oct 2016 21:12:28 +0100
+
+nagios-check-many (1.03) wheezy; urgency=medium
+
+  * ignore commented-out commands
+  * depends on icinga|nagios
+
+ -- Matija Nalis (Tomsoft Debian repo) <mnalis-debian@axe.tomsoft.hr>  Sun, 30 Oct 2016 19:07:06 +0100
+
+nagios-check-many (1.02) wheezy; urgency=medium
+
+  * implement --file
+
+ -- Matija Nalis (Tomsoft Debian repo) <mnalis-debian@axe.tomsoft.hr>  Sun, 30 Oct 2016 18:31:59 +0100
+
+nagios-check-many (1.01) wheezy; urgency=medium
+
+  * first working version...
+
+ -- Matija Nalis (Tomsoft Debian repo) <mnalis-debian@axe.tomsoft.hr>  Sun, 30 Oct 2016 13:40:06 +0100
+
+nagios-check-many (1.00) wheezy; urgency=low
+
+  * Initial Release (loosely based on nagios-smart-multi)
+
+ -- Matija Nalis (Tomsoft Debian repo) <mnalis-debian@axe.tomsoft.hr>  Fri, 28 Oct 2016 21:39:31 +0200

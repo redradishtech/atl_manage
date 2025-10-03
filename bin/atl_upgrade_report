@@ -1,0 +1,9 @@
+#!/bin/bash -eu
+# Report to send by email of useful facts, like users who haven't logged in recently, and unused plugins or soon-expiring plugins
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+echo "The following users have not logged in within the last 6 months (or ever)"
+
+atl_pg_usage_jira_userlogins "(lastlogin < now() - '6 months'::interval OR lastlogin is null)  ORDER BY lastlogin desc " | atl_psql -e

@@ -1,0 +1,11 @@
+#!/bin/bash -eu
+# Prevents startup if we're halfway through an atl_upgrade, i.e. the new version is deployed in $ATL_APPDIR but a) atl_activate hasn't run, b) atl_upgrade_database_backup hasn't run to back up the old data
+# This marker file is added by $ATL_MANAGE/bin/atl_upgrade
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+markerfile="$ATL_APPDIR/UPGRADING_DO_NOT_START"
+if [[ -f "$markerfile" ]]; then
+	error "An upgrade is in progress (marker file $markerfile present"
+fi

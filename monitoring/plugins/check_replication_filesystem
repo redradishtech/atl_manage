@@ -1,0 +1,19 @@
+#!/bin/bash -eu
+# Checks that the filesystem is replicating properly. 
+# Called from $ATL_APPDIR/replication/replication_filesystem_working.healthcheck
+
+PATH=$PATH:$ATL_MANAGE/monitoring/plugins
+
+# shellcheck source=/opt/atl_manage/replication/common.sh
+. "$ATL_MANAGE/replication/common.sh"
+
+if [[ -v $SOURCE ]]; then
+	# Note: sudo won't require a password, as sudoers allows this script, per $ATL_MANAGE/events/install-post/replication
+	"$ATL_MANAGE/lib/remote/run" sudo -E "$ATL_MANAGE/monitoring/plugins/check_replication_filesystem" "$@"
+elif [[ -v $DESTINATION ]]; then
+
+	ATL_REPLICATION_MAX_FILESYSTEM_UNMODIFIED_PERIOD_WARNING=${ATL_REPLICATION_MAX_FILESYSTEM_UNMODIFIED_PERIOD:-2}
+	ATL_REPLICATION_MAX_FILESYSTEM_UNMODIFIED_PERIOD=${ATL_REPLICATION_MAX_FILESYSTEM_UNMODIFIED_PERIOD:-5}
+
+	check_file_freshness "$ATL_DATADIR_BASE/$ATL_VER" "$ATL_REPLICATION_MAX_FILESYSTEM_UNMODIFIED_PERIOD_WARNING" "$ATL_REPLICATION_MAX_FILESYSTEM_UNMODIFIED_PERIOD"
+fi

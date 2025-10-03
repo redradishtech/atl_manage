@@ -1,0 +1,27 @@
+#!/bin/bash -eu
+## Given a Confluence plugin jar, prints SQL emitting all the usages of the plugin's macros.
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
+
+usage() {
+	echo >&2 "Usage: $0 <pluginjar>"
+	exit 1
+}
+main() {
+	if [[ $# -ne 1 ]]; then usage; fi
+	jar="$1"
+	if [[ ! -f $jar ]] || ! [[ $jar =~ \.jar$ ]]; then usage; fi
+
+	regex=$(
+		echo -n 'ac:name="('
+		unzip -p "$jar" atlassian-plugin.xml |
+			xmllint -format - |
+			xmlstarlet sel --noblanks --template --match '//xhtml-macro/@name' -n -v . |
+			xargs echo -n |
+			sed -e 's, ,|,g'
+		echo ')"'
+	)
+	echo "select '- [' || regexp_replace(content.title, '([][])', '\\\\\\1', 'g') || '|$ATL_BASEURL/pages/viewpage.action?pageId=' || content.contentid || ']' from content JOIN bodycontent ON content.contentid=bodycontent.contentid WHERE  body ~ '$regex' and   content.prevver is null and content_status!='deleted' and content.contenttype='PAGE';"
+}
+
+main "$@"

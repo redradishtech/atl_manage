@@ -1,0 +1,157 @@
+#!/bin/bash -eu
+## Extracts index performance stats from the Jira logs, queryable in jq format.
+##  Exit code 3 if Jira isn't recent enough to produce index logs
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+
+declare -A help
+# Explanations from https://confluence.atlassian.com/jirakb/jira-indexing-queue-1047541818.html
+help[maxQueueSize]="biggest queue size we have seen"
+help[putCounter]="number of puts"
+help[queueFullOnPut]="number of puts which had to wait because the queue was full"
+help[getCounter]="number of consumed index operations"
+help[timeInQueueMillis]="time of index operation spent in queue"
+help[timeToUpdateIndexMillis]="time of index operation being applied to index"
+help[totalTimeMillis]="total time: from putting to queue until getting result"
+help[totalTimeFailedMillis]="total time: from putting to queue until failed result"
+help[totalTimeTimedOutMillis]="total time: from putting to queue until timeout result"
+help[putCounterByThreadTopN]="top N threads sorted by number of puts descending, primary queue so these are all HTTP threads"
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	local PARSED
+	PARSED=$(getopt --options 'h' --longoptions 'help,full,annotate' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	full=false
+	annotate=false
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		--full) full=true ;;
+		--annotate) annotate=true ;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	# }}}
+	[[ $# -gt 0 ]] || usage
+
+	relevant_jiraversion
+
+	# This log file is defined by us in our customizes atlassian-jira/WEB-INF/classes/log4j2.xml
+	# It may not exist yet if Jira is recently started and hasn't got around to emitting stats yet
+	local indexlog="$ATL_DATADIR"/log/atlassian-jira-queueingindexstats.log
+	grepindex() { grep --no-filename -F '[JIRA-STATS] [INDEXING-QUEUE]  index:' "$@"; }
+	local log4jconf="$ATL_APPDIR/atlassian-jira/WEB-INF/classes/log4j2.xml"
+	# We might have an older log4j.properties - ignore if so
+	if [[ -f "$log4jconf" ]] && grep -qF "$(basename "$indexlog")" "$log4jconf" && [[ -f "$indexlog" ]]; then
+		echo
+		tail -10 "$indexlog" | jsonify "${*:-.}"
+	else
+		{
+			indexlog="$ATL_DATADIR"/log/atlassian-jira.log
+			[[ -s $indexlog ]] || { echo >&2 "No $indexlog"; exit $CONTROLLED_DEMOLITION; }
+			if $full; then
+				grepindex "$indexlog"
+			else
+				# Our index logs are probably in the last 1000 lines, so search them first; if nothing, exponentially increase the range
+				((j = 1))
+				((fs = $(stat -c%s "$indexlog")))
+				while ! tail -n$((1000 ** j)) "$indexlog" | grepindex; do
+					sleep 1
+					if ((1000 ** j > fs)); then { echo >&2 "No index stats found in log file"; exit $CONTROLLED_DEMOLITION; } fi
+					((j += 1))
+				done
+				log "Exit $?"
+			fi
+		} | stripirrelevant | jsonify "${@:-.}"
+	fi | { if $annotate; then { annotate | pretty; }; else cat -; fi; }
+}
+
+relevant_jiraversion() {
+	# According to https://jira.atlassian.com/browse/JRASERVER-72045 8.13.6 is the earliest version with indexing stats
+	version_greaterthan "$ATL_VER" 8.13.6 || {
+		log "Index stats are only available in Jira 8.13.6+"
+		exit 3
+	}
+}
+
+usage() {
+	local cmd="${CMD:-$0}"
+	cat <<EOF
+Usage: $cmd <jq expression>"
+Purpose: $(grep -m1 '##' "$0" | sed -e 's/## //')"
+
+Exit code 3 if this Jira is older than 8.13.6, and so doesn't emit index logs.
+
+Examples:
+	$cmd 'last'				# Print most recent stats "
+	$cmd '.[] | select(.indextotalsnapshot=="snapshot" and .totalTimeMillis.distributionCounter."30000" > 0) | [.timestamp, .totalTimeMillis]'		# Show times when indexing was timing out"
+
+Available top-level fields:
+
+$(for k in "${!help[@]}"; do
+		echo "	 $k			${help[$k]}"
+	done)
+EOF
+	exit 2
+}
+
+annotate() (
+	IFS='' # Keep whitespace for indentation
+	keys=("${!help[@]}")
+	while read -r line; do
+		if [[ "$line" == *\"*\":* ]]; then
+			keymatched=false
+			for key in "${keys[@]}"; do
+				if [[ $line =~ \"${key}\": ]]; then
+					echo "$line		// ${help[$key]}"
+					keymatched=true
+					break
+				fi
+			done
+			if ! $keymatched; then echo "$line"; fi
+		else
+			echo "$line"
+		fi
+	done
+)
+
+pretty() {
+	if isinstalled batcat; then
+		batcat -l json --paging=never --style=plain
+	else
+		cat -
+	fi
+}
+
+stripirrelevant() {
+	# Given input of the form:
+	# 2022-01-11 04:53:22,718+0000 devstatus.dvcs.githube:thread-17 INFO      [c.a.jira.index.QueueingIndexStats] [JIRA-STATS] [INDEXING-QUEUE]  index:ISSUE, total primary queue stats: {"maxQueueSize":0
+	# Strip all the gunk after the timestamp up to '[JIRA-STATS]'
+	#perl -pe 's/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2},\d{3}[+-]\d{4} ).* (?=\[JIRA-STATS\])/\1/g'
+	perl -pe 's/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}[+-]\d{4} ).* (?=\[JIRA-STATS\])/\1/g'
+}
+
+jsonify() {
+	# The general idea for turning mixed plaintext + json into pure JSON is from https://github.com/tstack/lnav/issues/836
+	# Input is of the form (Jira 8.x):
+	# 2021-06-18 00:54:01,946-0700 [JIRA-STATS] [INDEXING-QUEUE]  index:WORKLOG, snapshot primary queue stats: {"maxQueueSize":1 ...}
+	# or Jira 9.x:
+	# 2024-03-19 17:33:26,500 [JIRA-STATS] [INDEXING-QUEUE]  index:CHANGE_HISTORY
+	jq -nRrM '[inputs | capture("^(?<timestamp>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2},\\d{3}([+-]\\d{4})?) \\[JIRA-STATS\\] \\[INDEXING-QUEUE\\]  index:(?<indexname>[^,]+), (?<indextotalsnapshot>total|snapshot) (?<indexprimarysecondary>primary|secondary) queue stats: (?<body>.*)$") | (.body|fromjson) as $x | del(.body) | . * $x] | '"$*"' // empty'
+}
+
+if [[ $0 =~ atl_jira_indexstats ]]; then
+	main "$@"
+fi

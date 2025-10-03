@@ -1,0 +1,77 @@
+#!/bin/bash -eu
+
+main()
+{
+        [[ -f $patchfile ]] || fail "Missing patchfile: $patchfile"
+        case ${1:-} in
+                save) :;;
+                load) :;;
+                --help|*) usage;;
+        esac
+}
+
+getpatch()
+{
+        if [[ -v HG_NODE ]]; then
+                # We're triggered from a commit hook. Look up the originating hg patch
+                awk -F: "/${HG_NODE}/ {print \$2}" < .hg/patches/status 
+        else
+                # Triggered from command-line ('hg acl')
+                hg -q qtop
+        fi
+}
+
+patch=$(getpatch)
+aclfile=.acls/"$patch"
+echo >&2 "Patch: $patch"
+patchfile=.hg/patches/"$patch"
+
+load()
+{
+	:
+
+}
+
+save()
+{
+	:
+        # At this point we have a bunch of .acls/* files, some of which set perms on files for our patches
+        # We need to find the content from .acls/* relevant to our patch, diff it with getfacl for our patch files, and if modified, write our getfacls to .acls/$patch
+}
+
+patchpaths()
+{
+        hg status -amn0 --change "$patch" | all_path_permutations | sort -z | uniq -z
+}
+
+all_path_permutations()
+{
+        # Given one or more nul-terminated file paths on stdin, this perl function returns all path subsets.  E.g. given 'foo/bar/baz' it emits:
+        # foo
+        # foo/bar
+        # foo/bar/baz
+        #
+        # It works by turning the path into a glob, i.e. 'foo/bar/baz' becomes 'foo{,/bar{,/baz}}', which is then expanded.
+        # We find the number of /'s with https://effectiveperl.blogspot.com/2006/01/idiomatic-perl-counting-number-of.html
+        # In perl 'x' is a repeat operator, so '"}" x 5' = '}}}}}'
+        # I love perl!
+        perl -0lne  'my $slashcount = $_ =~ tr:/::; s:{:\\{:g; s:}:\\}:g; s:/:{,/:g; s:$:"}" x $slashcount:eg; foreach (glob($_)) { print($_) }'
+}
+
+usage()
+{
+        echo "Usage:"
+        echo "  acl load"
+        echo "  acl save"
+        echo "  acl [ls | showactive]"
+        echo "  acl showstored"
+        exit 1
+}
+
+fail()
+{
+        echo >&2 "$@"
+        exit 1
+}
+
+main "$@"

@@ -1,0 +1,104 @@
+#!/bin/bash -eu
+# https://wiki.redradishtech.com/display/~jturner/2017/08/29/Confluence+attachment+locations
+cat <<'EOF'
+-- https://stackoverflow.com/a/60260190
+create or replace function encode_uri_component(text) returns text as $$
+    select string_agg(
+        case
+            when bytes > 1 or c !~ '[0-9a-zA-Z_.!~*''()-]+' then 
+                regexp_replace(encode(convert_to(c, 'utf-8')::bytea, 'hex'), '(..)', E'%\\1', 'g')
+            else 
+                c
+        end,
+        ''
+    )
+    from (
+        select c, octet_length(c) bytes
+        from regexp_split_to_table($1, '') c
+    ) q;
+$$ language sql immutable strict;
+
+WITH baseurl as (
+	SELECT regexp_replace(bandanavalue, '.*<baseUrl>([^<]+)</baseUrl>.*', '\1') as baseurl FROM bandana WHERE bandanakey ='atlassian.confluence.settings'
+)
+, myspaces AS (
+
+	SELECT spaceid
+	FROM spaces
+EOF
+if (($#)); then echo "	WHERE spacekey='$1'"; fi
+cat <<'EOF'
+)
+,pages AS (
+	SELECT content.contentid pageid
+		,content.title AS pagetitle
+	FROM content
+	JOIN myspaces USING (spaceid)
+	WHERE contenttype!='ATTACHMENT' AND content_status!='deleted'
+)
+,attachments AS (
+	SELECT content.*
+		, mt.stringval AS mediatype
+		, fs.longval AS filesize
+	FROM content JOIN contentproperties mt USING (contentid)
+		JOIN contentproperties fs USING (contentid)
+	WHERE content.contenttype='ATTACHMENT' and mt.propertyname='MEDIA_TYPE' and fs.propertyname='FILESIZE'
+--	and content.pageid = 98307
+--	and content.pageid = 5899724
+)
+,attachments_data AS (
+        SELECT
+		spaces.spacekey
+		, spaces.spaceid
+                , pages.pageid
+		, pages.pagetitle
+                , attachments.title AS filename
+                , extract(epoch from attachments.lastmoddate)*1000 AS moddate
+                , version
+                , attachments.creationdate
+                , concat_ws('/', 'ver003',
+		coalesce(
+			right(spaceid::text, 3)::integer % 250
+			|| '/' || 
+			substring(spaceid::text from '(.?.?.?)...$')::integer % 250
+			|| '/' || 
+			spaceid
+		, 'nonspaced'
+		)
+                        , right(pageid::text, 3)::integer % 250
+                        , substring(pageid::text from '(.?.?.?)...$')::integer % 250
+                        , pageid
+			, first_value(contentid) OVER (PARTITION BY pageid, title order by version desc)
+                        , version
+                ) as attpath
+		, filesize
+		, (first_value(contentid) OVER (PARTITION BY pageid, title order by version desc) = contentid) AS is_latest
+        FROM attachments
+	LEFT JOIN pages USING (pageid)
+	LEFT JOIN spaces USING (spaceid)
+        WHERE content_status='current' and contenttype='ATTACHMENT'
+
+-- The above reports false positives for https://confluence.example.com/pages/viewpageattachments.action?pageId=5899724
+-- The problem is that if the *latest* version of an attachment is deleted:
+
+-- confluence=> select spaceid, pageid, contentid, contenttype, title, creationdate, version, prevver from content where pageid = 5899724 and title='CRDC_Source_Survey_Full.xls';
+--  spaceid | pageid  | contentid | contenttype |            title            |      creationdate       | version | prevver 
+---------+---------+-----------+-------------+-----------------------------+-------------------------+---------+---------
+--  4194309 | 5899724 |   5899725 | ATTACHMENT  | CRDC_Source_Survey_Full.xls | 2016-02-09 18:53:37.123 |       2 |        
+--  4194309 | 5899724 |   5900535 | ATTACHMENT  | CRDC_Source_Survey_Full.xls | 2016-01-28 17:59:45.833 |       1 | 5899725
+-- (2 rows)
+
+-- Then it's correct for there to be no file.
+
+)
+SELECT 
+	concat_ws('/', 'attachments', attpath) as fullpath
+	,filesize
+	,pagetitle
+	,concat_ws('/', baseurl, 'pages', 'viewpage.action?pageId='||pageid) AS pagelink
+	,concat_ws('/', baseurl, 'display', spacekey, encode_uri_component(pagetitle)) AS pagelink2
+	,filename
+	,concat_ws('/', baseurl, 'download', 'attachments', pageid, encode_uri_component(filename)) || '?' || concat_ws('&', 'version='||version, 'modificationDate='||moddate, 'api=v2') AS attachmentlink
+	,is_latest
+FROM attachments_data CROSS JOIN baseurl;
+EOF

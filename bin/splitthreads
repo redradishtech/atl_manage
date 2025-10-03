@@ -1,0 +1,65 @@
+#!/usr/bin/perl
+## Experimental attempts at splitting per-thread info in thread dumps
+
+use strict;
+use warnings;
+use Data::Dumper;
+use 5.26.0;
+
+
+my $print;
+my $prev;
+my $cur;
+
+my $undated_counter = 0;
+my $td = "";
+my $tname;
+my $nid;
+my $tstate = "";
+
+sub shorten {
+	my ($str) = @_;
+	my $maxlen=200;
+	my $overflow = length($str) - $maxlen;
+	if ($overflow >0) { 
+		# Say maxlen is 20 and our string is 21. Then We'll get 0..9 and 12..20
+		#say "Overflowing! length is " . length($str) . " with overflow $overflow";
+		my $newstr = substr($str, 0, ($maxlen/2 - 1)) . "‥" . substr($str, -($maxlen/2 + 2), length($str));
+		#say "Shortened to $newstr";
+		return $newstr;
+	} else {
+		return $str;
+	}
+}
+
+while (<>) {
+	$prev = $cur;
+	$cur = $_;
+	if (/"(.*)".* prio=.*nid=(\d+).*/) {
+		if ($td eq "") { 
+			# Dec 12 02:34:16
+			# Dec 12 02:34:16 "OkHttp ConnectionPool" #1308945 daemon prio=1 os_prio=0 tid=0x00007f658127c800 nid=0x894e in Object.wait() [0x00007f625bf5b000] 
+		} else {
+			my $fname = "thread-" . $tstate . "-" . $nid . "-" . $tname =~ s/ /_/gr . ".txt";
+			$fname =~ s/[^A-Za-z0-9\-\._ ]//g;
+			$fname = shorten($fname);
+			#say "Writing thread dump $fname";
+			open(my $fh, '>', $fname) or die $!;
+			print $fh $td; 
+			$td = "";
+			undef $tstate;
+		}
+		$tname = shorten($1);
+		$nid = $1;
+		#say "Thread: $tname";
+	} elsif (/java.lang.Thread.State: ([^ ]+)/) {
+		$tstate = $1;
+		#say "Thread: $tname State: $tstate";
+	} else {
+		#say "«$_»";
+	}
+
+	if (length $tname) {
+		$td .= $_;
+	}
+}

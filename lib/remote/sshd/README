@@ -1,0 +1,2 @@
+These are configuration files for an auxiliary sshd that listens only on localhost, and (possibly unlike the main port 22 ssh) allows root logins.
+See the description in ssh_for_atlassianapps.service

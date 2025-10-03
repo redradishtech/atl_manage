@@ -1,0 +1,35 @@
+#!/bin/bash -eu
+# Print the PID of the app's main process, as systemd reports it. Nonzero exit code if the service isn't running.
+# Used by atl_workingcopy and atl_upgrade to determine if we can do potentially invasive stuff to $ATL_APPDIR.
+# See also atl_running
+
+atl_pid() {
+	[[ -v ATL_SYSTEMD_SERVICENAME ]] || fail "$ATL_SHORTNAME is not run using systemd, so we don't know its pid"
+	local ppid childpid
+	ppid=$(systemctl show "$ATL_SYSTEMD_SERVICENAME" --property=MainPID | sed -e 's/.*=//')
+	if [[ $ppid == 0 ]]; then
+		return 1
+	else
+		case "$ATL_PRODUCT_RUNTIME_TECHNOLOGY" in
+		java*)
+			# For Java apps the systemd MainPID is a bash script, and the actual Java process we care about is a child process. Find it here:
+			childpid="$(ps --no-headers --ppid="$ppid" -o "pid,command" | awk '/java/ {print $1}')"
+			if [[ -n $childpid ]]; then
+				echo "$childpid"
+			else
+				# This happens during testing with 'sleep' commands. 
+				echo >&2 "Warning: could not find expected Java child of parent pid $ppid. We expect $ppid to be a bash script invoking Java. Returning the parent pid"
+				echo "$ppid"
+			fi
+			
+			;;
+		php*-fpm)
+			# PHP is saner: the ExecStart starts PHP directly with no wrappers
+			echo "$ppid"
+			;;
+		*) error "Unhandled runtime: $ATL_PRODUCT_RUNTIME_TECHNOLOGY" ;;
+		esac
+	fi
+}
+
+atl_pid "$@"

@@ -1,0 +1,69 @@
+#!/bin/bash -eu
+# Syncs filesystem from primary to standby.
+
+# We can rely on ATL_ variables being defined.
+
+#shellcheck source=/opt/atl_manage/replication/common.sh
+. "$ATL_MANAGE/replication/common.sh"
+
+main() {
+	[[ $ATL_REPLICATION_TYPE = rsync ]] || error "$0 only works with ATL_REPLICATION_TYPE=rsync, not '$ATL_REPLICATION_TYPE'"
+	if [[ -v $SOURCE ]]; then
+		# Note: syncing filesystems inherently requires root/sudo on the standby, and may require root on the primary too.
+		# - On the standby, the home directory might have root-owned files, perhaps even root-readonly files (like backups) whose ownership and permissions we need to preserve. We also need write access to touch the .lastsync marker file.
+		# - On the primary, we may have backups in the home dir written as root, which $ATL_USER can't access
+		# Therefore we use 'sudo -E' on the next line. The remoterun script logs into the standby as $ATL_REPLICATION_STANDBY_SYNCUSER. If ATL_REPLICATION_STANDBY_SYNCUSER is 'root' (default) then 'sudo -E' has no effect; if we're running as $ATL_USER, then the sudoers file must grant password-free access to 'sync_filesystem' and also preserve SSH_AUTH_SOCK. Granting this sudo permission is handled by $ATL_MANAGE/events/install-post/replication ('sudosnippet').
+		"$ATL_MANAGE/lib/remote/run" sudo -E "$ATL_MANAGE/replication/sync" "$@"
+	elif [[ -v $DESTINATION ]]; then
+		[[ $EUID = 0 ]] || error "Unexpectedly running without sudo/root. This should have been invoked with 'sudo -E' by the primary (see above) or in sync_filesystem_auto"
+
+		markerfile="$ATL_DATADIR/READONLY_STANDBY"
+		if [[ ! -f $markerfile ]]; then error "Missing standby marker file $markerfile on $(uname -n). Aborting sync"; fi
+		#shellcheck disable=SC2016
+		[[ ! -v ATL_REPLICATION_STANDBY_MIRROR_OF_PRIMARY_DATADIR ]] || fail 'Please replace ATL_REPLICATION_STANDBY_MIRROR_OF_PRIMARY_DATADIR with ATL_REPLICATION_STANDBY_MIRRORDIR'
+		[[ -v ATL_REPLICATION_STANDBY_MIRRORDIR ]] || fail 'Please set ATL_REPLICATION_STANDBY_MIRRORDIR. It will typically be .mirror-from-$ATL_REPLICATION_PRIMARY_HOST_UNAME'
+		[[ $ATL_REPLICATION_STANDBY_MIRRORDIR =~ ^\.mirror-from-.+$ ]] || error "ATL_REPLICATION_STANDBY_MIRRORDIR value '$ATL_REPLICATION_STANDBY_MIRRORDIR' appears invalid"
+		# Note that we sync the ATL_VER directory, not current/, so the data we sync is dependent on which .appinfo the caller sourced.
+		# The RSYNC_EXCLUDES property can be used to exclude Jira index files, which tend to vanish on the source halfway through syncs, leading to spurious failures.
+		if [[ $ATL_REPLICATION_PRIMARY_SYNCUSER != root ]]; then
+			error "ATL_REPLICATION_PRIMARY_SYNCUSER should be the ATL_USER on the replication primary or root, not '$ATL_REPLICATION_PRIMARY_SYNCUSER'. Please set ATL_REPLICATION_PRIMARY_SYNCUSER=root instead"
+		fi
+		if [[ ! -v ATL_REPLICATION_PRIMARY_SYNCUSER ]]; then
+			error "Please set ATL_REPLICATION_PRIMARY_SYNCUSER on $HOSTNAME, by loading the correct variables and then running 'atl profile freeze'"
+		fi
+
+		# Since we're syncing cache directories we expect some 'vanished' files. Ignore them. A partial index will be better than nothing in a failover emergency
+		rsync=("$ATL_MANAGE/lib/rsync_ignore_vanished")
+		sshcmd=(ssh -F "$(gethomedir "${!DESTINATION_SYNCUSER}")/.ssh/config" -o UserKnownHostsFile="$(gethomedir "${!DESTINATION_SYNCUSER}")/.ssh/known_hosts")
+		rsync+=(-e "${sshcmd[*]}")
+		if [[ $ATL_REPLICATION_PRIMARY_USER != "$ATL_USER" ]]; then
+			rsync+=(--usermap "$ATL_REPLICATION_PRIMARY_USER:$ATL_USER")
+		fi
+		if [[ $ATL_REPLICATION_PRIMARY_GROUP != "$ATL_GROUP" ]]; then
+			rsync+=(--groupmap "$ATL_REPLICATION_PRIMARY_GROUP:$ATL_GROUP")
+		fi
+		# rsync from replication primary to an intermediate directory on standby
+		if [[ $* =~ -v ]]; then set -x; fi
+		local rsyncopts="-rHKlpgo"
+		# We used to have '-a' as as rsync option, which is equivalent to -rlptgoD. Since 6/Aug/23 I removed the -t, leaving the remainder (rlpgoD). We don't want timestamps preserved because if the destination is ZFS with snapshots enabled, changing just a timestamp breaks snapshot copy-on-write, using extra disk space. Jira in particular is prolific in changing directory timestamps (creating/deleting thumbnails, I think), so that a 'rsync -t' causes the destination ZFS's snapshots to use lots of disk space.
+		log "Rsyncing from prod to replication mirror"
+		set -x
+		time "${rsync[@]}" $rsyncopts -z --delete replication_source:"$ATL_REPLICATION_PRIMARY_DATADIR_BASE/$ATL_VER/" "$ATL_DATADIR/$ATL_REPLICATION_STANDBY_MIRRORDIR" ${ATL_REPLICATION_RSYNC_EXCLUDES:+$ATL_REPLICATION_RSYNC_EXCLUDES} "$@"
+		(
+			flock --exclusive 200
+			# Now sync from our up-to-date intermediate directory to our real home directory, with a write lock to ensure we don't modify content rsnapshot is busy backing up
+			# Note we use straight rsync here, not ${rsync[@]}, as there should be no 'vanished' files and no need for SSH
+			log "Rsyncing from replication mirror to replication data dir"
+			cd "$ATL_DATADIR"
+			time rsync $rsyncopts --delete --exclude .lastsync --exclude "READONLY_*" --exclude "$ATL_REPLICATION_STANDBY_MIRRORDIR" --link-dest="$ATL_REPLICATION_STANDBY_MIRRORDIR" "$ATL_REPLICATION_STANDBY_MIRRORDIR/" .
+		) 200>"$ATL_LOCKDIR/home.lock"
+		# ATL_PRECONDITION_BANNERTEXT uses .lastsync to report data freshness
+		#echo "We're running as $EUID and are being asked to touch $PWD/$ATL_VER/.lastsync:"
+		touch ".lastsync"
+		if [[ $* =~ -v ]]; then set +x; fi
+	else
+		error "Neither primary nor standby"
+	fi
+}
+
+main "$@"

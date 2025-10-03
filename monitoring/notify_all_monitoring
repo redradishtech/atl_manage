@@ -1,0 +1,33 @@
+#!/bin/bash -eu
+
+## Notifies monitoring systems like Nagios and healthchecks.io (indicated in $ATL_MONITORING_TYPES) of the outcome of the $1 monitoring service check on the current app ($ATL_LONGNAME).
+# This script is designed to be called from /etc/cron.d/$ATL_SHORTNAME-$service scripts, e.g.:
+# 
+# 0 */4 * * * root . /opt/atlassian/redradish_jira/8.20.12/.env/atl_env;   jlog appdeployment jrun appdeployment /opt/atlassian/redradish_jira/8.20.12/monitoring/appdeployment.healthcheck 3> >(jeventlog -t appdeployment | notify_all_monitoring "appdeployment")
+# 
+# The scripts takes 'jeventlog' JSON representing metadata about a service run (start time, stop time, exit code), and informs each of the monioring systems listed in $ATL_MONITORING_TYPES (currently 'nagios4' and 'healthchecks'). If healthchecks.io is notified, only services listed in $ATL_MONITORING_HEALTHCHECKS_SERVICES are pinged.
+
+# shellcheck source=/opt/atl_manage/lib/logging.sh
+. "$ATL_MANAGE"/lib/logging.sh
+
+(( $# == 1 )) || fail "Usage: notifyall SERVICENAME"
+service="$1"
+if [[ ! -v ATL_MONITORING_TYPES ]]; then
+	if [[ -v ATL_MONITORING ]]; then
+		# Don't break cron-driven scripts in the interim while ATL_MONITORING is still in .env dirs
+		warn "Please define ATL_MONITORING_TYPES. Falling back to \$ATL_MONITORING ($ATL_MONITORING)"
+		ATL_MONITORING_TYPES="$ATL_MONITORING"
+	else
+		fail "Please define ATL_MONITORING_TYPES"
+	fi
+fi
+
+json="$(cat -)"
+
+if [[ $ATL_MONITORING_TYPES =~ nagios4 ]]; then
+	echo "$json" | JDEBUG=true jeventsummaryscript "$ATL_MANAGE/monitoring/notify_nagios4" "$ATL_LONGNAME" "$service" @EXITCODE@ "@SUMMARY@"
+fi
+
+if [[ $ATL_MONITORING_TYPES =~ healthchecks ]]; then
+	echo "$json" | JDEBUG=true jeventsummaryscript "$ATL_MANAGE/monitoring/notify_healthchecks" "$ATL_LONGNAME" "$service" @EXITCODE@ "@SUMMARY@"
+fi

@@ -1,0 +1,22 @@
+{
+  "packages": {
+    "python": {
+      "version":        "2.7.18.6",
+      "allow_insecure": ["python-2.7.18.6"],
+	  "patch": "never"
+    },
+    "ruby":    "3.3.2",
+    "bundler": "2.5.11",
+    "go":      "latest"
+  },
+  "shell": {
+    "init_hook": [
+      "echo 'Welcome to devbox!' > /dev/null"
+    ],
+    "scripts": {
+      "test": [
+        "echo \"Error: no test specified\" && exit 1"
+      ]
+    }
+  }
+}

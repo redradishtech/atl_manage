@@ -1,0 +1,543 @@
+- DirManager
+ - Responsible for creating directories:
+  - Using ZFS if needed
+  - Sets permissions
+ - Check permissions are okay
+
+- FIXME: is atl_tarsnapper keeping hourly backups??
+- Fixme: does atl_deploy actually use $ATL_MANAGE/templates/skel/.psqlrc? We rely on \timing off there now
+atl_panic
+- App /status page check doesn't time out:
+
+- Move $ATL_APPDIR/monitoring/.eventhandler to $ATL_APPDIR/.env/atl_nagiosevent, and mv $ATL_MANAGE/monitoring/eventhandler to $ATL_MANAGE/monitoring/atl_nagiosevent
+
+
+Backup manifest
+---------------
+- Backups should include a 'backup_manifest' file similar to Postgres (https://www.postgresql.org/docs/current/backup-manifest-format.html)
+	{ "Backup-Manifest-Version": 1, "env": { "product": "jira-software", "version": 8.11 }, "runtime": { "user": "redradish_jira" } }
+	- Store the usernames associated with uid/gids, so the restorer can get re-map the ids
+	- Allow 'auxiliary' databases
+- This would then allow $ATL_MANAGE/backupmirror/restore_backup to apply --usermap if $ATL_USER does not match .runtime.user
+- The application version needs to support local vers, git and hg URIs. The data 'version' needs to support a static 'current' option that doesn't increment on each app version change
+- Scenario: prod is upgraded, but sandbox is on version x-1: we now want to atl_backupmirror_restore, but our hourly.0 backup is from version x, which won't work correctly on the x-1 sandbox. At least with a README.toml atl_backupmirror_restore could know not to try (suggest the user '$ATL_MANAGE/backupmirror/sync_backup x-before-upgrade-to-y' on the primary and 'atl_backupmirror_restore x-before-upgrade-to-y' on the sandbox)
+
+- Implementation attempt: Sep 2024:
+  Failed (bin/atl_backup). Problems:
+   - Lots of complicated code to hardlink (reuse) past backup contents, as well as encyption and compression. 
+   - The code is complex and ugly. No reuse of hardlink logic between /home and /database. No way to support mydumper instead of mysqldump. No postgres support. No atl_backup_restore support
+   - BACKUP_MANFIFEST is very difficult to make both sane and useful. Last attempt (from bin/atl_backup):
+	{
+	  "backup-manifest-version": 1,
+	  "app": {
+		"app-product": "jethro",
+		"app-name": "jethro-test.coastec.net.au",
+		"app-version": "2.35.1"
+	  },
+	  "databases": [
+		{
+		  "database-type": "mysql",
+		  "database-version": "mariadb  Ver 15.1 Distrib 10.6.18-MariaDB, for debian-linux-gnu (x86_64) using  EditLine wrapper",
+		  "coastec_jethro": {
+			"sha1": "8a3df53ef51032f3afe271e0e1dcdf7c0f2e403a  -",
+			"coastec_jethro.sql": {
+			  "backup-command": "atl_mysqldump --single-transaction --add-drop-table --routines --events --skip-dump-date --opt coastec_jethro",
+			  "coastec_jethro.sql.zst": {
+				"compression": "zstd",
+				"coastec_jethro.sql.zst.age": {
+				  "sha1": "836c24f97e6697c3bda7fd1123e13db0fd320e0c  coastec_jethro.sql.zst.age",
+				  "age_private_keyfile": "keepass://https://age-secret-key",
+				  "age_public_key": "age1zcudk7pk3p6dk675ynt2ddqtzte67tltpyp8x0kt5ghuxmshh43q77wzre"
+				}
+			  }
+			}
+		  }
+		}
+	  ],
+	  "home": {
+		"path": "/coastec/coastec_jethro/home",
+		"checksumfile": "CHECKSUMS.home",
+		"*.zst.age": {
+		  "compression": "zstd",
+		  "age_private_keyfile": "keepass://https://age-secret-key",
+		  "age_public_key": "age1zcudk7pk3p6dk675ynt2ddqtzte67tltpyp8x0kt5ghuxmshh43q77wzre"
+		}
+	  }
+	}
+   - Not useful when writing atl_backup_restore. 
+   - Encrypting and compressing each file in ATL_DATADIR just to accommodate rsnapshot is crazy. We should just use restic/borg which does dedup and encryption natively.
+   - rsnapshot could not just backup what atl_backup generated. It needed an app/ subdir, which is ugly and pointless.
+   - Likewise for the database: we should generate nice reusable blobs and let dedup do its job
+   - Tried to implement a reactor pattern in bash, which would have made the code nicer, but bash can't do lifo queues easily.
+
+
+Multitenant
+-----------
+- When multitenanting, we have a split:
+-- there is still just one app deployment (ATL_LONGNAME), at one place (ATL_APPDIR), one webserver config with one backup and set of monitoring/* scripts. atl_freeze stores just these variables.
+-- there are multiple instances (ATL_FQDN, ATL_BASEURL) runtime users (ATL_USER), and each has its own data directory (ATL_DATADIR)
+
+- For multitenant, backups we should have $ATL_BACKUP_ROOT/$ATL_TENANT/{home,database}, not $ATL_BACKUP_ROOT/{home/$ATL_TENANT,database/$ATL_DATABASE}
+
+
+- We have circular deps on setup. 'atl freeze' tries to chmod nagios. 'atl_install_monitoring' assumes apache is installed, which only happens as an install-post.
+- Remove '%{ATL_LONGNAME}' patches. If creating a child patchqueue we should just rename the ATL_LONGNAME patch
+- Jethro: check for too-short LOCK_LENGTH (https://github.com/tbar0970/jethro-pmm/issues/824)
+- Steal ideas from https://github.com/bashup/events
+- Replace the replication rsync+SSH mess with lsyncd
+-- How to we avoid clobbering prod if primary and standby need to change roles?
+- We should just assume root SSH logins are possible. As a fallback we could install an separate ssh service:  /usr/sbin/sshd -d  -D -f /etc/ssh/sshd_config -o Port=1022 -o PermitRootLogin=prohibit-password
+-- The standby host fingerprint should be checked into the profile
+-- The app SSH public/private keys should be checked into the profile too
+--- On install-post, generate a root-owned $ATL_USER/.ssh/<dest>/{ssh_config,id_ed25519{,.pub}}from ATL_REMOTE_PRIVATEKEY and ATL_REMOTE_PUBLICKEY. These files are app-specific but use-independent. It must only be readable by root
+--- The primary should then start the lsyncd service
+- Overhaul the ATL_ variable system. Instead of multiple sourcing steps, use a reactor pattern. Allow for dynamic variables showing runtime info like /proc.  This would solve ordering problems when loading $ATL_PROFILEDIR files.
+-- Add lookups from one profile into another.
+-- Possibly adopt a configuration language like CUE - https://news.ycombinator.com/item?id=32600821
+-- Use-case: in Jethro we want to have a runtime setting ATL_TENANT, and correspondingly altered ATL_DATABASE. We don't want ATL_TENANT written to the static profile.
+
+- We need some global healthchecks:
+-- zfs.healthcheck should be global. When we have multiple services they all fight to run the check at the same instant. Need to enhance atl_install_monitoring_services with a --global flag to install profile-independent checks.
+-- /etc/cron.d/nagios4_running is global
+- In the current system, we rely partly on ATL_* vars to trigger features (ATL_BACKUP_TYPES, ATL_WEBSERVER, ATL_REPLICATION, ATL_BACKUPMIRROR) and partly on hg patches being present (cloudflare, backupmirror, replication). Some features like replication and backupmirror need both.
+-- Simplification: only have ATL_* vars driving things: 
+--- atl_profile load translates /etc/atlassian_app_profiles into a concrete set of feature/info flags in $ATL_APPDIR/.env
+--- $ATL_MANAGE/features/{replication,backups-mirror,cloudflare,....}/{install-pre,install-post,select-patches}
+--- atl_deploy calls */select-patches to hg qselect patches before applying the patchqueue
+--- then calls $ATL_MANAGE/events/{event}/*
+---- Need hooks  galore e.g. after generating .env, 'monitoring' needs a chance to grant 'nagios' read permission.
+- Generalizing to Other Apps
+- Can wemount the ZFS homedirs noexec?
+-- atl_replacetokens needs to know what files might contain tokens
+-- atl_deploy needs to set permissions appropriately (e.g. PHP apps need www-data)
+-- lib/create_patchqueue needs to add the right files to .hgignore
+-- atl_setup (or something) needs to install dependencies. Also might be done in $ATL_APPDIR/events/install-post/<something>
+-- On upgrades, sometimes db migrations need doing. Might be done in $ATL_APPDIR/events/upgrade-stopped-pre/upgrade-database
+- Say the %{ATL_LONGNAME} patch modifies apache2.conf in such a way that 'a2enmod headers' is needed. How do we trigger that? 
+
+- atl_install_monitoring_services: support old_name properly (allow for renaming services)
+- If a cronjob (e.g. /etc/cron.d/<app>-zfs) is installed accidentally, e.g. by a misapplied guard, then only manual intervention can ever remove it.
+- The 'uninstall-pre' event is broken, e.g. systemd's uninstall-pre stops the app. 'pre' should mean 'steps taken while the app is running'
+- Create a wrapper around jevents. atl_log should become atl_logwatch, and atl_log should print a summary of either the main log (without args) or a particular monitor
+- For profiles, we need some sane way of saying "what is the ATL_VER value for $product?". E.g. for $ATL_MANAGE/lib/publishreport, which needs to know the VER and NEWVER of every product.
+-- Another example: when installing a postgres standby, we want to be able to ask 'what is the port of the primary?'
+- Automatically set up OAuth creds for local checks and integration:
+-- Have alerts create/comment on a Jira issue, so that customers can see problems are logged, and there is a place to log time against.
+-- 
+- Can we create a Nagios alert of health check results from database?  select * from support.health_check_status ;
+- Migrate off bash to something saner. Insanities:
+-- Insanity: not even simplest stuff like cat "$foo" is safe (must be cat -- "$foo")
+-- Insanity: foo=$(exit 1) does not set $?. There is no way to catch the exit code
+-- non-true statements don't trigger -o errexit in if blocks. http://stratus3d.com/blog/2019/11/29/bash-errexit-inconsistency/
+-- It would be nice to use a language where the output of an if-then-else statement could be piped
+-- Need a language where both stdout and stderr can be captured as variables. See monitoring/plugins/check_jira_index_health where this would be useful
+-- See xmlstarlet text generation in /opt/atl_manage/events/start-pre/check_for_database_connection_settings - it doesn't end in newline, so 'read' can't parse it. https://unix.stackexchange.com/questions/418060/read-a-line-oriented-file-which-may-not-end-with-a-newline
+- create_patchqueue --commit=branch/patch doesn't work yet, because generally 'branch' isn't pulled and updated unless it is the latest branch
+- We need some place to put server-wide variables, like the Postfix check parameters (ATL_MONITORING_MAILQUEUE_DEFERRED). Currently they are set to a particular profile, but used by atl_install_monitoring
+- Have per-org nagios notification contacts, so that on a shared host we don't reuse a common contact in atlassian.cfg. 
+-- When 'atl_install_monitoring', in addition to atlassian.cfg we would need to install %{ATL_ORGANIZATION}.cfg defining a %{ATL_ORGANIZATION}-criticial-notificants group, etc, which then gets used in app nagios.cfg snippets. Possible but tedious. Are we sticking with nagios long enough to bother?
+- Jira: investigate whether we can NOOP out the scheduler_run_details queries
+- Fix backupmirror so that a backup can be invoked from the destination ('jturner-desktop') that is not network-discoverable from the source ('linode'). 
+-- Currently the source sets a 'ssh_to_backupmirror_source' variable defining the SSH command, utilizing a constructed-on-the-fly .ssh/config on the destination. I have forgotten why it must be so complicated. Could we pass over the whole source .env, if the destination needs some info from it?
+- Investigate https://github.com/brettwooldridge/HikariCP
+- Switch from crontabs to systemd service files
+-- Lets us initiate a manual backup or whatever easily
+-- We can then have an $ATL_APPDIR/events/install-post/ script trigger stuff like config_applied.service, knowing it will run as the correct user
+-- Deprecate/simplify atl_cronrun
+-- Persistent=true lets us emulate anacron, e.g. run backup if the server was offline recently.
+- In userdirectories.healthcheck, check whether the userdn account is due to expire soon.
+- Replace $ATL_MANAGE/monitoring/nagiosify.
+  Currently atl_install_monitoring_services parses healthcheck and writes the cron file, which contains the locking/log/run logic, which doesn't belong in a cronfile (too many painful variables). 
+  Could we have a 'nagiosify run backup.healthcheck' script which infers the right j* commands? Yes, but it is not obvious to casual users that this needs invoking.
+  Idea: have atl_install_monitoring_services generate backup.sh from backup.healthcheck, and then invoke it from backup.cron. This provides a nice separation between cron and script. Upsides
+  	- it is now very easy for casual users to e.g. kick off a backup, or sync replication
+	- crontab is nice and simple.
+	- we can kick off normally-cronned operations e.g. from atl_backup
+  Downsides:
+  	- it does repeat the boilerplate for every generated script.
+	- the contents of $ATL_APPDIR/*/*.sh now changes. hgignore needs updating
+
+- We have to fix the atl_app_patchqueue situation:
+
+Currently $ATL_APPDIR/.hg/patches is checked out from a central repo, ssh://hg@bitbucket.org/redradish/atl_app_patchqueue
+This is bad because we don't want customer patches outside their environment, and also runs the risk of accidentally checking out customer A's setup on customer B's server.
+New scheme:
+ - Have a 'central' repo, ssh://hg@hg.sr.ht/~redradishtech/atl_app_patchqueue	 containing just base branches ('default', 'jira', 'jira-software', 'jira-software-8.5.4', 'confluence', .....)
+ - Per-client repo at $ATL_PATCHQUEUE_REPO, typically http://localhost:8610/$client/patchqueue
+ - create_patchqueue will:
+ -- clone $ATL_PATCHQUEUE_REPO. If it doesn't exist, ask the user to 'hg clone central $ATL_PATCHQUEUE_REPO' first
+ -- configure a 'central' path
+ -- ??? push some branches to 'central'
+
+ EDIT: above didn't work. It's too painful having to think whether a mod to 'default' is in a customer repo (where customer==redradishtech usually) or the generic repo.
+ Look into hg evolve or nix expressions to completely replace our patchqueue system.
+
+
+- FIXME: after lo upgrade, finding lots of variants of \$ATL_DATADIR/6.13.0_mirror-from-usw-conf01
+- FIXME: Add a nagios check for diskspace to ensure N*2 is avalable for upgrades
+- FIXME: Add a nagios check for expired licenses that will prevent upgrade
+- events/upgrade-stopped-pre/replication is broken
+
+- Add locking so scripts that read/write to the home directory can't interfere. E.g. rsnapshot backups should wait for replication syncs. Currently I can't see a nice way to add a flock in rsnapshot.conf. flock works but it would be nice to find a locking tool that prints what lock it is waiting on.
+- Tweak the Apache error message to display the state of the app startup e.g. last log file message
+- Replace chrony/ntp with systemd-timesyncd - https://wiki.archlinux.org/index.php/systemd-timesyncd
+- Investigate http://www.crashub.org/
+- Investigate JMC, jconsole
+
+- atl_postmortem
+ - Accept outage start/end date, and timestamp
+  - Check for -Duser.timezone. If set, die (https://www.redradishtech.com/display/KB/-Duser.timezone+considered+harmful%2C+and+why+your+Atlassian+server+shouldn't+be+on+UTC)
+  - Mount ~/postmortem hg repo if necessary
+  - Create ~/postmortem/$date-$instance/
+  - Copy relevant log files to ~/postmortem/$date-$instance/logs/
+
+- Rewrite the profile sourcing system.
+-- The [foo][bar] notation is annoying to type.
+-- We can't use shortname as a specifier, because shortname is host=specific. So jira.foo.org and jira.foo.corp.com both have shortname 'jira' but if we use specifier '[name=jira]' it will be unclear which jira is meant.
+
+Rather, use key=value with whitespace:
+Source files as facts are known:
+	initialfacts := [ name=jira.foo.com, host=myhost ]
+	source file for each combo of facts (a, b, ab)
+	repeat until we run out of files
+
+- Perhaps reimplement profiles as dhall scripts - https://dhall-lang.org/. See also https://news.ycombinator.com/item?id=22575007
+
+- Add Nagios checks for any failing POP3/IMAP incoming mailboxes. Can use https://exchange.nagios.org/directory/Plugins/Network-Protocols/IMAP4-and-POP3/check-pop3-account/details 
+- Harden systemd per https://www.ctrl.blog/entry/systemd-service-hardening.html
+- Nagios task to check for missing disk attachments (see atl_check_attachments)
+- Nagios tasks to check for expiring eval licenses.
+- Backups:
+	- Convert backups to restic or borgbackup - https://restic.readthedocs.io/en/stable/manual.html#manage-tags http://jpmens.net/2017/08/22/my-backup-software-of-choice-restic/
+	- Use-cases: some way of rsync'ing the "latest" backup without worrying about hourly.0/ being half-written
+- Run SQL on start:
+  - Disable analytics
+  - update base url (DONE)
+  - set banner (DONE)
+   - Note that banner background colour can be set via REST /application-properties:
+   	https://docs.atlassian.com/software/jira/docs/api/REST/7.6.1/?_ga=2.138316340.508691496.1519174520-1713557612.1519174520#api/2/application-properties-setPropertyViaRestfulTable
+	curl   -u $USER:$PASSWORD -X GET https://issues.redradishtech.com/rest/api/2/application-properties  | jq .
+- Rather than having one huge atl_patchqueue repo with branches, have a repo per client, created via the REST API: https://community.atlassian.com/t5/Bitbucket-questions/How-do-you-create-a-project-or-project-repository-on-bitbucket/qaq-p/344839
+-- In generic REPO, have branches:
+   default
+     jira
+       jira-<version>
+
+-- In client repo, have structure:
+      /etc/atlassian_app_profiles
+      /opt/atlassian/$ATL_PRODUCT/patchqueue    # with branch $ATL_LONGNAME
+      /etc/procmail/main.cf, and any other important files
+
+
+- Nagiosify cannot handle commands like: /opt/redradish/nagios/nagiosify "tsp.atlassian letsencrypt renew" "tsp.atlassian letsencrypt renew" "certbot --quiet renew --post-hook 'apachectl graceful'"
+- atl_nagios_install_check cannot handle a check with quotes, like check="certbot --quiet renew --post-hook 'apachectl graceful'"
+
+
+Profile sourcing rewrite
+------------------------
+Scenario: we want to host apps from redradish, coast and mbc on the same server. Do we need 3 different profile dirs? Should we allow /etc/atlassian_app_profiles/$ATL_BASEDOMAIN/$ATL_LONGNAME? But then there are also server-wide vars, like ATL_OPSGENIE=true. We also have some server-wide Nagios checks (Current Load, Postfix, Chrony) that need to know their ATL_ROLE - currently using a new var (ATL_SERVER_ROLE) for that.
+
+
+The profile system needs an overhaul:
+- Profile metadata must be readable by scripts, not just bash. Perhaps use JSON or TOML. Eliminate the ability to include arbitrary shell logic.
+-- Use-case: syncing backupmirror from jira to jira-test. We ought to be able to just configure ATL_BACKUPMIRROR_{SOURCE,DESTINATION}_{HOST,APP} and let the scripts work out the details. Currently we have to replicate ATL_* variables from source into the ATL_BACKUPMIRROR_SOURCE_* namespace.
+- Somehow integrate the $ATL_APPDIR/.env dir, which is just a bash serialization of the inferred variables.
+- When doing upgrades, we need a way to change ATL_VER, wherever it appears. We need an API onto the profile system that lets us say 'change this variable, wherever it is'
+
+
+We need multiple types of metadata:
+- global info (setup.bash can rely on e.g. ATL_MONITORING)
+-- Specifically, to allow byobu integration there should be some simple way of getting a field.
+- profile info (ATL_SHORTNAME, etc)
+- plugin info (version-specific plugin JSON)
+- Script output: e.g. 'ls' output showing the latest database backup, or java version, 
+- local info (e.g. Confluence login credentials for doc uploading) 
+
+The Script output in particular will be useful for upgrade reports and documentation.
+
+
+with tags for versions
+- Rather than running 'atl foo' for the foo profile, run 'foo' as an executable script, with the option of providing args so 'foo sync_server' runs script 'sync_server' in the context of foo. Good for syncing staging with prod
+- If a foo/ directory exists containing profile files, list them as foo_* profiles
+
+
+- For the Nagios checks like 'files not modified in X days', make those X WORKING days so that things like weekends and public holidays don't trigger alarms.
+- Edit JIRA's conf/server.xml to remove access_log generation, since everything is already logged at the Apache/Nginx layer
+- Nagios alert for deletion of X% of issues (accidentally deleted project)
+- Nagios alert for disabled outgoing email (or enabled, depending on role)
+
+- Add "maintenace mode" in which:
+ -- App is hidden to regular users, or put in RO mode with a banner.
+ -- Backup and replication tasks are disabled.
+
+
+- asciinema support for recording sessions
+
+=================
+Downtime-free upgrades:
+atl_install --old
+	 o Copy db 'jira' to 'jira_old'. fs to ${ATL_VER}_old
+	 o A second copy of the app is deployed (same old version; pointed at 'jira_old' db, less memory and disabled email), for https://jira-old.$company.com, backend jira-old.internal:8009 etc.
+atl jira_old
+atl_start
+atl_watchdb --database=jira &
+ - Once copy of app is online, check if any mods have been made to 'jira':
+ 	- If mods made, resync jira -> jira_old, fs, restart jira-old app, try again.
+atl_syncfromold
+atl_restart
+ -OR-
+atl_switchtoold 
+ o If no mods detected, proceed:
+ o In 'jira_old' profile:
+   o 'jira-old.$company.com' vhost is renamed 'jira.$company.com', same jira-old.internal:8009 backend
+   o 'jira-old.internal:80' vhost is renamed 'jira.internal:80', same jira-old.internal:8009 backend
+ o In 'jira' profile
+   o 'jira.$company.com' vhost renamed 'jira-new.$company.com', same 'jira.internal:8009' backend
+   o 'jira.internal:80' vhost renamed 'jira-new.internal', same 'jira.internal:8009' backend
+ o Reload Apache.  jira_old is now the live JIRA.
+
+
+ o Optionally put jira_old into RO mode
+
+atl jira
+atl_stop
+atl_watchdb --database=jira_old &
+cda
+ o Upgrade JIRA app as usual, but running at a 'jira-new.$company.com' hostname.
+ o Check for database mods.
+ 	- If mods detected, resync jira_old -> jira, fs_old -> fs and try the upgrade again.
+		- Perhaps we can work out a db/fs diff and apply it?
+ o If no mods, and upgrade succeeded, switch Apache from jira-old.internal:8009 to jira.internal:8009, and http://jira.internal backend  
+
+
+For the above, we need:
+- atl_maintenance [--off]	# Turn on 'maintenance mode': customize prompt
+- atl_install --old     	# Installs $ATL_VER version of app with ATL_SHORTNAME=jira-old, ATL_LONGNAME=jira-old.$company.com. Create 'jira_old' database synced from 'jira'
+- atl_switchtoold		# Tweaks 'jira-old' app's ServerName from 'jira-old.$company.com' to 'jira.company.com', and jira-old.internal:80 to jira.internal:80. Tweaks 'jira' app's ServerName from 'jira.$company.com' to 'jira-new.$company.com', and jira.internal:80 to jira-new.internal:80
+- atl_watchdb           	# Freeze until users modify the db somehow. Perhaps modify prompt
+- atl_syncfromold		# Sync jira_old to jira database (dangerous!!) and filesystem. Only in maintenance mode
+
+- To preserve sessions across the server switches:
+ - Implement PersistentManager + PersistentValve. see https://stackoverflow.com/questions/35917945/tomcat-how-to-persist-a-session-immediately-to-disk-using-persistentmanager
+
+
+- Failover servers might want a different set of Nagios checks to production:
+-- A check that the filesystem recently synced
+-- A check that the app is NOT running
+How can we achieve this?
+
+========================
+Upgrade Notes
+
+We would like:
+- The Template should contain a list of the company's plugins, with company-specific test instructions.
+ - This initial template list should be generated by a script that pulls in test processes from Confluence
+ - The oldversion and newversion fields will be replaced at runtime.
+ - This means the _upgradereport command needs to know the old/new plugin versions. 
+- The template's URLS should be wrapped in <testurl> macros
+
+Steps:
+
+atl_plugins --report    # Generates a table with space for pre- and post-upgrade screenshots, and $pluginkey:oldstatus$ , $pluginkey:newstatus$
+
+==========================
+Upgrade Notes
+
+To generate an upgrade report we need:
+ - old ver
+ - new ver
+ - getplugindata info
+ - various usage stats (atl_loganalyze, etc)
+ - list of related apps
+
+For plugins, instructions and screenshots need to be stored in the template, 
+
+- Our plugin report
+
+===========================
+Revised branch structure:
+
+The problem with:
+
+jira
+  jira-7.8.1
+  jira-7.9.0
+    issues.redradishtech.com
+
+is that the 'jira' patch contains context from a concrete JIRA version, both incidental (like extra conf/server.xml comments) and specific (like Synchrony-specific variables in JIRA 7.8+).
+
+The problem with:
+
+jira
+  jira-7.8.0
+    jira-7.8.1
+      jira-7.9.0
+        issues.redradishtech.com
+
+is that we end up hand-editing patch files on any conflict. However this is only for the first level of conflict. 
+
+
+confluence     			# 5.9.10-specific
+  confluence-5.9.10		# 5.9.10-specific
+    newconfluence-6.8.0		# 
+      newconfluence-6.8.1		# 
+
+Say we tweak the default Xmx in 5.9.0. Since it is just above the newly-introduced synchrony settings, we would expect a conflict merging into 6.8.0, but not then into 6.8.1:
+
+- Yes, we are presented with a conflict attempting to merge ALL 5.9.10-specific mods into the 6.8.0 patch. It is not clear what mods are version-specific and what are our change. But subsequent merges (6.8.0 into 6.8.1) do not conflict.
+
+ - 
+
+- Need somewhere to store non-app-specific config:
+ - Nagios customer-specific snippets, like definitions of contacts.
+ - ATL_ORGANIZATION.
+ Perhaps atl_setup could prompt for essential non-app-specific fields and store them somewhere.
+
+- 
+- Now we have cron.d/, systemd, apache2/ and want to store /etc/atlassian_app_profiles as well, the whole thing is getting silly. We really want something (dpkg? etckeeper? overlayfs?) which stores files across the filesystem in a single place.
+
+- Integrate pg_stat_statements: http://geekmonkey.org/2017/11/optimizing-postgresql-queries-using-pg_stat_statements-and-pg_buffercache/
+
+- Flesh out the idea that for any app we have 2 axes:
+ -- ATL_ROLE (prod, standby, staging)
+ -- ATL_PRODUCT (jira, confluence, eazybi, postgresql, backuptester, remotemonitoring)
+
+    (e.g. for 'eazybi', atl_createuser/atl_createdb will create the right user/db)
+ 
+So we could contextualize ourselves for 'jira prod', 'jira standby', 'postgresql prod', 'postgresql standby'. The atl_install script can then delegate sensibly to the atl_install_postgresql* scripts
+ - Note: don't atl_createuser and atl_createdb in atl_deploy until this is explored. 
+ - This would require ordering: we can't install 'jira prod' without first 'postgresql prod', for instance, or 'jira standby' without 'jira prod', or 'monitoring prod' without 'jira prod'.
+
+- Currently we rely on the hostname for triggers to distinguish prod from standby servers. Instead, implement 'Sourcing .common-${ATL_PRODUCT}' and 'Sourcing .$ATL_SHORTNAME-${ATL_PRODUCT}'.  ???
+- Install OsQuery?
+
+- Add timeout support to nagios.sh scripts. https://ma.ttias.be/limit-runtime-cronjob-script/. The nagiosify script will have to nicely catch the 'timeout' signal and report back to the caller
+
+- Fix atl_lnav to look for the right log file(s), given invocations like:
+  atl_lnav --from '2018-07-12 00:00:00.000' --to '2018-07-13 00:00:00.000' /var/log/apache2/jira.example.com/
+
+- Convert atl_log to use atl_lnav
+- Implement / document natural date specifiers like '5 hours ago'
+
+- We have a coordination problem when setting up multi-host systems. To successfully atl_install an app:
+-- db host must be up, or atl_psql fails.
+-- standby must be up, or replication postinst fails
+
+- We need to separate the ATL_ROLE (standby) from the state ('pre-production', 'in maintenance') to handle the case of pre-production standby servers. The atl_maintenance script needs involving. 
+
+- It would be nice if we could run without atl_psql --super. Currently it is required by the tablefunc setup in the LDAP nagios check, and check_replication_database script, and also the backup_database script called from rsnapshot. Could we do our LDAP thing without tablefunc? If so, let's remove it
+
+- Replace patchqueue guards with a more flexible mechanism that allows AND/OR selectors, and doesn't store transient guards ('uname -n') into version control.
+-- One problem with mq guards as a way of enabling/disabling features is it doesn't allow for safe disabling. Say 'letsencrypt' guard is enabled, and results in letsencrypt/renew.healthchceck installing /etc/cron.d/jira-letsencrypt-new script. Now we disable the guard, and letsencrypt/renew.healthcheck disappears. Without an opportunity to formally disable it we don't know to remove the cron script. Features (letsencrypt, tarsnap etc) should be enabled by ATL flags. Then the 'install-pre' event could notice that a feature is disabled and remove it's artifacts.
+
+- Replace atl_install_postgres* with repmgr or something: https://www.reddit.com/r/PostgreSQL/comments/b0al1w/managing_high_availability_in_postgresql_part_ii/
+
+
+DESIGN NOTES
+
+- EXTENDED PRIVILEGES
+- We need cron jobs to be able to a) write possibly root-owned files (replication), b) read root-only-readable files (postgres backups), c) access postgres superuser (check replication status)
+-- We can run some cron jobs as root (check backups, check replication status), but for replicating files we really need root access. Some options for achieving this:
+--- Simply run rsync as root locally, and rsync to root@otherserver. This is the simplest, default option.
+--- However sometimes remote SSH to root isn't allowed ('PermitRootLogin no'). Then the options are:
+---- Modify sudoers to allow $ATL_USER to rsync as root:
+	Defaults:redradish_jira env_keep+=SSH_AUTH_SOCK
+	redradish_jira ALL=NOPASSWD:/usr/bin/rsync
+     This works, but means $ATL_USER can effectively get root access via rsync, so it insecure.
+----- A variation on this is to not use 'NOPASSWD' for '/usr/bin/rsync', but instead pass in the password on stdin. We would have to then store $ATL_USER's password in ~$ATL_USER/.env, pass it from invoker (primary) to standby to primary. Could work but passwords are messy.
+----- As above, but use pam_ssh_agent_auth (https://medium.com/thomas-strohmeier/setting-up-pam-ssh-agent-auth-for-sudo-login-7135330eb740) to authenticate via the presence of the key in ssh-agent. This is the nicest option but pam_ssh_agent_auth isn't present in 16.04 repos, and messing with pam seems a bit risky.
+---- Create a second user, 'redradish_jira_syncer', with sudo permission, and invoke rsync on client and server as this user.
+----- Perhaps later this account could be generalized to 'redradish_jira_admin', with permission to read ~redradish_jira/.env with superuser db credentials
+
+
+- Global variables
+Some variables, like $ATL_MONITORING, are specific to the server rather than any particular profile. They can be sourced by $ATL_MANAGE/setup.bash, allowing many atl_nagios commands to work. 
+
+
+- When a patch like 'replication' is enabled, then disabled, there needs to be some way of un-applying all the patch's modifications, like nagios checks. Currently 'replication' is hidden by hg guards, and .getcommands makes the patch invisible to the events subsystem. We don't want to expose the patch because we don't want unused files in replication/.
+-- First of all, we should rename 'commands' to 'listeners'. So it would be the "replication listener registered for the install-post event". Clean up the symlinks appropriately.
+-- The event system should always invoke the event method ('install-post') on the relevant listener ('replication'), and let the listener decide what to do. There can be a (shared) isenabled() function
+-- May/2020: The whole hg-patch-presence-as-flag system is bodgy. E.g. if we have 'replication' then 'hg qselect' to disable it, our replication/ directory disappears, and then how do we know what was in it (cron jobs, etc) to uninstall? We should turn it around: ATL_* flags determine the presence of features, which sets the relevant guards (hg qselect replication) to enable/disable the relevant patches. E.g if we disable replication, then 'atl_reinstall', the final step of atl_workingcopy should be to diff the .env from current/ and $workingcopy/, notice that replication has been disabled, and uninstall its cron/nagios.
+
+- atl_log could do with many enhancements:
+-- Flags to view logs from since the last boot, or for the n-1'th boot
+
+atl_info
+--------
+- Expand atl_plugins to record more generic system info, including:
+  - lsb_release -a
+  - Java version
+
+
+- Write up some conventions:
+-- Scripts should use underscores, not dashes
+-- End-user scripts (where the end user is an administrator) must start with atl_ and live in bin/
+-- bin/ may also contain other commands, like lnav, that we make available, that aren't atlassian-specific (so no atl_* prefix)
+-- Scripts not intended for end-user use (e.g. libraries or internal utilities) can be called anything, but must live in lib/
+-- In names, put the most reusable part first, and otherwise prefer <NOUN>_<VERB> to <VERB>_<NOUN>.
+--- This is because there might be multiple <VERB>s applying to <NOUN>, and this convention lets you autocomplete to find them.
+--- e.g. atl_backup_synchronize, not atl_synchronize_backup. atl_upgrade_datatabase_backup not atl_upgrade_backup_database
+--- e.g. atl_install_* because there are lots of things we want to install, one after another
+-- Prefer verbs to nouns. E.g. atl_primarybackup_fetch, not atl_primarybackup_fetcher
+
+
+- Need a standardized way to add a field to a profile. Use-case: letsencrypt setup, where we want to set ATL_SSLCERTFILE vars. Also during upgrades, we modify ATL_VER
+
+
+- Lots of functionality ought to be replaced with Ansible. E.g. defining $ATL_SHORTNAME.internal (in /etc/hosts), and then editing $ATL_WEBSERVER's config to listen on $ATL_SHORTNAME.internal:80. 
+
+- Replace cron scripts with systemd service scripts and timers. This will let us programmatically trigger a refresh to e.g. refresh a passive nagios check after fixing a problem, like mods not being committed to the patchqueue. Another use-case: upgrade-running-pre/replication needs to trigger a final pre-upgrade sync of the filesystem
+
+
+
+Generalize
+==========
+
+The whole system could be quite easily generalized to other software, like Jethro:
+- atl_fetchproduct: fetch any software for which a rule is defined (like homebrew)
+- atl_install: unpack $software, create hg repo, apply patchqueue
+-- event system handlers perhaps need to go into a third repo, so they are independent of the atl_manage base system and independent of the app-specific patches
+
+
+- Use a real templating language instead of %{FOO} tokens. Specifically, I would like to expand a list, like ATL_RECIPROCALLY_MONITORED_HOSTS, expand into multiple clauses in nagios.conf
+ - Use multiple threads to pg_dump backups: https://paquier.xyz/postgresql-2/postgres-9-3-feature-highlight-parallel-pg_dump/
+
+- Write a script that provides the value of ATL_SOMETHING, given a profile and server name. E.g. atl_profilevar 'jira' ATL_BACKUPMIRROR_SOURCE_HOST 
+
+
+- Need some way to read variables from another profile, or our profile in another context. 
+-- backupmirror/sync_backup runs on the backup mirror: it needs to know what $ATL_BACKUP_TYPES is on the backup source, in order to sync them. Can't we set ATL_BACKUP_TYPES universally? We could, but we don't want rsnapshot on staging, so either set have ATL_BACKUP_TYPES different, or have some complicated rules where ATL_BACKUP_TYPES + ATL_ROLE determines what backups are used on staging. 
+
+
+
+BUGS
+====
+In some circumstances, tags like 'replication' are lost as the generic patchqueues are merged into company-specific ones.
+
+Upgrades
+========
+Upgrades are too slow, because there are too many backups:
+- First atl_upgrade_copydata rsyncs the data directory
+- Then upgrade-stopped-pre runs rsnapshot, which does another rsync + database backup
+- Then atl_upgrade_database_backup backs up the database, with the app stopped
+
+Nothing is outright wrong about these steps. Perhaps we should keep a n+1 atl_upgrade_copydata ready to go at all times.
+
+
+ZFS
+===
+Currently the biggest impediment to fully automated upgrades is the need for downtime. 
+Most downtime is caused by the need for:
+- A consistent filesystem backup (rsnapshot + rsync)
+- A database pg_dump backup
+
+ZFS Structure
+
+/tank/jira.example.com/
+/tank/jira.example.com/$VER
+/tank/jira.example.com/dev
+/tank/jira.example.com/dev/backups-from-production
+/tank/jira.example.com/standby
+
+- Criteria for a better language than bash:
+-- Some easy way to check for the presence of files, other than [[ -n $(shopt -s nullglob; echo <pattern>) ]]. E.g checking for .swp files in ATL_PROFILEDIR

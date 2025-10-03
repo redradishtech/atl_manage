@@ -1,0 +1,21 @@
+#!/bin/bash -eu
+## Prints Confluence user macros, retrived from the database.
+#WITH usermacro AS (select xmltable.* from bandana, XMLTABLE('/map/entry' PASSING (bandanavalue::xml) COLUMNS macroname text NOT NULL PATH 'string', macrobody text PATH 'com.atlassian.confluence.renderer.UserMacroConfig/template') where bandanacontext='_GLOBAL' and bandanakey='atlassian.confluence.user.macros') select macroname, macrobody from usermacro ;
+
+## Requires Postgresql 10+
+echo "select xmltable.*
+from bandana
+, XMLTABLE(
+	'/map/entry/com.atlassian.confluence.renderer.UserMacroConfig' PASSING (bandanavalue::xml)
+	COLUMNS
+	name text NOT NULL
+	, title text NOT NULL
+	, description text
+	, \"iconLocation\" text
+	, \"documentationUrl\" text
+	, \"hasBody\" boolean
+	, hidden boolean
+	, \"outputType\" text
+	, \"bodyType\" text
+	, template text
+) where bandanacontext='_GLOBAL' and bandanakey='atlassian.confluence.user.macros';"

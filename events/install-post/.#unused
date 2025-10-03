@@ -1,0 +1,187 @@
+
+grant_maintainers_access()
+{
+	if [[ -n ${ATL_MAINTAINERS:-} ]]; then
+		for maint in $ATL_MAINTAINERS; do
+			# https://stackoverflow.com/questions/18431285/bash-check-if-a-user-is-in-a-group
+			# Root will already have access to the filesystem and doesn't need to be in the $ATL_USER group. Is there some way to generalize this?
+			if [[ $maint != root ]]; then
+				if ! id -nG "$maint" | grep -qw "$ATL_USER"; then
+					log "Adding maintainer $maint to the $ATL_USER group"
+					$SUDO usermod -a -G "$ATL_USER" "$maint"
+					log "Adding maintainer $maint to the systemd-journal group (for accessing $ATL_SHORTNAME logs via 'atl_vimlog')"
+					$SUDO usermod -a -G systemd-journal "$maint"
+				else
+					log "Maintainer $maint is already in $ATL_USER group"
+				fi
+			fi
+			if ! can_access_database "$maint"; then
+				log "Creating $maint Postgres user."
+				$SUDO su - postgres -c "createuser $maint"
+			else
+				log "Maintainer $maint already has database login privs"
+			fi
+			{ 
+				# A database may create objects owned by various users. Here we find what those users are, and grant the roles to our maintainers, then make the maintainer user read-only.;
+				# https://dba.stackexchange.com/questions/30061/how-do-i-list-all-tables-in-all-schemas-owned-by-the-current-user-in-postgresql
+				for roleweneed in $(atl_psql -tAXqc "select distinct rol.rolname 
+from pg_class cls
+  join pg_roles rol on rol.oid = cls.relowner
+  join pg_namespace nsp on nsp.oid = cls.relnamespace
+where nsp.nspname not in ('information_schema', 'pg_catalog')
+  and nsp.nspname not like 'pg_toast%'
+  ;"); do
+
+				echo >&2 "GRANT \"$roleweneed\" TO $maint;"
+				echo "GRANT \"$roleweneed\" TO $maint;"
+			done
+			#	echo "GRANT \"$ATL_DATABASE_USER\" TO $maint;"
+				# There is no point granting 'postgres' to users, as the reason it is useful is due to its SUPERUSER attribute, but this is not inherited according to the docs (https://www.postgresql.org/docs/9.4/static/role-membership.html).
+				#echo "GRANT \"postgres\" TO $maint;"
+				# Warning: this affects all databases, not just $ATL_DATABASE.
+				echo "ALTER USER $maint SET default_transaction_read_only = on;" 
+				# There appears to be no way to create a true read-only Postgres user. This commented out code comes as close as possible, but still, a dump via 'postgres' will contain:
+				# 
+				# -CREATE USER MAPPING FOR redradish_confluence SERVER redradish_jira OPTIONS (
+				# -    password 'DmLq77lsAq6ocfo',
+				# -    "user" 'jira_fdwuser'
+				# -);
+				# whereas a dump with a readonly user contains:
+				# +CREATE USER MAPPING FOR redradish_confluence SERVER redradish_jira;
+
+				#  select * from pg_catalog.pg_user_mappings;
+#					schemas=$(echo "select schema_name from information_schema.schemata where schema_name !~ 'pg_*' and schema_name != 'information_schema';" | $SUDO su - postgres -c "psql $ATL_DATABASE -tAXq")
+#					log "Granting $maint read-only access to $ATL_DATABASE database, schemas: $schemas"
+#					for schema in $schemas; do
+#						#FIXME: root can't see user mapping optiosn
+#						echo "REVOKE USAGE ON SCHEMA $schema FROM $maint;"
+#						echo "REVOKE ALL ON ALL TABLES IN SCHEMA $schema FROM $maint;"
+#						echo "REVOKE ALL ON ALL SEQUENCES IN SCHEMA $schema FROM $maint;"
+#						echo "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA $schema FROM $maint;"
+#						echo "ALTER DEFAULT PRIVILEGES IN SCHEMA $schema REVOKE SELECT ON TABLES FROM $maint;"
+#						echo "ALTER DEFAULT PRIVILEGES IN SCHEMA $schema REVOKE SELECT ON SEQUENCES FROM $maint;"
+#						echo "alter user $maint set default_transaction_read_only = on;"
+#					done
+			} | $SUDO su - postgres -c "psql -tAXq  $ATL_DATABASE --echo-all"
+			$SUDO su - "$maint" -c "psql $ATL_DATABASE -tAXqc '\dt' > /dev/null" || warn "Maintainer $maint does not have access to $ATL_DATABASE database"
+		done
+	fi
+}
+
+revoke_maintainers_access()
+{
+	if [[ -n ${ATL_MAINTAINERS:-} ]]; then
+		for maint in $ATL_MAINTAINERS; do
+			{
+				echo "REVOKE $ATL_DATABASE_USER FROM $maint;"
+				echo "ALTER USER $maint SET default_transaction_read_only = off;" 
+			} | $SUDO su - postgres -c "psql -tAXq --echo-all"
+			#echo "drop owned by $maint; revoke all privileges on database $ATL_DATABASE from $maint;" | $SUDO su - postgres -c "psql $ATL_DATABASE -tAq --echo-all"
+		done
+	fi
+}
+create_database()
+{
+	# Old versions of Mercrial (e.g. 1.4) don't support 'hg --mq'. We simulate it by overriding hg, checking for '--mq', and 'cd .hg/patches' before running the command.
+	# Likewise we check for other non-supported commands like 'hg heads -T', 'hg clone -b <branch>', and do the next best thing.
+	# This function is recursive to handle multiple problems, e.g. hg --mq heads -T
+	verify_database_installed()
+	{
+		case $ATL_DATABASE_TYPE in
+			# https://stackoverflow.com/questions/14810684/check-whether-a-user-exists
+			postgresql*)
+			command -v psql >/dev/null && getent passwd postgres > /dev/null
+			;;
+		mysql)
+			command -v mysql >/dev/null
+			;;
+		*) error "Unhandled database"
+	esac
+	}
+
+	database_user_exists()
+	{
+		case $ATL_DATABASE_TYPE in
+			postgresql*)
+				[[ 1 = $(echo "SELECT 1 FROM pg_roles WHERE rolname='$ATL_DATABASE_USER';" | $SUDO su - postgres -c "psql -tAXq postgres") ]]
+				;;
+			mysql)
+				error "Not implemented" ;;
+			*)	
+				error "Unhandled database type";;
+		esac
+	}
+
+	database_exists()
+	{
+		case $ATL_DATABASE_TYPE in
+			postgresql*)
+				[[ 1 = $(echo "SELECT 1 FROM pg_database WHERE datname='$ATL_DATABASE';" | $SUDO su - postgres -c "psql -tAXq postgres") ]] ;;
+			mysql)
+				error "Not implemented" ;;
+			*)
+				error "Unhandled database type";;
+		esac
+	}
+
+
+
+	verify_database_installed || error "Please manually install $ATL_DATABASE_TYPE"
+	case $ATL_DATABASE_TYPE in
+		postgresql*)
+			if ! database_user_exists; then
+				cat - <<-EOF | $SUDO su - postgres -c "psql -tAXq --echo-all"
+				CREATE ROLE "$ATL_DATABASE_USER" WITH PASSWORD '$ATL_DATABASE_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT LOGIN;
+				EOF
+			else
+				log "Postgres role $ATL_DATABASE_USER already exists"
+			fi
+
+			if ! database_exists; then
+				tspace=/var/lib/postgresql/tablespace/$ATL_SHORTNAME
+				if [[ -d "$tspace" && -n "$(ls -A "$tspace")" ]]; then
+					echo "CREATE TABLESPACE $ATL_SHORTNAME OWNER $ATL_SHORTNAME LOCATION '$tspace';" | $SUDO su - postgres -c "psql -tAXq --echo-all"
+					TABLESPACE="TABLESPACE $ATL_SHORTNAME"
+				else
+					TABLESPACE=''
+				fi
+				cat - <<-EOF | $SUDO su - postgres -c "psql -tAXq --echo-all"
+				-- https://confluence.atlassian.com/jira064/connecting-jira-to-postgresql-720411771.html
+				CREATE DATABASE "$ATL_DATABASE" OWNER "$ATL_DATABASE_USER" ENCODING 'UNICODE' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0 $TABLESPACE;
+				EOF
+			else
+				log "Postgres database $ATL_DATABASE already exists"
+			fi
+			;;
+		mysql)
+			error "Not get implemented"
+			;;
+		*) error "Unhandled database";;
+	esac
+}
+
+drop_database()
+{
+
+	verify_database_installed || true
+	if ( database_exists || database_user_exists ) && [[ -n $deletedatabase ]]; then
+		read -r -p "Was asked to delete database $ATL_DATABASE, of size $(echo "select pg_database_size('$ATL_DATABASE') / 1024 / 1024" | $SUDO su - postgres -c "psql -tAXq") Mb. If you really want to proceed, type 'delete': " deleverything
+		case $deleverything in
+			delete) true;;
+			*) error "Aborting. You may delete the $ATL_DATABASE database by hand if you want" ;;
+		esac
+		if database_exists; then
+			log "Deleting database $ATL_DATABASE:"
+			echo "DROP DATABASE \"$ATL_DATABASE\";" | $SUDO su - postgres -c "psql -tAXq --echo-all"
+		else
+			log "Postgres database $ATL_DATABASE doesn't exist, so no need to drop it"
+		fi
+		if database_user_exists; then
+			echo "DROP USER \"$ATL_DATABASE_USER\";" | $SUDO su - postgres -c "psql -tAXq --echo-all"
+		else
+			log "Postgres user $ATL_DATABASE_USER doesn't exist, so no need to drop it"
+		fi
+	else
+		warn "Not removing database. To delete database, pass in --delete-database"
+	fi
+}

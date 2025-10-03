@@ -1,0 +1,19 @@
+#!/bin/bash -eu
+# https://github.com/jimsalterjrs/sanoid/blob/master/INSTALL.md
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+main() {
+	[[ -v ATL_ZFS ]] || fail "ATL_ZFS is not set. We probably don't want sanoid"
+	apt install debhelper libcapture-tiny-perl libconfig-inifiles-perl pv lzop mbuffer build-essential
+	cd /tmp
+	sudo git clone https://github.com/jimsalterjrs/sanoid.git
+	cd sanoid
+	git checkout $(git tag | grep "^v" | tail -n 1)
+	ln -s packages/debian .
+	dpkg-buildpackage -uc -us
+	apt install ../sanoid_*_all.deb
+
+}
+
+main "$@"

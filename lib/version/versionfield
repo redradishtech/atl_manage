@@ -1,0 +1,36 @@
+#!/usr/bin/env perl
+#
+#
+# https://regex101.com/r/Ly7O1x/3/codegen?language=perl
+
+use 5.016;   # implies 'use strict;'
+use Getopt::Std;
+use warnings;
+use autodie;
+use Data::Dumper;
+
+my %opt;
+
+
+GetOptions ( 'url=s' => \$url);
+if (!$url) {
+        print("Usage: fetch.pl --url tracdb\n");
+        exit(1);
+}
+
+
+
+
+my $ver = $ARGV[0];
+my $field = "buildmetadata";
+
+if ($ver =~ /^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?:-(?P<prerelease>(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+(?P<buildmetadata>[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/) {
+	say "yay $+{$field}";
+}
+
+## Note: I tried and failed to use the SemVer module:
+#use SemVer;
+#our $VERSION = SemVer->new($ver);
+#say $VERSION->prerelease();
+#say $VERSION->{prerelease}[0];
+#print(Dumper($VERSION));

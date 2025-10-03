@@ -1,0 +1,28 @@
+## Extra sshd needed to support replication and remote backups for Atlassian apps.
+#
+# Atlassian apps have auxiliary scripts that SSH to remote servers, e.g. for replication or storing remote backups. 
+# Specifically, remote servers need to SSH to the primary host *as root*, in order to e.g. replicate or back up root-owned files.
+# However in locked-down servers, the port 22 sshd does not allow 'root' to log in.
+# Our workaround is to launch a second sshd that does allow root logins, listening only on localhost (so not a security risk).
+# Remote access to this root-enabled sshd is provided via ssh tunnel initiated by the primary host (us).
+# See /opt/atl_manage/lib/remote/*
+
+[Unit]
+Description=SSH on localhost for Atlassian apps, allowing root connections
+After=network.target auditd.service
+ConditionPathExists=!/etc/ssh/sshd_not_to_be_run
+
+[Service]
+ExecStartPre=/usr/sbin/sshd -f /etc/ssh/ssh_for_atlassianapps/sshd_config -t
+ExecStart=/usr/sbin/sshd -f /etc/ssh/ssh_for_atlassianapps/sshd_config
+ExecReload=/usr/sbin/sshd /etc/ssh/ssh_for_atlassianapps/sshd_config -t
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartPreventExitStatus=255
+Type=notify
+RuntimeDirectory=sshd-for-atlassianapps
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

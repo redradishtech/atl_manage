@@ -1,0 +1,14 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+if [[ $ATL_ROLE = prod ]]; then
+	if [[ -v ATL_NOEMAIL ]]; then
+		error "On a production server (ATL_ROLE=prod), we shouldn't be starting with email disabled. Why is ATL_NOEMAIL=$ATL_NOEMAIL set?"
+	fi
+else
+	if [[ ! -v ATL_NOEMAIL ]]; then
+		warn "On a $ATL_ROLE server, we shouldn't be starting with email enabled. Has ATL_NOEMAIL been overridden?"
+	fi
+fi

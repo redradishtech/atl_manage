@@ -1,0 +1,23 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+. /opt/atl_manage/lib/version.sh
+
+require_app confluence
+require_table confversion
+
+conf="$ATL_DATADIR/confluence.cfg.xml"
+if [[ ! -f $conf ]]; then
+	warn "Missing $conf"
+	exit
+fi
+grep -qF '<setupStep>complete</setupStep>' "$conf" || exit 0 # Setup incomplete; exit successfully
+homedir_buildno="$(grep -oP '(?<=<buildNumber>)[0-9]+(?=</buildNumber>)'  "$ATL_DATADIR/confluence.cfg.xml")"
+[[ -n $homedir_buildno ]] || error "Could not find <buildNumber>...</buildNumber> in $conf"
+database_buildno="$(atl_psql -tAXqc 'select buildnumber from confversion JOIN (select max(installdate) installdate from confversion) x USING (installdate);')"
+[[ -n $database_buildno ]] || error "Could not find build number in database"
+
+if ! version_equal "$database_buildno" "$homedir_buildno"; then
+	warn "Build number discrepancy: Database build number '$database_buildno' does not match home directory build number '$homedir_buildno' (in $conf). See version mappings at https://developer.atlassian.com/server/confluence/confluence-build-information/. If $conf's buildno is higher than $homedir_buildno's, change $conf's to the lower value"
+fi

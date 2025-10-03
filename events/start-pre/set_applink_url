@@ -1,0 +1,68 @@
+#!/bin/bash -eu
+## For non-prod instances (e.g. 'jira-sandbox') whose database is a fresh copy of prod ('jira', 'confluence') - rewrite the applinks, which will be incorrect.
+# E.g. for 'jira-sandbox':
+#   RPC URL		'http://confluence.internal:8080' must become 'http://confluence-sandbox.internal:8080'
+#   Display URL	'https://confluence.example.com' must become 'https://confluence-sandbox.example.com'
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+require_app jira confluence
+only_in_nonproduction
+
+case "$ATL_PRODUCT" in
+	confluence)
+		require_table bandana
+		us=confluence
+		ourport=8090
+		other=jira
+		otherport=8080
+		;;
+	jira)
+		require_table propertystring
+		us=jira
+		ourport=8080
+		other=confluence
+		otherport=8090
+		;;
+esac
+
+# RPC URL
+
+# Calculate what we anticipate the upstream prod RPC URL to be
+# Start with our actual BASEURL_INTERNAL:     http://jira-sandbox.internal:8080
+pre="${ATL_BASEURL_INTERNAL/$us/$other}"	# http://confluence-sandbox.internal:8080
+pre="${pre/-sandbox/}"                		# http://confluence.internal:8080
+pre="${pre/$ourport/$otherport}"			# http://confluence.internal:8090
+
+# Note: we use BASEURL_INTERNAL (not ATL_SHORTNAME) because it replaces underscores with dashes, e.g. redradish_jira becomes redradish-jira.internal
+post="${ATL_BASEURL_INTERNAL/$us/$other}"   # E.g. http://redradish-confluence.internal:8080
+post="${post/$ourport/$otherport}"			# http://redradish-confluence.internal:8090
+actual="$(atl_pg_get "$ATL_PRODUCT" applink-rpc-url | atl_psql -tAXq)"
+if [[ $actual != "$pre" && $actual != "$post" ]]; then
+	if [[ ${actual/\.localhost/\.internal} = "$pre" ]]; then
+		# Prod rpc URL should normally be .internal, but historically we've also used .localhost. If .localhost is found, replace it 
+		log "Note: prod $ATL_PRODUCT RPC URL is $actual. It should be upgraded to $pre at some point. Continuing as normal"
+		pre="$actual"
+	else
+		# FIXME: Confluence returns more than one URL (how do we choose?) and also wraps them in <string>. Needs fixing.
+		warn "The $ATL_PRODUCT applink-rpc-url '$actual' is not what we expected in a production database ($pre) nor what we want to change it to ($post). Portlets will fail unless this is fixed"
+		exit 0
+	fi
+fi
+atl_pg_set "$ATL_PRODUCT" applink-rpc-url "$pre" "$post" | atl_psql -tXAq | while read -r oldurl; do
+	log "Changed $ATL_LONGNAME's Applink URL from $pre to $post"
+done
+
+# Display URL
+
+# Calculate what we anticipate the upstream prod display URL to be
+pre="${ATL_BASEURL/$us/$other}"	# https://confluence-sandbox.example.com
+pre="${pre/-sandbox/}"                	# https://confluence.example.com
+
+post="${ATL_BASEURL/$us/$other}"	# 'https://confluence-sandbox.example.com'
+set -x
+atl_pg_set "$ATL_PRODUCT" applink-display-url "$pre" "$post" | atl_psql -tXAq | while read -r oldurl; do
+	log "Changed $ATL_LONGNAME's Applink URL from $pre ($oldurl) to $post"
+done
+set +x

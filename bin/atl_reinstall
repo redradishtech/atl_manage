@@ -1,0 +1,21 @@
+#!/bin/bash -eu
+
+main() {
+	if [[ $* =~ --help ]]; then usage; fi
+
+	atl_redeploy "$@"
+	cd || : # atl_redeploy, which runs in a subshell, may have replaced $CWD, so cd to avoid further subshell unhappiness
+	atl_activate
+}
+
+usage() {
+	cat <<EOF
+Purpose: Redeploys and reactivates the current ($ATL_VER) version of the app.
+
+Equivalent to atl_redeploy \$@ && atl_activate
+EOF
+	atl_redeploy --help
+	exit 2
+}
+
+main "$@"

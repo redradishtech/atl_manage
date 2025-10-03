@@ -1,0 +1,1398 @@
+#!/bin/bash -eu
+## A complicated script that applies customizations, in the form of a Mercurial patchqueue, to an unpacked (Atlassian) app. Usually called from bin/atl_deploy in a mercurialized app directory.
+# The Mercurial patchqueue repo has various branches:
+# - 'default'	- customizations applying to all Atlassian apps, such as systemd scripts and monitoring
+# - $app	- e.g. 'jira', 'confluence', 'crowd'. application-specific customizations
+# - $app-$ver	- e.g. 'jira-7.15.2'. application-and-version-specific customizations
+# - $fqdn	- e.g. 'wiki.redradishtech.com' (aka $ATL_LONGNAME). instance-specific customizations
+# If given the --rebase flag, modifications in more abstract branches are rebased into less abstract branches. E.g. if a systemd config tweak was made in 'default', then it will bubble down through all the layers to the instance-specific branch.
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+# Necessary for the 'grep -v's
+set -o pipefail
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	PARSED=$(getopt --options 'hvcurwm:' --longoptions 'help,commit::,message:,rebase,keep,exclude:,nopush,,gethash,getremotehash' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	# Note, no commit=. We check on the variable's defined'ness rather than value below, so that we can distinguish between '--commit' and '--commit=foo'
+	# Also no rebase=
+	nopush=${ATL_PATCHQUEUE_ONLY_LOCAL:-}
+	excludes=()
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		--commit)
+			shift
+			if [[ $1 =~ (.+)/(.+) ]]; then
+				commit=true
+				commitbranch="${BASH_REMATCH[1]}"
+				commitpatch="${BASH_REMATCH[2]}"
+			elif [[ $1 = '' ]]; then
+				fail "No --commit value. Use '--commit=foo', not '--commit foo'"
+				commit=true
+				commitbranch="$ATL_LONGNAME"
+				commitpatch="$ATL_LONGNAME"
+			else
+				usage "Wrong --commit format. Format is: --commit=branch/patch"
+			fi
+			;;
+		-m | --message)
+			shift
+			commitmsg="$1"
+			;;
+		--keep) keep=true ;;
+		--rebase) rebase=true ;;
+		--nopush) nopush=true ;;
+		--gethash) gethash=true ;;
+		--getremotehash) getremotehash=true ;;
+		--exclude)
+			shift
+			excludes+=(--exclude "$1")
+			;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	if [[ -v gethash ]]; then
+		gethash
+		exit 0
+	elif [[ -v getremotehash ]]; then
+		getremotehash
+		exit 0
+	fi
+	if [[ -v commit ]]; then
+		# Committing implies rebasing, as we're almost always committing to a more generic patchqueue
+		rebase=true
+		if [[ ! -v commitmsg ]]; then
+			error "Please enter a commit message (--message | -m)"
+		fi
+	fi
+
+	# }}}
+
+	[[ -f ${ATL_TOMCAT_SUBDIR}conf/server.xml || $ATL_PRODUCT = jethro || $ATL_PRODUCT = invoiceninja || $ATL_PRODUCT = website || $ATL_PRODUCT = fisheye ]] || error "$0 is expected to be called in a deployed application directory, which '$PWD' does not appear to be"
+	[[ ! -v ATL_NEWVER ]] || error "ATL_NEWVER must not be set. We use ATL_VER only"
+	[[ -v ATL_VER ]] || error "ATL_VER must be set (so we know which $ATL_PRODUCT-\$ver branch to use)"
+	workingcopy="$PWD"
+
+	# Note that every function needs to work both for a completely new deployment (no .hg yet) and for an existing install (.hg plus patchqueue + random mods)
+	#
+	[[ -d .hg ]] || fail "We expect our directory $PWD to be pre-mercurialized"
+
+	if [[ -d .hg/patches ]]; then
+		check_for_uncommitted_and_outgoing_patches # If redeploying, ensure patchqueue contains all local modifications
+	fi
+
+	patchqueue_pull_branches # Ensures all relevant branches are checked out in .hg/patches. This also leaves us with unapplied psatches
+	check_if_commit_possible
+	patchqueue_install_extensions
+	patchqueue_install_hooks            # Install comment-stripping hook to .hg/patches/.hg/hgrc
+	rebase_and_test_patchqueue_branches # Repeatedly rebase and test-apply the patchqueue.
+	#apply_guards_and_commit				# Tweak the hg queue guards, e.g. CVE patches that are version-specific.
+	tag_cleanapplying_branches
+	warn_if_local_patch_not_merged
+	[[ $nopush ]] || push_patches_upstream # Push all patchqueue mods upstream
+	apply_patchscripts					# Unless rebasing, we may not have applied the .hgpatchscript/* scripts that clean up permissions. Do so now
+	assert_state "" "$workingcopy"
+}
+
+usage() {
+	cat <<EOF
+$*
+Purpose 1: Check out and create a patch queue branch for our instance, $ATL_LONGNAME.
+Purpose 2: (with --rebase) Update all patch queue branches. Since upstream may have changed parameters, this includes regenerating the '_replacetokens' patch.
+Purpose 3: (with --gethash) Print a hash of all relevant patchqueue branches that would be applied. This is used for caching the result.
+
+
+Usage:
+atl_patchqueue [options]
+
+Options:
+	--rebase		Rebase to the latest deployment patches, rather than deploying to last-known-good tag
+	--commit		Store local mods in the $ATL_LONGNAME patch.
+	--gethash		Gets the upstream tip IDs of all patchqueue branches, and emits a unified hash
+	-h			Show this message
+
+Notes:
+	This is an internal utility script, used by atl_deploy. This cannot be safely run directly on a production app checkout, as it unapplies and re-applies patches, possibly leaving the app in a
+	broken state.  Expects a profile to be pre-loaded (run 'atl_profile load').
+
+EOF
+	# Exit code must be nonzero so caller (bin/atl_workingcopy) knows not to proceed
+	exit 1
+}
+
+# Gets the app in version control, with a correct .hgignore committed.
+# Precondition: in $workingcopy
+# Postcondition: patchqueue (if any) is unapplied
+# Postcondition: .hgignore is correct and committed
+[[ $(type -t mercurialize) = function ]] || mercurialize() {
+	fail "OLD MERCURIALIZE FUNCTION RUNNING. This should have been overridden by that in lib/appfetcher.sh"
+	if [[ ! -d .hg ]]; then
+		# A fresh install. Commit it in a clean mercurial repo
+		hg init
+		log "Creating hg repo .."
+		chronic hg commit --addremove -m "Clean $ATL_VER"
+	else
+		# Updating an existing install (within atl_workingcopy). Qpop any patches and update .hgignore
+		if [[ -d .hg/patches ]]; then
+			if ((${#excludes[@]} > 0)); then
+				log "Force-qpopping due to presence of ${excludes[*]} indicating non-clean repo"
+				hg -q qpop -af >/dev/null
+			else
+				hg -q qpop -a >/dev/null
+			fi
+		fi
+	fi
+}
+
+# Ensures that there are no files or modifications not in the patchqueue, and not pushed upstream.
+# Precondition: in $workingcopy
+check_for_uncommitted_and_outgoing_patches() {
+
+	assert_no_local_mods() {
+		assert_state "" "$workingcopy"
+
+		local statuscmd
+		statuscmd=(hg status)
+		if ((${#excludes[@]} > 0)); then
+			statuscmd+=("${excludes[@]}")
+		fi
+		local statusoutput
+		statusoutput=$("${statuscmd[@]}")
+		if [[ -n "$statusoutput" ]]; then
+			if [[ -v keep || -v commit ]]; then
+				local toppatch="$(hg -q qtop)"
+				if [[ $toppatch != _local ]]; then
+					if [[ $toppatch = _replacetokens ]]; then
+						if [[ -e .hg/patches/_local ]]; then
+							if [[ -s .hg/patches/_local ]]; then  # Exists and >0 bytes
+								fail "branch=$(hg branch --mq): Expected '_local' to be the top patch, not $toppatch. Maybe hg qpush -f? Strangely, .hg/patches/_local contains something. Fix this by hand."
+							else
+								fail "branch=$(hg branch --mq): Expected '_local' to be the top patch, not $toppatch. Maybe 'hg qpush -f'?'"
+							fi
+						else
+							fail "branch=$(hg branch --mq): Expected '_local' to be the top patch. Run 'hg qnew -f _local'"
+						fi
+					else
+						fail "branch=$(hg branch --mq): Expected '_local' to be the top patch, not '$(hg -q qtop)'. Fix by hand"
+					fi
+				fi
+				log "Committing mods to _local:\n$statusoutput."
+				if [[ -v commit ]]; then log "Mods will later be merged into $commitbranch/$commitpatch"; fi
+				hg -q qrefresh -m "$commitmsg" # This puts our changes in .hg/patches/_local, which is .hgignore'd so won't cause problems
+			else
+				error "You have uncommitted files in $PWD:\n$statusoutput\nTo merge into the $ATL_LONGNAME patch, rerun with '--commit' or '--commit=branch/patch'\nTo keep the changes till next reboot, re-run with '--keep'\nTo delete the mods:\n\tcda\n\thg update -C\n\thg clean"
+			fi
+		fi
+	}
+	assert_no_uncommitted_patches() {
+		assert_state "" "$workingcopy"
+		# https://stackoverflow.com/questions/2210403/testing-for-uncommitted-changes-in-mercurial
+		# We don't care if 'guards' is modified, as that indicates transient guards are applied, which shouldn't be in hg anyway
+		if [[ $(hg status --mq --exclude .hg/patches/guards 2>/dev/null) ]]; then
+			error "You have uncommitted patchqueue changes: $(hg status --mq).  Please 'cdan; hg diff --mq; hg commit --mq' before proceeding"
+		fi
+	}
+
+	assert_no_outgoing_and_incoming_patch_changes() {
+		assert_state "" "$workingcopy"
+		local modfiles
+		# We have the correct repo at least. Before pulling, check that there are no outgoing commits, as we really don't want to have to merge patches.
+		if modfiles=$(hg -q outgoing --mq -T '{files}') 2>&1; then
+			if [[ "$modfiles" =~ ^(\.hgtags)+$ ]]; then
+				debug "Only .hgtags have changed; ignoring/wiping"
+			else
+				debug "Pending outgoing patches; checking if any are incoming (which may conflict).."
+				# Don't quote - we do want these expanded
+				# shellcheck disable=SC2046
+				if hg -q incoming --mq $(hg -q branches --mq --template '--branch={branch} '); then
+					error "$workingcopy/.hg/patches has patches not pushed upstream. Please do this before continuing, otherwise there is a high likelihood of the incoming patches yielding multiple heads. Run cd $ATL_APPDIR/.hg/patches;  hg strip 'roots(outgoing())' to remove outgoing patches. See also: hg outgoing --no-merge -r 'file(\"set:!.hgtags\")'"
+				else
+					debug "..No incoming patches, we're fine to proceed"
+				fi
+			fi
+		fi
+	}
+	ensure_local_patch_not_in_versioncontrol() {
+		assert_state "" "$workingcopy"
+		# Normally this would exit nonzero, saying '_local: file is already untracked'
+		if hg --cwd .hg/patches forget _local; then
+			warn ".hg/patches/_local should not be committed to the patchqueue. It records local-only changes! Removing now"
+			if [[ -n "$(hg status _local)" ]]; then
+				# If 'forget' removed it from hg, commit that change.
+				# However it's possible the 'forget' just un-added it locally, in which case 'hg status' will return blank, and we don't need to do anything
+				hg --cwd .hg/patches commit -m "Remove incorrectly committed _local" _local
+			fi
+		fi
+	}
+
+	assert_no_local_mods
+	ensure_local_patch_not_in_versioncontrol
+	assert_no_uncommitted_patches
+	if patchqueue_using_correct_repo; then
+		assert_no_outgoing_and_incoming_patch_changes
+	fi
+}
+
+patchqueue_using_correct_repo() {
+	local PATCHREPO_FIRST_ID=8cb7f1cfefa6
+	assert_state "" "$workingcopy"
+	[[ $(hg -q id --mq -i -r0) = "$PATCHREPO_FIRST_ID" ]]
+}
+
+# Get string representing state of the .hg/patches Mercurial branches. Cf. getremotehash. This isn't actually used anywhere.
+gethash() (
+	[[ -d .hg/patches ]] || fail "Must be invoked in app directory (in $PWD, missing .hg/patches)"
+	branches_to_pull=(default "$ATL_PRODUCT" "$ATL_PRODUCT_FULL" "${ATL_PRODUCT_FULL}-${ATL_VER%+*}" "$ATL_LONGNAME" "$ATL_LONGNAME-$ATL_VER")
+	totalid="$(
+	    cd .hg/patches
+		for b in "${branches_to_pull[@]}"; do
+			echo -n " $b="
+			hg -q heads "$b" -T '{node|short}'
+		done
+	)"
+	log "The combined hash string is $totalid"
+	echo "${totalid:1}"	# Strip leading ' '
+)
+
+# Get string representing state of the .hg/patches Mercurial branches upstream. If differing from gethash(), either hg push or hg pull (or both) is needed.
+getremotehash() (
+	local b
+	[[ -d .hg/patches ]] || fail "Must be invoked in app directory (in $PWD, missing .hg/patches)"
+	cd .hg/patches
+	local id branches_to_pull
+	branches_to_pull=(default "$ATL_PRODUCT" "$ATL_PRODUCT_FULL" "${ATL_PRODUCT_FULL}-${ATL_VER%+*}" "$ATL_LONGNAME" "$ATL_LONGNAME-$ATL_VER")
+	totalid=
+	for b in "${branches_to_pull[@]}"; do
+		id="$(hg -q identify -r "$b" "$ATL_PATCHQUEUE_REPO" -T '{node|short}' || echo \"error-pulling-branch-\$b\")"
+		log "Branch $b has remote id $id"
+		totalid+=" $b"="$id"
+	done
+	echo "${totalid:1}"   # Strip leading ' '
+)
+
+# Ensures all relevant branches are pulled in .hg/patches
+# Precondition: in $workingcopy
+# Precondition: app in mercurial (.hg present). Patchqueue (.hg/patches) may or may not be present. If it is, patches are unapplied with no local mods
+# Postcondition: .hg/patches contains all relevant branches
+# Postcondition: patches unapplied
+# Postcondition: potentially no working copy
+patchqueue_pull_branches() {
+	if [[ -v rebase ]]; then
+		branches_to_pull=(default "$ATL_PRODUCT" "$ATL_PRODUCT_FULL" "${ATL_PRODUCT_FULL}-${ATL_VER%+*}" "$ATL_LONGNAME" "$ATL_LONGNAME-$ATL_VER")
+		if [[ -n ${ATL_PARENT_LONGNAME:-} ]]; then
+			branches_to_pull+=("$ATL_PARENT_LONGNAME")
+		fi
+	else
+		branches_to_pull=("$ATL_LONGNAME-$ATL_VER")
+	fi
+
+	assert_state "" "$workingcopy"
+	if [[ ! -d .hg/patches ]]; then
+		# We have no patchqueue yet. Clone and pull intermediate and leaf branches, if they exist.
+		hg clone -q --noupdate "$ATL_PATCHQUEUE_REPO" -b default .hg/patches || fail "Unable to clone from $ATL_PATCHQUEUE_REPO"
+		_pushd .hg/patches
+		# Note that if the ATL_LONGNAME branch was based on something other than $ATL_PRODUCT_FULL-$ATL_VER, then that branch is also pulled
+	else
+		patchqueue_using_correct_repo || error "$workingcopy/.hg/patches is not from the checkout source we expect: $(hg paths)"
+		_pushd .hg/patches
+
+		if grep -qF "default = $ATL_PATCHQUEUE_REPO" .hg/hgrc; then
+			#log "We're good, $PWD/.hg/hgrc contains $ATL_PATCHQUEUE_REPO"
+			:
+		else
+			perl -i -pe 's,^default = .*,default = '"$ATL_PATCHQUEUE_REPO"',g' .hg/hgrc
+			log "Replaced global atl_app_patchqueue with $ATL_PATCHQUEUE_REPO in $PWD/.hg/hgrc"
+		fi
+		# We used to pull every branch present, which is wasteful as there are normally branches from past versions ('jira-6.3.3' etc). Let's hope there wasn't a good reason for doing so (perhaps nonstandard customer-specific branches?).
+		# Why pull ANY beyond what we specify above?
+		#branches_to_pull+=($(hg -q branches))
+		# We have an unknown set of branches. 'hg pull' them, but not *all* branches as most aren't relevant to us.
+	fi
+	log "Pulling ${branches_to_pull[*]} ..."
+	# Sadly we can't pull all branches at once, because we might be upgrading so the $ATL_PRODUCT_FULL-$ATL_VER branch won't exist.
+	# There isn't a way to test if a branch exists on the server other than trying to pull it.
+	# We still need to distinguish between 'pull failed because branch does not exist' and 'pull failed because <corrupt repo/network error/whatever>', so we wrap the pull in a 'while' to test for known error responses.
+	for b in "${branches_to_pull[@]}"; do
+		# This never fails so let's not contribute to log spam.
+		log "Pulling $b .."
+		if [[ $b = default ]]; then
+			# We know 'default' will exist. Pull it without the '|| true' so that if our repo connection is broken, we fail
+			hg -q pull -b "$b"
+		else
+			while read -r pullresult; do
+				if [[ $pullresult =~ 'abort: unknown branch' ]]; then
+					warn "Failed to pull branch '$b': $pullresult"
+				fi
+			done < <(hg -q pull -b "$b" 2>&1)
+		fi
+		# What was this sleep here for??
+		#sleep 0.1
+	done
+	wait
+	hg -q update default # On Aty I found it's possible for the .hg/patches repo to be checked out to a nonexistent branch. Update to default, which we know exists
+
+	# At this point we know .hg/patches has updated relevant branches, and no patches are applied. We don't know what patch branch is currently active.
+	headcount=$(
+		set -o pipefail
+		hg heads "$(hg -q branch)" -T'{rev}\n' | wc -l
+	)
+	if [[ $headcount = 2 ]]; then
+		warn "Patchqueue branch $(hg -q branch) has $headcount heads! This should only happen if you explicitly pushed a commit onto a branch, e.g. for a -compat- tag on an old version"
+		#jlog "Merging 2 heads.."
+		#hg merge	# We rely on nonzero exit code if the merge fails
+		#hg commit -m Merge
+	fi
+	#let headcount=$(set -o pipefail; hg heads "$(hg -q branch)" -T'{rev}\n' | wc -l)
+	#if [[ $(hg -q branch) != default && $headcount -gt 1 ]]; then
+	#	error "Updating patchqueue branch '$(hg branch)' has resulted in multiple heads, which will need to be merged. This should not normally happen unless e.g. upstream created a file with the same name as one created locally. Please 'cd $PWD; hg merge; hg commit -m \"Merge multiple heads\"."
+	#fi
+	_popd
+}
+
+check_if_commit_possible() {
+	assert_state "" "$workingcopy"
+
+	if [[ -v commit ]]; then
+		# This is normal if _local is committed in an earlier branch
+		#[[ -s .hg/patches/_local ]] || fail "Asked to --commit, but there is nothing in the _local patch to commit"
+		if [[ $commitbranch = default && $ATL_PRODUCT != jira ]]; then
+			fail "Asked to --commit to branch '$commitbranch', but this can only be done deploying Jira, not $ATL_PRODUCT."
+		fi
+		_pushd .hg/patches
+		#hg up "$commitbranch" || fail "Asked to --commit to branch '$commitbranch', but this branch isn't checked out for '$ATL_PRODUCT' deployments."
+		# Can't do this here, because we may not have $commitbranch
+		#if branch_already_validated_against_later_version "$commitbranch"; then
+		#	fail "Asked to --commit to branch '$commitbranch', but our version ($ATL_VER) is older than the version '$commitbranch' was last validated against. That means '$commitbranch' won't be test-applied here, and so we can't --commit to it. Your best option is to --keep the patch, copy .hg/patches/_local to wherever the latest version is deployed (a staging instance?) and --commit=$commitbranch/commitpatch it there, where it can be tested."
+		#else
+		#	: # Good to go - we have $commitbranch checked out
+		#fi
+		_popd
+	fi
+}
+
+patchqueue_install_extensions() {
+	assert_state "" "$workingcopy"
+	if [[ ! -f .hg/hgrc ]] || ! grep -qF "^mq =" .hg/hgrc; then
+		log "Enabling mq extension in $PWD/.hg/hgrc"
+		echo -e "[extensions]\nmq = " >>.hg/hgrc
+	fi
+}
+# Install some hg hooks in .hg/patches/.hghooks
+patchqueue_install_hooks() {
+	install_hgpatchscript_hook() {
+		assert_state "" "$workingcopy"
+		# The patchscript hook applies .hgpatchscript/* ACLs on each queue operation. Used e.g. to grant nagios access to nagios/
+		# Note .hg/hgrc won't exist on a cleanly created hg repo
+		if [[ ! -f .hg/hgrc ]] || ! grep -qF "$ATL_MANAGE/.hghooks/hgpatchscript" .hg/hgrc; then
+			log "Installing patchscript hook in $PWD/.hg/hgrc"
+			echo -e "[hooks]\ncommit = $ATL_MANAGE/.hghooks/hgpatchscript" >>.hg/hgrc
+		fi
+		# This will be done naturally in later stages as we apply the patches
+		#hg -q qseries | while read -r f; do
+		#	if [[ -f .hgpatchscript/$f ]]; then
+		#		. .hgpatchscript/"$f"
+		#	fi
+		#done
+	}
+	install_revstrip_hook() {
+		assert_state "" "$workingcopy"
+		_pushd ".hg/patches"
+		# We used to have an inferior version of this perl command lacking the 'undef'. Remove it. FIXME
+		precommitstr='precommit.strip_parent_revisions = perl -i -pe '"'"'BEGIN{undef $/;} s,^(?<=# HG changeset patch\n)# Parent [^\n]*\n*$,,sgm'"' *"
+		[[ -f .hg/hgrc ]] || fail "No .hg/hgrc"
+		if ! grep -qF "$precommitstr" .hg/hgrc; then
+			if grep -qF "precommit.strip_parent_revisions " .hg/hgrc; then
+				warn "Detected old version of precommit.strip_parent_revisions patchqueue hook. Deleting"
+				sleep 3
+				newhgrc=$(mktemp)
+				grep -vqF "precommit.strip_parent_revisions " .hg/hgrc >"$newhgrc"
+				log "Original hgrc: $(cat .hg/hgrc)"
+				log "New .hgrc: $(cat "$newhgrc")"
+				cat "$newhgrc" >.hg/hgrc
+				rm "$newhgrc"
+			fi
+			log "Installing .hghooks hook in $PWD/.hg/hgrc"
+			{
+				echo "[hooks]"
+				echo "# mq patches usually have a '# Parent <commit>' line, recording the commit of their parent repo just before the patch is applied."
+				echo "# This is normally harmless, but in our case the underlying repo is created from scratch on every deployment. This means the commit IDs are different "
+				echo "# every time, and 'hg qrefresh' modifies the '# Parent <commit>' line. These patch changes are annoying, because .hg/patches is itself a repo with branches"
+				echo "# that get rebased (e.g. 'default' -> 'jira'), and the different '# Parent <commit>' lines cause merge conflicts."
+				echo "# We solve that problem by stripping all '# Parent ' lines from patches just before every commit."
+				echo
+				echo "$precommitstr"
+			} >>.hg/hgrc
+		fi
+		_popd
+	}
+
+	install_revstrip_hook
+	install_hgpatchscript_hook
+}
+
+warn_if_local_patch_not_merged() {
+	assert_state "" "$workingcopy"
+	if [[ -v commit ]] && local_patches; then
+		fail "You asked to --commit changes to $commitbranch/$commitpatch, but it didn't happen, perhaps because we didn't encounter branch '$commitbranch' during our rebase"
+	fi
+}
+
+# Store branch tip revisions that apply cleanly, so they can be tagged with the app version ($branch-compat-$ATL_VER)
+declare -x cleanly_applying_revisions=()
+
+cleanapplying_revision_remove() {
+	assert_state "" "$workingcopy/.hg/patches"
+	# Here we remove the soon-to-be-invalidated revision, and it will be re-added after the commit.
+	local myrev
+	myrev=$(hg -q id)
+	myrev=${myrev%+}
+	#log "Replacing a soon-to-be-invalid revid. Before: ${cleanly_applying_revisions[@]} and our rev is ${myrev}"
+	if [[ ${#cleanly_applying_revisions[@]} -gt 0 && $myrev = "${cleanly_applying_revisions[0]}" ]]; then
+		cleanly_applying_revisions=("${cleanly_applying_revisions[@]:1}")
+	fi
+}
+
+cleanapplying_revision_add() {
+	assert_state "" "$workingcopy/.hg/patches"
+	# Having just committed, record our mq revision in the cleanly_applying_revisions list.
+	local _branch
+	_branch=$(hg -q branch)
+	local myrev
+	myrev=$(hg -q id)
+	log "$_branch will be tagged -compat- at $myrev"
+	myrev="${myrev%+}"                                                     # 'hg id' displays a shortened hash ending with '+' to indicate 'more chars'. Strip the +.
+	cleanly_applying_revisions=($myrev ${cleanly_applying_revisions[@]:-}) # Put more specific branch IDs first, so that $ATL_LONGNAME branch's will be processed first later, which is where the checkout is anyway
+}
+
+# Given $workingcopy/.hg/patches has some subset of the correct branches ('default', '$app', '$app-$ver', '$ATL_PARENT_LONGNAME', '$ATL_LONGNAME'), this function creates or updates any missing branches.
+# For instance, if new version $ver is deployed, then new branch '$app-$ver' will be branched off '$app'. If new instance $ATL_LONGNAME is deployed, '$ATL_LONGNAME' will be branched off '$app-$ver'
+# If a branch already exists, then:
+# If --rebase is given ($rebase = true), the contents of the 'upper' branch will be merged into it. E.g. 'default' merged into '$app', '$app' merged into '$app-$ver', and '$app-$ver' merged into '$ATL_LONGNAME'.
+# If --rebase is NOT given, then no branch merging takes place. The '$ATL_LONGNAME' patch is updated to a '$ATL_LONGNAME-$ver' tag, assumed to have been set on last successful --rebase
+#
+# Whether or not --rebase is given, each branch (except '$app') is experimentally applied against the repo to test for validity.
+rebase_and_test_patchqueue_branches() {
+	rebase_and_test() {
+		assert_state "" "$workingcopy"
+		# These two files (used to be?) committed to the root repo, and then get deleted during runtime, which then breaks qpop. Restore them just in case.
+		hg rev -C temp/README.txt temp/safeToDelete.tmp &>/dev/null || :
+		hg -q qpop -a
+		_pushd .hg/patches
+		error_if_staging_without_parent_branch
+		assert_no_modified_guards
+
+		if [[ -v rebase ]]; then
+			# E.g. 'jira', 'jira-servicedesk', 'jira-servicedesk-4.1.0', 'servicedesk.redradishtech.com'
+			# Hack to eliminate duplicates (e.g. ATL_PRODUCT = ATL_PRODUCT_FULL = confluence). https://unix.stackexchange.com/a/167194
+			branches=(default "$ATL_PRODUCT" "$ATL_PRODUCT_FULL" "${ATL_PRODUCT_FULL}-${ATL_VER%+*}" ${ATL_PARENT_LONGNAME:-} "${ATL_LONGNAME}" "$ATL_LONGNAME-$ATL_VER")
+			IFS=" " read -r -a branches <<<"$(echo ${branches[@]} | tr ' ' '\n' | uniq | tr '\n' ' ')"   # Eliminate dups like 'confluence'
+			log "Now iterating through branches ${branches[@]}"
+			for branch in "${branches[@]}"; do
+				log "Considering branch $branch (prevbranch ${prevbranch:-})"
+				if branch_exists "$branch"; then
+					log "Updating existing branch: $branch"
+					hg -q up "$branch"
+
+					assert_local_patch_is_present_only_in_final_branches
+
+					local changelog # Will be set in 'mergebranches'
+					if [[ $branch == default ]]; then
+						if [[ ${commitbranch:-} == default ]]; then
+							if [[ $ATL_PRODUCT == jira ]]; then
+								# If we just --commit'ed a change to default/something, and we're patching Jira (which 'default' should apply to), so reapply the patchqueue to incorporate our patch
+								apply_and_commit_patchqueue "$commitmsg"
+							fi
+						else
+							: # Normally we do nothing with the 'default' branch.
+						fi
+					elif [[ $branch == "$ATL_LONGNAME-$ATL_VER" ]]; then
+
+						mergebranches "$prevbranch" "$branch" || true
+						# Incorporate CVE patches
+						_pushd "$workingcopy"
+						# Note that at this point, @tokens@ aren't replaced. The install-pre event is thus only useful for setting/unsetting patch guards. We also hardcode the path to $ATL_MANAGE/bin/atl_event as $ATL_APPDIR/bin/atl_event is broken
+						"$ATL_MANAGE"/bin/atl_event install-pre
+						_popd
+						# Even if merging resulted in no changes, and install-pre no new patches, we want to test-apply in case %{ATL} vars changed
+						apply_and_commit_patchqueue "%{ATL} var changes"
+
+					elif mergebranches "$prevbranch" "$branch"; then
+						log "Changes were merged from branch '$prevbranch' to '$branch', and we are not exempt from test-applying $branch, so doing that now"
+						log "Now testing if '$branch' branch (just rebased on $prevbranch) applies cleanly to $ATL_VER"
+						apply_and_commit_patchqueue "$changelog"
+
+					elif [[ ${commitbranch:-} = "$branch" ]]; then
+						# mergebranches (in previous elif) returned false, meaning no changes were inherited from our parent branch. Normally we wouldn't bother test-applying
+						# but if the user --commit'ed to this branch then we must, just to merge in the _local patch.
+						log "Committing changes to branch '$branch', patch $commitpatch"
+						apply_and_commit_patchqueue "$commitmsg"
+					else
+						log "No need to validate"
+					fi
+				else
+					createbranch "$prevbranch" "$branch"
+					transfer_patches_from_old_repo "$branch"
+					if [[ $branch == "$ATL_LONGNAME-$ATL_VER" ]]; then
+						# Incorporate CVE patches
+						_pushd "$workingcopy"
+						"$ATL_MANAGE"/bin/atl_event install-pre
+						_popd
+					fi
+					apply_and_commit_patchqueue "New branch"
+					assert_state "" "$workingcopy/.hg/patches"
+					# This is not true for intermediate branches like jira-software-8.13.0:
+					#[[ $(tail -1 series) == _local ]] || error "Top patch on branch $branch is expected to be _local"
+				fi
+
+				[[ -z $(hg prompt '{status|modified}') ]] || fail "Just updated $branch${prevbranch+ after merging $prevbranch}, and our hg patches are modified"
+				prevbranch=$branch
+			done
+		else
+			update_to_tag "$ATL_LONGNAME-${ATL_VER}"
+			apply_and_commit_patchqueue "Changed ATL vars"
+		fi
+		assert_state "" "$workingcopy/.hg/patches"
+		# We qpop -a'd earlier
+		# We are on '$ATL_LONGNAME' branch, possibly at a tag (no --rebase). Reapply patches to regenerate _replacetokens.
+		apply_and_commit_patchqueue "Changed ATL vars"
+		_popd
+		assert_state "" "$workingcopy"
+	}
+
+	assert_local_patch_is_present_only_in_final_branches() {
+		add_missing_series() {
+			warn "Missing _local patch in $branch branch. Adding it now"
+			echo _local >>series
+			hg ci -m "Add missing _series" series
+		}
+		# Temporary hack: ensure _local is present in the final branch and --commit branch, and *not* present elsewhere
+		assert_state "" "$workingcopy/.hg/patches"
+		case "$branch" in
+			"$ATL_LONGNAME-$ATL_VER")
+				if [[ -v ATL_PARENT_LONGNAME ]]; then
+					grep -qF _local series || {
+						warn "Missing _local patch in $branch branch. _local should be present in the parent branch $ATL_PARENT_LONGNAME, so please merge that into $ATL_LONGNAME manually"
+											shellout_allowing_only_rejects_afterwards || return $?
+										}
+									else
+										grep -qF _local series || add_missing_series
+				fi
+				;;
+
+		${ATL_PARENT_LONGNAME:-}-$ATL_VER)
+			grep -qF _local series || add_missing_series
+			;;
+
+		"${commitbranch:-}")
+			# We're committing to 'jira' or some non-terminal branch. _local should not be present
+			if grep -qF _local series; then
+				fail "_local patch should not be present in branch $branch. This needs to be fixed manually."
+			fi
+			;;
+		*)
+			if grep -qF _local series; then
+				fail "_local patch should not be present in branch $branch"
+			fi
+			;;
+		esac
+	}
+
+	error_if_applied_patches() {
+		assert_state "" "$workingcopy"
+		assert_patches_not_applied
+	}
+	error_if_staging_without_parent_branch() {
+		assert_state "" "$workingcopy/.hg/patches"
+		if [[ $ATL_LONGNAME =~ .*(staging|stage|sandbox) ]] && [[ -z ${ATL_PARENT_LONGNAME:-} ]]; then
+			error "You appear to be deploying a ${BASH_REMATCH[1]} instance. The patches for a sandbox/staging instance should be stored in a hg branch branched off a production branch. Please specify the production branch in the ATL_PARENT_LONGNAME variable in $ATL_PROFILEDIR/$ATL_SHORTNAME. Then rerun this script, which will create a '$ATL_LONGNAME' branch derived from it."
+		fi
+
+	}
+	assert_no_modified_guards() {
+		# We will probably have all sorts of transient guards applied ('staging', `uname -n`), plus a few permanent ones ('javamelody').
+		# We need to discard the transient guards (we certainly don't want to commit patches altered to accommodate them), but keep permanent guards.
+		# Permanent guards are assumed to be checked in.
+		# So here we revert to the checked-in guards.
+		# 20/Aug/19 Update: we no longer have 'transient' guards. Guards
+		assert_state "" "$workingcopy/.hg/patches"
+		if [[ $("$ATL_MANAGE/venv/bin/hg" status guards) =~ ^M ]]; then
+			# We probably have transient guards like 'prod' or `uname -n` applied. Undo changes to give just the required guards checked in
+			# 2/Sep/20: I haven't seen this error trigger in a long time. Get rid of it?
+			error "Unexpected situation: we have 'transient' guards $(hg diff guards). Shouldn't they all be checked into the mq repo??"
+			hg revert -C guards
+		fi
+	}
+
+	## After (possibly) merging, test that our branch applies cleanly by qpush'ing all patches
+	# Leaves patches applied
+	apply_and_commit_patchqueue() {
+		local commitmsg="$1" # Only our caller knows why our patches changed and need reapplying (merged branch? new branch? updated ATL vars?), so let the caller set the commit message
+		# FIXME: when --commit'ing a patch *previously* stored in _local (with --keep), the correct log message is the description of the _local patch.
+		# Ideally we would extract the correct log message (apply_patchqueue sees it) and use it instead of demanding a --message from the user at commit time.
+		# But this code is already spaghetti-like enough without that
+		assert_state "" "$workingcopy/.hg/patches"
+
+		local branch
+		branch=$(hg -q branch)
+		if branch_already_validated_against_later_version "$branch"; then
+			if [[ $branch = "$ATL_LONGNAME-$ATL_VER" ]]; then
+				fail "Our branch '$branch' has a -compat- tag indicating our branch was tagged for compatibility with a later version than $ATL_VER. This should never happen."
+			else
+				true # Do not remove this apparently pointless 'true' statement. Removing it will the 'return' to fail. NFI idea why.
+				# In other cases 'apply_patchqueue refresh', which does the same check, will simply 'return' without test-applying $branch patches if it is compatible with a later version
+
+			fi
+		fi
+
+		local oldguards
+		oldguards="$(mktemp)"
+		if [[ -f guards ]]; then
+			cp guards "$oldguards"
+		fi
+		_pushd "$workingcopy"
+		hg -q qpop -a # Needed if we're not the first 'validation' - previous runs will have left patches applied.
+		#hg qpush -a &>/dev/null | (grep -v led-icons || :) || {
+
+		apply_patchqueue refresh
+		_popd # back in .hg/patches
+
+		if [[ -f guards ]] && ! diff "$oldguards" guards; then
+			echo "Guards protecting patches changed (see diff above)"
+			read -p "Is this correct? (Y/n) " -n 1 -r
+			if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+				fail "Please fix manually"
+			fi
+		fi
+		rm -f "$oldguards"
+
+		#hg -q qpop -a | (grep -v led-icons || :)
+		if [[ -n $(hg prompt '{status|modified}') ]]; then
+			# https://stackoverflow.com/questions/3982111/hg-post-merge-commit-message-best-practice
+			hg -q commit -m "${commitmsg}"
+			log "Committed: $commitmsg"
+		else
+			log "Reapplying patchqueue required no patch modifications."
+		fi
+
+		cleanapplying_revision_add
+	}
+
+	branch_exists() {
+		hg branches -q | grep "^$1$" >/dev/null
+	}
+
+	# Within a .hg/patches directory, merge $1 (parent) branch changes into $2 (child) and, if successful, commit the result, leaving us in $2 (child) branch.
+	# Doesn't expect the caller to put us on the correct branch, and doesn't guarantee to leave us on the child branch
+	# Returns 1 if a merge was performed, 0 otherwise
+	mergebranches() {
+		local parent="$1"
+		local child="$2"
+		local childrev
+
+		assert_state "" "$workingcopy/.hg/patches"
+
+		childrev="$(hg branches | awk "/^$child / {print \$2}")" # E.g. '2012:a23eea04594b' in hg 5.3.x. I think in earlier versions we just got one part or the other, which is why..
+		# Get just the id part
+		childrev="${childrev#*:}"
+		log "Checking for changes: $parent → $child"
+		changelog=$(hg -q log -r 0::"$parent" --prune "$childrev" --template "[$parent → $child] {join(splitlines(desc), ' ')}. {diffstat} files: {join(files, ', ')}\n" | grep -v '→.*→' || true)
+		# Avoid breaking with too-long lines. Encountered when branching dev.easyjethro.com.au off easyjethro.com.au
+		if (( ${#changelog} > 1000 )); then changelog="Merged $parent into $child"; fi
+		local exitcode=$?
+		((exitcode == 0)) || error "$exitcode: Getting the changelog between $parent and $child failed (childrev=$childrev)"
+		if [[ -n $changelog ]]; then
+			# We now want to switch to the $child branch.
+			# In the past, we foolishly tagged $parent with a tag called '$child'. As a result, a simple 'hg up $child' may put us on the tag, not the branch.
+			# The tag has since been removed, but for safety we use this convoluted code to figure out the real ID of the branch, and update to it
+			hg -q up -r "$childrev"
+			assert_on_branch "$child"
+			# https://www.mercurial-scm.org/repo/hg/help/merge-tools
+			# https://stackoverflow.com/questions/9782383/how-to-automatically-merge-hgtags-in-mercurial/26012910#26012910
+			log "We're in branch $(hg branch), about to merge $parent, because apparently we have changes: $changelog"
+			if branch_already_validated_against_later_version "$child"; then
+				LOG "[$parent → $child] Note that our to-be-merged parent '$parent' is compatible with a LATER VERSION than our branch ('$child')'. That means you should carefully cherry-pick real changes, and don't copy line numbers, or $child will become no-longer-compatible with $ATL_VER. When in doubt, just :wqa to use the current file"
+			else
+				log "[$parent → $child] Feel free to transfer all mods from '$parent' to '$child'."
+			fi
+			# FIXME: we probably don't care about $base, and can remove it
+			#if hg -q merge "$parent" --config merge-patterns..hgtags=internal:tagmerge --config 'merge-tools.vimdiff.args'='$local $other -c "redraw | echomsg \"Merging parent '"$parent"' into '"$child"'\""'
+
+			#vimdiff.args = -f -d $output -M $local $base $other -c "wincmd J" -c "set modifiable" -c "set write"
+
+			if hg -q merge "$parent" --config merge-patterns..hgtags=internal:tagmerge --config 'merge-tools.vimdiff.args'='-f -d $output $other -c "redraw | echomsg \"Merging parent '"$parent"' into '"$child"'\""'; then
+				log "Commmitting successfully merged changes from '$parent' into '$child'"
+				hg ci -m -
+			else
+				if [[ -z "$(hg diff .hgtags)" ]]; then
+					# output is something like:
+					#resolving manifests
+					#getting webserver-apache
+					#merging .hgtags
+					#automatic .hgtags merge failed
+					#the following 1 tags are in conflict: jira-software-8.20.10-compat-8.20.10
+					#automatic tag merging of .hgtags failed! (use 'hg resolve --tool :merge' or another merge tool of your choice)
+					#1 files updated, 0 files merged, 0 files removed, 1 files unresolved
+					#use 'hg resolve' to retry unresolved file merges or 'hg merge --abort' to abandon
+					# The internal:tagmerge algorithm appears to have a bug where if a tag is listed in .hgtags and exists 'internally' in the HG database, the merge 'fails' despite no changes being needed to .hgtags.
+					log ".hgtags merge failed, but no .hgtags change is actually needed. Continuing.."
+					hg resolve --mark .hgtags
+					# Did resolving .hgtags fix the problem? This grepping is ugly but I can't find any revsetty way to find the equivalent info
+					hg -q status | grep -q 'No unresolved merge conflicts' || hg resolve --tool=vimdiff --all || {
+						warn "hg resolve --all failed. Please fix in subshell, and conclude with 'hg resolve --all'"
+						shellout_allowing_only_rejects_afterwards || return $?
+					}
+					hg ci -m -
+					if hg -q status | grep -q 'No unresolved merge conflicts'; then
+						hg commit -m -
+					fi
+				else
+					# Change from warn to error, since 'exit 1' in bash leaves us here and we want to abort.
+					error "Merging $parent into $child failed (exit code $?). PLEASE CHECK THAT $parent IS THE RIGHT PARENT OF $child BEFORE ATTEMPTING TO FIX. If not, abort this and manually merge the correct parent into $child'."
+					exit 1
+					#					if [[ $prevbranch = "$ATL_PRODUCT" ]]; then
+					#						warn "When merging '$prevbranch', favour '$branch' formatting. Merge in functional changes, not formatting"
+					#					fi
+					#					warn "Here are the parent branches of '$child': $(hg -q log -r 'parents(branch(.))' -T '{branch}\n' | sort | uniq)"
+					#					warn "A 3-pane diff will now come up:"
+					#					log "\tLEFT:   new merged $child"
+					#					log "\tMIDDLE: $parent"
+					#					log "\tRIGHT:  old $child"
+					#					log "\tSee what changed in the middle ($parent) vs. the right (old $child), and apply to left (new $child)"
+					#					log "\tBe very careful, if adding/removing lines, to +/- the @@ line"
+					#					set -o pipefail
+					#					#hg resolve --debug --all || error "hg resolve --all failed. To fix 'cd $PWD; hg resolve --all'"
+					#					hg resolve --tool=vimdiff --all || {
+					#						warn "hg resolve --all failed. Please fix in subshell, and conclude with 'hg resolve --all'"
+					#						shellout_allowing_only_rejects_afterwards || return $?
+					#					}
+					#					hg ci -m -
+				fi
+			fi
+			if hg resolve -l | grep -q '^U'; then
+				fail "Auto-merge of $parent → $child failed. Files marked 'U' are unresolved: $(hg resolve -l)."
+			fi
+			log "We just merged $parent into $child, and are on $child branch. Merged changes: $(echo $'\n> ')$changelog"
+			# Note that our -compat- tag will be invalid at this point. That is okay - later
+			return 0
+		else
+			log "\tNo changes: $parent → $child"
+			changelog="-"
+			return 1
+		fi
+	}
+
+	createbranch() {
+		rename_application_patch() {
+			assert_state "" "$workingcopy"
+			local branch
+			branch="$(hg -q branch --mq)"
+			if [[ $branch = "${ATL_PARENT_LONGNAME:-}" ]]; then
+				if hg -q qseries | grep -qx "%{ATL_LONGNAME}"; then
+					hg qrename "%{ATL_LONGNAME}" "$ATL_PARENT_LONGNAME"
+				elif hg -q qseries | grep -qx "${ATL_PARENT_LONGNAME}"; then
+					error "Error: Branch $branch newly forked off $prevbranch already has a $ATL_PARENT_LONGNAME patch??"
+				else
+					error "Error: on parent $branch branch, but have neither %{ATL_LONGNAME} not ATL_PARENT_LONGNAME ('$ATL_PARENT_LONGNAME') patch"
+				fi
+			elif [[ $branch = "${ATL_LONGNAME}" ]]; then
+				if [[ -n ${ATL_PARENT_LONGNAME:-} ]]; then
+					[[ $prevbranch = "$ATL_PARENT_LONGNAME" ]] || error "Error: our $branch branch was not branched off $ATL_PARENT_LONGNAME as expected, but rather off $prevbranch"
+					if hg -q qseries | grep -qx "%{ATL_LONGNAME}"; then
+						: # The simplest case - a reusable tokenized patchfile
+					elif hg -q qseries | grep -qx "$ATL_PARENT_LONGNAME"; then
+						hg qrename "$ATL_PARENT_LONGNAME" "$ATL_LONGNAME"
+					else
+						error "Our $branch branch was branched off $ATL_PARENT_LONGNAME, but somehow lacks a $ATL_PARENT_LONGNAME patch"
+					fi
+				fi
+			fi
+		}
+
+		create_local_patch() {
+			assert_state "" "$workingcopy"
+			local branch
+			branch="$(hg -q branch --mq)"
+			if grep -q _local .hg/patches/series; then
+				if [[ $branch = "$ATL_LONGNAME-$ATL_VER" || -v ATL_PARENT_LONGNAME ]]; then
+					: # Having a _local would only make sense if we're branching off a app branch, not an intermediate branch
+				else
+					fail "Branch '$branch' unexpectedly already has a _local patch"
+				fi
+			elif [[ $branch = "${ATL_PARENT_LONGNAME:-}" || $branch = "$ATL_LONGNAME" || $branch = "$ATL_LONGNAME-$ATL_VER" ]]; then
+				log "Creating a _local patch for branch $branch"
+				echo _local >>.hg/patches/series
+			fi
+		}
+
+		local prevbranch="$1"
+		local branch="$2"
+		assert_state "" "$workingcopy/.hg/patches"
+		assert_on_branch "$prevbranch"
+		log "Creating branch '$branch' off $prevbranch"
+		hg branch -f "$branch" # This implicitly switches us to the branch too
+		_pushd "$workingcopy"
+		rename_application_patch
+		create_local_patch
+		# We need to commit even if there are no apparent changes, otherwise the next 'hg update' step breaks with:
+		# abort: uncommitted changes
+		# (commit or update --clean to discard changes)
+		hg ci --mq -m "New branch '$branch' created from '$prevbranch'"
+		if [[ -v ATL_PARENT_LONGNAME ]] && grep -F "$ATL_PARENT_LONGNAME" .hg/patches/*; then
+
+			warn "Some lines in the applied patches (listed above) reference the parent '$ATL_PARENT_LONGNAME' instead of $ATL_LONGNAME. This may not be a problem e.g. if in comments. Make sure parent hasn't harcoded the name, e.g. uses .hgpatchscript/%{ATL_LONGNAME}"
+		fi
+		_popd
+	}
+
+	# Suspect this is dead code. If the fail() hasn't triggered for a while, delete it
+	transfer_patches_from_old_repo() {
+		local branch="$1"
+		assert_state "" "$workingcopy/.hg/patches"
+		assert_on_branch "$branch"
+		[[ -z $(hg prompt '{status|modified}') ]] || fail "Just updated $branch${prevbranch+ after merging $prevbranch}, and our hg patches are modified"
+		if [[ -d ../patches-oldrepo ]]; then
+			fail "$PWD/../patches-oldrepo exists!! Where did it come from?"
+			cd ../..
+			hg qpop -a
+			[[ -z $(hg prompt '{status|modified}') ]] || fail "Just updated $branch${prevbranch+ after merging $prevbranch}, and our hg patches are modified"
+			cd .hg/patches-oldrepo
+			hg up "$branch"
+			[[ -z $(hg prompt '{status|modified}') ]] || fail "Just updated $branch${prevbranch+ after merging $prevbranch}, and our hg patches are modified"
+			cd ../patches
+			log "Copying changes from old repo.."
+			if [[ $ATL_PRODUCT = jira ]]; then
+				rsync -ra ../patches-oldrepo/ . --delete --exclude=.hgtags --exclude=.hg
+			else
+				rsync -ra ../patches-oldrepo/ . --delete --exclude=.hgtags --exclude=.hg --exclude=cve-2019*
+			fi
+			hg status
+		fi
+		# Only commit if oldrepo changed from new (otherwise hg ci fails)
+		[[ -z $(hg prompt '{status|modified}') ]] || hg ci --addremove -m "Patches from old repo"
+
+	}
+
+	update_to_tag() {
+		local branch="$1"
+		# First try to update to a stable versioned tag.
+		# tagname="$branch-compat-${ATL_VER%+*}"
+		local tagname="$branch-compat-${ATL_VER%+*}"
+		tagexists "$tagname" || error "Branch '$branch' has not been updated to work with ${ATL_VER} (no '$tagname' tag). Run with '--rebase' to update / test our branch's patchqueue."
+		log "Setting '$branch' branch to static tag '$tagname'"
+		hg -q up "$tagname"
+		assert_on_branch "$branch"
+	}
+
+	rebase_and_test
+}
+## Re-evaluate which mq guards need applying (like version-specific CVE mitigations), test-apply the results and commit if needed.
+apply_guards_and_commit() {
+	assert_state "" "$workingcopy"
+	if [[ -n $(hg prompt '{status|modified}') ]]; then
+		error "Boo, we do not expect to find unapplied mods in patches here. We have just mergeupdated all relevant branches (or in the case of '$ATL_LONGNAME' branch, updated to a static tag if --rebase wasn't specified), and should have committed any merge changes."
+	fi
+	log "Triggering 'install-pre' event to potentially update patchqueue guards.."
+	# Trigger install-pre event, which will tweak .hg/patches/guards to enable/disable certain patches, like version-dependent CVEs.
+	# FIXME: won't this change the production copy, not $workingcopy?
+	cp .hg/patches/guards{,.pre}
+	"$ATL_MANAGE"/bin/atl_event install-pre
+	local guarddiff
+	if guarddiff=$(diff .hg/patches/guards{.pre,}); then
+		rm .hg/patches/guards.pre
+		log "'install-pre' event did not change patch guards. Not reapplying"
+		return
+	else
+		#### FIXME infrequently used code path. Make sure it works
+		log "'install-pre' event change guards: $guarddiff. Reapplying patches"
+		rm .hg/patches/guards.pre
+	fi
+	reapply_patchqueue # Our .hg/patches/guards might have changed; reapply patches (no commit)
+
+	_pushd .hg/patches
+	# Did our .hg/patches/guards change? Say we're on jira 7.13.1, for which .hg/patches/cve-2019-15001 should apply. On first 'atl_install --rebase' the install-pre event will add 'cve-2019-15001' to .hg/patches/guards, which is then committed later in this function. On subsequent installs .hg/patches/guards won't change. If we later add another mitigation for another CVE in 7.13.1, then even if --rebase wasn't specified, our .hg/patches/guards will change.
+	if [[ -n $(hg prompt '{status|modified}') ]]; then
+		if [[ ${rebase:-} ]]; then
+			error "'install-pre' event changed guards, resulted in modified patches ($(hg -q status)) (perhaps just the guard file)"
+		else
+			log "'install-pre' event changed guards, resulted in modified patches ($(hg -q status)) (perhaps just the guard file)"
+		fi
+		cleanapplying_revision_remove # If we had previously merge-applied more abstract branches and noted new revisions for $branch-$ver tagging, remove the last rev (our branch's) in anticipation of our commit changing it. We will record the new rev id below.
+		hg commit -m "Mods resulting from guards."
+		cleanapplying_revision_add # Mark our revision ID for $branch-$ver tagging (we removed the old one above).
+	else
+		debug "Yay, guards did not result in modified patches."
+	fi
+	_popd
+}
+
+## Returns 0 if the current branch ($1) contains patches for a later version of the app than $ATL_VER - which generally means we shouldn't alter it.
+#
+# Say we have branches:
+# default
+# jira
+# jira-7.13.0
+# 	issues.slowcompany.com
+# jira-8.5.0
+# 	issues.fastcompany.com
+#
+# Also say we have made a wonderful config tweak in 'default' that we'd like to propagate to slowcompany and newcompany.
+# Say we ran 'atl_reinstall --rebase' for fastcompany:
+#   This function will be called successively with args (default, jira), (jira, jira-8.5.0), (jira-8.5.0, issues.fastcompany.com). For each call:
+#     we want to merge the new change across branches,
+#     then validate that the branch's patchqueue applies. This means the 'jira' branch patches will be specific to JIRA 8.5.0, and the 'jira' branch will have a 'jira-compat-8.5.0' tag set.
+# Now say we run 'atl_reinstall --rebase' for slowcompany:
+#   This function will be called successively with args (default, jira), (jira, jira-7.13.0), (jira-7.13.0, issues.slowcompany.com). For each call:
+#     we want to merge the new change across branches (e.g. default -> jira)
+#     however, on the 'jira' branch we *don't* want to validate that its patches apply cleanly, because they won't - the 'jira' branch patches are actually specific to JIRA 8.5.0, as indicated by the 'jira-compat-8.5.0' tag.
+#     ..but on the issues.slowcompany.com branch, we *do* want to validate that the patches apply.
+#
+# So in general, if $child ($2) branch has a $child-compat-$versiongreaterthanours tag, we do the branch merge (because it's a step on the way to our final child) but we don't do the branch validation.
+#
+branch_already_validated_against_later_version() {
+	local child="$1"
+	assert_state "" "$workingcopy/.hg/patches"
+	assert_on_branch "$child"
+	# https://stackoverflow.com/questions/60344923/how-to-find-the-latest-tag-matching-a-specific-pattern-in-mercurial-hg
+	# https://stackoverflow.com/questions/30910202/cut-off-the-desc-at-n-characters-in-hg-log-output-with-templates
+	local compatvers
+	compatvers=($(hg log -r 'branch(.) and tag("re:.*-compat-.*")' -T '{sub(r".*-compat-","",tags)}\n'))
+	# On bash 4.3.48 (LO), this gives 'compatvers[@]: unbound variable' unless we have the :- default
+	# On bash 5.0.17 (at least) '${compatvers[@]}' is empty and the loop doesn't run at all.
+	# We should remove the :- here and below in the log statement once everyone is on bash 5.x
+
+	for compatver in "${compatvers[@]:-}"; do
+		# See above note: until we're on bash 5.x we need the "" default"
+		[[ -n "$compatver" ]] || continue
+		#log "We are in .hg/patches, branch $(hg -q branch)"
+		#log "We have a -compat-tag $compatver in this '$child' branch"
+
+		if version_equal "$compatver" "${ATL_VER%+*}"; then
+			:
+			# log "IGNOREME: '$child' branch has been previously marked compatible with $ATL_VER, but new changes have just been merged in, so we will now test-apply our patches again"
+		elif version_greaterthan "$compatver" "${ATL_VER%+*}"; then
+			# E.g. we're deploying Jira 7.11.0, and our 'jira' branch's tag indicates our patches are for 8.5.0. So 'version_greaterthan 8.5.0 7.11.0' succeeds and we won't test-apply our branch ( '|| apply_and_commit_patchqueue' later)
+			# FIXME: If our earlier 'mergebranches' function merged 'default' changes into our 'jira' branch, our 'jira-compat-$ver' tag should be deleted. There are two ways the -compat- tags might be managed:
+			# 1) Immediately remove the obsolete -compat- tag after merge, and immediately add it after a check *and* after creating a ATL_LOGNAME patch
+			# 2) Simply note the compatible version, and at the end tag or force-retag the branch (effectively deleting and updating existing tags).
+			# We currently follow 2) which is simpler, but leaves us with invalid jira-compat-$VER tags. I don't think they are actually used
+			#log "IGNOREME: '$child' branch patches are tagged as being compatible with $compatver, and are unlikely to apply cleanly to our ${ATL_VER%+*} app, so we won't try."
+			echo >&2 "Version $compatver is greater than ${ATL_VER%+*}"
+			return 0
+		fi
+	done
+	# FIXNE: on bash 5.x remove the :- blank default in compatvers
+	log "Branch '$child' has not been marked compatible with any versions newer than $ATL_VER (previously tested versions: ${compatvers[*]:-})."
+	return 1
+}
+
+# Same as 'apply_patchqueue', but qpop'ing first
+reapply_patchqueue() {
+	assert_state "" "$workingcopy"
+	hg -q qpop -a >/dev/null
+	apply_patchqueue || error "Patch '$(hg -q qtop)' failed to apply. Please 'cd $PWD', fix, then either push upstream or hg push --mq \$ATL_APPDIR/.hg/patches"
+	log "All ${ATL_SHORTNAME}-specific patches applied. Top patch is '$(hg qtop -q)'"
+}
+
+# Apply/Update a patchqueue by applying it to app files, possibly not the same version of the app that the patches were originally derived from. The 'patch' algorithm usually handles minor discrepancies (fuzz needed), and if --rebase is set (setting the 'refresh' parameter), this fuzz is incorporated back into the patchqueue ('hg qrefresh'). When the _replacetokens patch is encountered it is regenerated using 'atl_replacetokens'.
+# If the --commit flag is set, then when the indicated patch is encountered, changes (captured in .hg/patches/_local in an earlier step) will be qfolded in, and the patchqueue updated to include it.
+#
+# A significant wrinkle is: what happens if our patchqueue was derived from a *later* version of the app than ours? E.g. we're on the 'jira' patchqueue branch, having just pulled in new changes from the 'default' branch, but the 'jira' branch patches are all for Jira 8.20.1 and we're on 7.11.1. In that case we don't refresh the 'jira' branch patchqueue, otherwise it will break again when applied to 8.20.1. The 'refresh' flag is then ignored, and in fact the whole thing becomes a no-op *except* if --commit was specified, in which case only the --commit'ed to patch is applied.
+#
+apply_patchqueue() {
+	# Pretend to 'qpush' a patch, but don't really (make it blank before, and restore it after). This is done if our app is older than that the patchqueue is derived from.
+	qpush_noop() (
+		local topatch=$1
+		local qnextout
+		while qnextout=$(hg -q qnext 2>&1) && [[ $(hg -q qtop) != "$topatch" ]]; do
+			if [[ $qnextout =~ skipping\ $topatch ]]; then
+				log "Our destination patch, $topatch, is protected by a guard."
+				break
+			fi
+			set +eu
+			[[ -f .hg/patches/$qnextout ]] || fail "Missing .hg/patches/$qnextout"
+			warn "Fake-applying $qnextout patch"
+			mv ".hg/patches/$qnextout" ".hg/patches/$qnextout.tmp"
+			>".hg/patches/$qnextout"
+			hg qpush || printstacktrace
+			mv ".hg/patches/$qnextout.tmp" ".hg/patches/$qnextout"
+		done
+	)
+
+	# 'qpush' a patch, and 'qrefresh' the patchqueue to incorporate any changes.
+	qpush_with_refresh() (
+		set -eu
+		local topatch=$1
+		local qnextout
+		assert_state "" "$workingcopy"
+		while qnextout=$(hg qnext 2>&1) && [[ $(hg -q qtop) != "$topatch" ]]; do
+			#log "XXX: Here we are at $(hg -q qtop). Our qnext output is $qnextout. Does that match 'skipping $topatch'?"
+			if [[ $qnextout =~ skipping\ $topatch ]]; then
+				log "Our destination patch, $topatch, is protected by a guard."
+				break
+			fi
+			set +eu
+			#log "Pushing $(hg -q qnext)"
+			local pushresult
+			if pushresult=$(hg qpush 2>&1); then
+				if [[ $pushresult =~ Hunk.*succeeded\ at.*offset ]]; then
+					log "Refreshing slightly modified $(hg -q qtop)"
+					hg -q qrefresh
+				elif [[ $pushresult =~ '^bad hunk' ]]; then
+					error "A patch is broken:\n$pushresult\nTo fix, 'cd $PWD', qpop, fix and qpush the broken patch"
+				else
+					# Print any warnings from hgpatchscript
+					echo "$pushresult" | grep -i warning
+				fi
+			else
+				warn "Failed to cleanly qpush patch '$(hg -q qtop)' from mq branch '$(hg -q branch --mq)' to $PWD, error: '$pushresult'. Please fix:"
+				shellout_allowing_only_rejects_afterwards || return $?
+			fi
+			assert_state "qpushed $(hg -q qtop), result $pushresult" "$workingcopy"
+			set -eu
+		done
+	)
+
+	# 'qpush' a patch
+	qpush_without_refresh() {
+		local topatch=$1
+		local pushresult
+		assert_state "" "$workingcopy"
+		if pushresult="$(hg qpush "$topatch" 2>&1)"; then
+			:
+			#log "Successful push: $pushresult"
+		else
+			error "Failed to cleanly qpush patch '$(hg -q qtop)', error: '$pushresult'. To fix, 'cd $PWD', inspect .rej files, 'hg qrefresh; hg commit --mq; hg push --mq' and try again"
+		fi
+		assert_state "qpushed to $topatch" "$workingcopy"
+	}
+
+	# Invokes one of the three qpush variants for each patch up to $1.
+	qpush_patches_upto() {
+
+		local patch="$1"
+		set -o pipefail
+		#log "With filter" | (grep -v led-icons || :)
+		log "About to $updatestyle-push to patch '$patch'"
+		assert_state "" "$workingcopy"
+		if [[ $updatestyle = refresh ]]; then
+			qpush_with_refresh "$patch"
+		elif [[ $updatestyle = norefresh ]]; then
+			qpush_without_refresh "$patch"
+		elif [[ $updatestyle = noop ]]; then
+			qpush_noop "$patch"
+		else
+			error "Please set updatestyle"
+		fi ||
+			if [[ -z ${prevbranch:-} ]]; then
+				fail "Default branch '$branch' failed to apply cleanly. Please 'cd $PWD', fix up the patches, 'hg qrefresh' and 'hg commit --mq'"
+			else
+				fail "Branch '$(hg -q branch --mq)' failed to apply cleanly (having just absorbed changes from branch '$prevbranch') at patch '$patch'. Please 'cd $PWD', fix up the patches, 'hg qrefresh' and re-run '$0 --resume'"
+			fi
+		assert_state "qpushed to $patch" "$workingcopy"
+	}
+
+	local_patches() {
+		# Patch files have lines starting with 'diff ' if they contain anything besides comments.
+		grep -q --no-filename -c ^diff .hg/patches/_local
+	}
+
+	# Having applied all patches in our series, check if a commit remains unapplied, which should only happen if the indicated patch wasn't in our series, and take special action.
+	update_commit_patches_not_in_series() {
+		assert_state "" "$workingcopy"
+		local_patches || return 0
+		# There are still diffs in _local!
+		[[ -v commit && $branch == "$commitbranch" ]] || return 0
+
+		if grep -qx "$commitpatch" .hg/patches/series; then
+			fail "We have finished committing to $commitpatch and applying our queue, but _local is not empty. Why did the contents of _local not get committed to $commitpatch ?"
+			#fail "Asked to --commit to patch '$commitpatch' in this branch ($branch), but it appears to have failed because _local is non-empty."
+		fi
+
+		[[ $updatestyle == refresh ]] || fail "We were asked to create new patch $commitbranch/$commitpatch, but we can't (updatestyle=$updatestyle), perhaps because this branch is compatible with a later version"
+		log "Creating new patch, $commitbranch/$commitpatch"
+		# Back up to before _local (maybe) and _replacetokens
+		while [[ $(hg -q qtop) =~ ^_ ]]; do
+			hg qpop
+		done
+		if ! patch -p1 < .hg/patches/_local; then
+			fail "In $PWD: Failed to apply _local"
+		fi
+		hg qnew "$commitpatch"
+		> .hg/patches/_local
+		hg qpush -a
+		log "Successfully created patch $commitpatch. Please now put it in the correct order. 'hg qpop', vim .hg/patches/series; hg qpush"
+		bash
+	}
+
+
+	# apply_patchqueue() main code
+	
+	local updatestyle="${1:-norefresh}" # 'refresh', 'norefresh' or 'noop'
+	assert_state "" "$workingcopy"
+	assert_patches_not_applied
+	local branch
+	branch=$(hg -q branch --mq)
+	_pushd .hg/patches
+	hg -q update  # Ensure checkout reflects the current branch
+	if branch_already_validated_against_later_version "$branch"; then
+		if [[ -v commit && $branch == "$commitbranch" ]]; then
+			warn "We have been asked to commit a change to branch $branch. However It contains patches updated to be compatible with a version of the product later than the version this instance deploys as ($ATL_VER). We will go ahead and modify the patches - which will cause other deployments at the later version (e.g. a test instance) to need rebasing."
+		else
+			warn "We will NOT be refreshing the $branch patches, as it is compatible with a version later than ours"
+			updatestyle=noop
+		fi
+	fi
+	_popd
+
+	# Apply each patch, taking special action for _replacetokens and the --commit patch (if any)
+	for patch in $(hg -q qseries); do
+		debug "Considering patch $patch"
+		assert_state "About to apply $patch" "$workingcopy"
+		if [[ $patch == _replacetokens ]]; then
+			qpush_patches_upto "$lastpatch"
+			log "$branch contains a _replacetokens patch. Refreshing it"
+			# https://stackoverflow.com/questions/2210403/testing-for-uncommitted-changes-in-mercurial
+			local hgpromptstatus
+			hgpromptstatus="$(hg prompt '{status}')"
+			if [[ "$hgpromptstatus" = '?' ]]; then
+				warn "We have files locally present that are not in the '$branch' mercurial branch. This can happen if a later patch .hgignore'd a file, and its .hgignore is not applied yet. 'hg status' output: $(hg status)"
+			elif [[ -n "$hgpromptstatus" ]]; then
+				error "Unexpected state: uncommitted patches while testing if branch '$branch' applies cleanly"
+			fi
+			: >.hg/patches/_replacetokens
+			hg -q qpush || {
+				error "Unexpectedly failed to push _replacetokens"
+			}
+			# It only matters in the final branch for %{tokens} to be replaced via _replacetokens, and in fact it is only in the final branch that atl_replacetokens should always succeed, e.g. a loadbalancer-fronted instance using port 80 won't have $ATL_SSLCERTFILE declared, yet the intermediate branches' apache2/apache2.conf will contain %{ATL_SSLCERTFILE}.
+			if [[ $branch = "$ATL_LONGNAME-$ATL_VER" ]]; then
+				atl_replacetokens
+				hg -q qrefresh
+			else
+				log "Using blank _replacetokens for non-final branch"
+			fi
+
+		elif [[ -v commit && -v commit && $patch == "$commitpatch" && $branch == "$commitbranch" ]]; then
+
+			qpush_patches_upto "$patch"
+			# If --commit is given and indicates this is the branch+patch to commit to, qfold _local (our temporary patch store)
+			if [[ -v commit ]] && local_patches; then
+				if [[ $updatestyle = noupdate ]]; then
+					LOG "We have been asked to --commit a change to branch $branch which we can't update normally, as it contains patches for a later release. At this point we have FAKE-applied all patches up to $commitpatch, and are now going to try to qfold _local into it. Good luck!"
+				fi
+				log "Merging _local into $branch/$patch patch"
+				grep -qx _local .hg/patches/series || echo _local >>.hg/patches/series # Our primitive app patchsets ('jira', 'confluence') don't have a _local patch, so temporarily add it before it gets qfold'ed away
+				hg qfold _local || {
+					log "Failed to fold _local into $commitpatch. Please fix manually, making sure that afterwards, .hg/patches/_local is GONE and _local is not in the patchqueue series"
+					bash || return $?
+					if [[ -s .hg/patches/_local ]]; then
+						warn "_local patch still contains something after manual intervention. It should be empty! Please fix, 'rm .hg/patches/_local', then 'vim .hg/patches/series' and remove _local"
+						bash || return $?
+						[[ ! -s .hg/patches/_local ]] || fail "🙄"
+					fi
+					if grep -q _local .hg/patches/series; then
+						warn "_local should not be in the patchqueue series after manual intervention. Please 'vim .hg/patches/series' and remove it."
+						bash || return $?
+						! grep -q _local .hg/patches/series || fail "🙄"
+					fi
+				}
+				[[ ! -f .hg/patches/_local ]] || fail ".hg/patches/_local should be qfolded away"
+				grep -qv _local .hg/patches/series || fail "_local should be qfolded away"
+				if [[ $branch = "$ATL_LONGNAME-$ATL_VER" ]]; then
+					# Recreate .hg/patches/_local in leaf branches
+					LOG "about to hg qnew -f _local. Are we in the right place???? Please check and exit non-zero if not"
+					bash || return $?
+
+					hg qnew -f _local
+					(cd .hg/patches && hg forget _local && hg commit -m -)
+					hg qpush
+				fi
+
+
+				hg qrefresh # Incorporate the As and Ms into our top-most patch
+				touch .hg/patches/_local
+			fi
+		elif [[ $patch == _local ]]; then
+			# _local will be in the patchqueue but won't actually exist unless we happen to have --commit'ed this branch earlier.
+			touch .hg/patches/_local
+		fi
+		assert_state "Just applied $patch" "$workingcopy"
+		lastpatch="$patch"
+	done
+	#done < <(hg -q qseries)    # We used to feed patches into a while loop one by one on stdin, but that isn't a good pattern generally as it consumes stdin, making it unavailable for bash subshells
+
+	qpush_patches_upto "$lastpatch"
+
+	update_commit_patches_not_in_series
+}
+
+shellout_allowing_only_rejects_afterwards() {
+	log "Shelling out; we're in $PWD"
+	local tryagain=true
+	while $tryagain; do
+		bash || {
+			tryagain=false
+			fail "Aborted!"
+			break
+		}
+		local status
+		# Each patch will have modified .hgignore with runtime files it's service adds (e.g. flightrecordings/*). Earlier we qpopped all these patches, removing the .hgignore lines but not the runtime files (e.g. flightrecordings/*.jfr). These runtime files would appear as 'unknown' here, and break the qpush. The solution is to use the unmodified .hgignore in $ATL_APPDIR.
+		status="$(hg status --config ui.ignore="$ATL_APPDIR/.hgignore")"
+		norejects() { grep -v "\.rej$"; }
+		local unknownfiles
+		unknownfiles="$(echo "$status" | grep "^? .\+$" | norejects || :)"
+		if [[ -n "$unknownfiles" ]]; then
+			warn "Please 'hg add' or rm files ('hg clean' to remove all): $unknownfiles"
+			continue
+		fi
+		unknownfiles="$(echo "$status" | grep -v "^[MA]" | norejects || :)"
+		if [[ -n "$unknownfiles" ]]; then
+			warn "Please ensure ONLY modified / added files are left (.rej's are fine)."
+			continue
+		fi
+		return 0 # All modified files are M's, A's or unknown ('?') .rej's
+	done
+	if $tryagain; then return 0; else return 1; fi
+}
+
+# Having rebased to customer-specific branch on the customer-specific patch, and ensured it applies, tag the branch (if not already tagged) so we deploy directly to it in future
+# Note: we used to have the tag logic in create_and_mergeudpdate_branches. That doesnt work when a new client branch is being created, because create_localmodification_patch then comes and adds a new file after the tagging. Instead, separate out the tagging code here
+tag_cleanapplying_branches() {
+	if ((${#cleanly_applying_revisions[@]} == 0)); then
+		#log "No new cleanly applying branches to tag"
+		return
+	fi
+	log "Cleanly applying ids: ${cleanly_applying_revisions[*]:-(none)}"
+	_pushd "$workingcopy/.hg/patches"
+	local finalbranch
+	finalbranch=$(hg branch)
+	[[ $finalbranch = "$ATL_LONGNAME-$ATL_VER" ]] # We expect to be in the final deployment's branch
+	# Previously we had this:
+	# I can't see right now why we'd ever be in the ATL_PARENT_LONGNAME branch
+	# [[ $finalbranch = "$ATL_LONGNAME-$ATL_VER" || $finalbranch = "$ATL_LONGNAME" || $finalbranch = "${ATL_PARENT_LONGNAME:-}" ]]	# We expect to be in the final deployment's branch
+
+	for rev in "${cleanly_applying_revisions[@]:-}"; do
+		log "Switching $PWD from $(hg branch) to $rev"
+		((headcount = $(
+			set -o pipefail
+			hg heads "$(hg -q branch)" -T'{rev}\n' | wc -l
+		)))
+		hg -q update -C -r "$rev" # The -C is necessary because we want to clear out 'lost' files like the $ATL_LONGNAME patch
+		local branch
+		branch=$(hg branch)
+
+		# We know $branch applies. If called with --rebase, tag $branch so we know in future it is compatible with $ver.
+		# Our qpush_with_refresh above probably resulted in trivial line number changes to patches. Commit them
+		# Note that {status|modified} excludes unknown ('?') patches, as the sole presence of unknown patches would cause 'hg commit' to fail with 'nothing changed'
+		tagname="$branch-compat-${ATL_VER%+*}"
+		#log "We're now at rev $(hg -q id), which is branch $branch. Proposed tag: $tagname"
+		if [[ $(hg id) =~ $tagname$ ]]; then # 'hg id' prints the current revision hash, and then the names of any tags for this revision. Here we are testing if our branch has already been version-tagged.
+			log "$branch branch is already tagged as $tagname"
+		else
+			if ! tagexists "$tagname"; then
+				# We have no tag yet
+				hg tag "$tagname" || error "What? We have no '$tagname' tag, but hg tag failed ($PWD)"
+				log "Tagged branch '$branch' with new tag '$tagname'"
+			elif [[ -n $(hg diff -r "$tagname" -r 'heads(branch(.))') ]]; then
+				# There are changes since the tag was made: re-tag
+				#hg tag --remove "$tagname" >/dev/null || true
+				hg tag -f "$tagname"
+				log "Tagged branch '$branch' with updated tag '$tagname'"
+			else
+				log "No new changes to tag as '$tagname'"
+			fi
+		fi
+	done
+	hg -q up "$finalbranch"
+	if [[ $(hg -q branch) != "$ATL_LONGNAME-$ATL_VER" ]]; then
+		log "We might have a tag named after a branch, because we expected to be at $ATL_LONGNAME-$ATL_VER, but are actually at $(hg -q branch). Dropping into bash"
+		bash || exit $?
+	fi
+	_popd
+}
+
+push_patches_upstream() {
+	assert_state "" "$workingcopy"
+	if hg outgoing --mq >/dev/null 2>&1; then
+		log "Pushing patchqueue changes upstream (backgrounded)"
+		# At this point we know our patchqueue applies. Push the changes upstream in the background
+		# OBSOLETE: no longer doing this as we rm -rf our directory later when hg might stil be going."" using '& disown' to do it in the background without spamming us in output"
+		hg -q push --mq --new-branch &
+	fi
+}
+
+apply_patchscripts() {
+	assert_state "" "$workingcopy"
+	for patch in "$(hg -q qseries)"; do
+		ps=".hgpatchscript/$patch"
+		if [[ -f $ps ]]; then
+			. "$ps"
+		fi
+	done
+}
+
+# Transient guards complicate things - disabled until a really good use-case presents
+# # In addition to the guards that are set as part of the $ATL_LONGNAME patchqueue, set `uname -n` and ATL_ROLE guards for this deployment. This is all done after the patchqueue patches are refreshed, as we don't want to commit any diff changes
+# set_transient_guards()
+# {
+# 	guards=()
+# 	[[ -f .hg/patches/guards ]] && guards+=($(cat .hg/patches/guards))
+# 	guards+=(${ATL_PATCHQUEUE_GUARDS:-})
+# 	# Disable this, as it modifies the .hg/patches/guards file which is version-controlled, but this change should not be committed, and the uncommitted change upsets atl_patchqueue.
+# 	# Longer-term: guards are probably not the way to go anyway, as we need OR'ed guards
+# 	#guards+=("$(uname -n)") # This allows patches to be host-specific
+# 	quards+=("$ATL_ROLE")
+# 	log "Setting guards: ${guards[*]:-}"
+# 	# shellcheck disable=SC2068
+# 	hg qselect ${guards[@]:-}
+# }
+
+# Return true if tag $1 is define on the current branch
+tagexists() {
+	local tagname="$1"
+	hg log -r "branch(.) and tag('$tagname')" -T '{tags}\n' &>/dev/null
+}
+
+assert_state() {
+	local desc="$1"
+	local expecteddir="$2"
+	[[ $PWD == "$expecteddir" ]] || fail "Expected to be in $expecteddir: $desc"
+	if [[ $expecteddir =~ .hg/patches$ ]]; then
+		[[ -d ../../temp ]] || { warn "$PWD/../../temp missing (state $desc). Shelling out"; bash; exit 1; }
+	else
+		[[ -d ./temp ]] || { warn "$PWD/temp missing (state $desc). Shelling out"; bash; exit 1; }
+	fi
+}
+
+assert_on_branch() {
+	[[ $(hg -q branch) == "$1" ]] || fail "Expected to be on the '$1' branch"
+}
+
+assert_patches_not_applied() {
+	if [[ -s .hg/patches/status ]]; then # size > 0, a quick and dirty way of checking if any patches are applied
+		error "Unexpected state: We have applied patches. The caller should have unapplied them."
+	fi
+}
+
+_pushd() {
+	pushd "$1" >/dev/null
+}
+
+_popd() {
+	popd >/dev/null
+}
+
+main "$@"
+
+# vim: set foldmethod=marker formatoptions+=cro :

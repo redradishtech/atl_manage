@@ -1,0 +1,100 @@
+#!/bin/bash
+## Note we don't set -eu until after venv/bin/activate, which doesn't like it
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+. "$ATL_MANAGE"/venv/bin/activate
+set -eu
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	local PARSED
+	PARSED=$(getopt --options 'dh' --longoptions 'dir:,help' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	# now enjoy the options in order and nicely split until we see --
+	plugindir=
+	while true; do
+		case "$1" in
+		--dir)
+			plugindir="$2"
+			if [[ ! -d $plugindir ]]; then error "Plugin directory does not exist: $plugindir"; fi
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	# }}}
+	(($#)) || usage
+
+	if [[ -z "$plugindir" ]]; then
+		if [[ $ATL_PRODUCT = confluence ]]; then
+			plugindir="$ATL_DATADIR"/plugins-cache
+		elif [[ $ATL_PRODUCT = jira ]]; then
+			plugindir="$ATL_DATADIR"/plugins/installed-plugins
+		else
+			error "Unhandled product: $ATL_PRODUCT"
+		fi
+	fi
+	jars=()
+	shopt -s nullglob # Stops literal '*.obr' matching if no obrs are found
+	for j in "$plugindir"/**/*.{jar,obr}; do
+		log "Testing $j"
+		if [[ $j =~ .obr ]]; then
+			xml=$(unzip -p "$j" obr.xml)
+			echo "$xml" | grep -q "$1" || continue # First do a quick grep for the key, only doing a slower XML parse if we match
+			log "Parsing XML from $j obr.xml"
+			while read -r key version; do
+				#log "${j[*]} contained resource $key $version"
+				[[ $key == "$1" ]] || continue               # Let through if key matches
+				[[ $# = 1 || $version == "$2" ]] || continue # Let through if version (if specified) matches
+				jars+=("$j")
+				#log "After adding, jars ${jars[*]} with ${#jars[@]} entries"
+				#done < <(echo "$xml" | xq -r '.repository.resource | .[] | [."@symbolicname", ."@version"] | @tsv')
+			done < <(echo "$xml" | xq -r '.repository.resource | ([."@symbolicname",."@version"]? // (.[] | [."@symbolicname", ."@version"])) | @tsv')
+			# The .obr will have one or more  <resource> entries like:
+			#			<resource id='org.randombits.supplier.core/1.4.0' symbolicname='org.randombits.supplier.core' presentationname='RB Supplier - Core' uri='supplier-core-1.4.0.jar' version='1.4.0'>
+			# which this converts to multiple lines of output like:
+			# org.randombits.supplier.core    1.4.0
+			# org.randombits.support.core     1.4.0
+			# If the jar had just one resource (e.g. composition), then .repository.resource will be an object. If the jar had multiple resources (e.g. confiforms) then .repository.resource will be an array. jq doesn't deal with these possibilities nicely. The ..? // ... pattern is taken from https://stackoverflow.com/questions/64700815/using-the-destructuring-alternative-operator-in-jq
+		elif [[ $j =~ .jar ]]; then
+			xml=$(unzip -p "$j" atlassian-plugin.xml 2>/dev/null || :)
+			[[ -n $xml ]] || continue
+			echo "$xml" | grep -q "$1" || continue # First do a quick grep for the key, only doing a slower XML parse if we match
+			while read -r key version; do
+				[[ $key = "$1" ]] || continue               # Let through if key matches
+				[[ $# = 1 || $version = "$2" ]] || continue # Let through if version (if specified) matches
+				jars+=("$j")
+			done < <(echo "$xml" | xq -r '."atlassian-plugin" | [."@key", ."plugin-info"."version"] | @tsv')
+		fi
+	done
+	if ((${#jars[@]})); then
+		echo "${jars[@]}"
+	fi
+}
+
+usage() {
+	cat <<EOF
+Purpose: Run a command in a working copy of $ATL_APPDIR, and then copy the (presumably modified) working copy back, but only if the new/modified files would not interfere with the running Tomcat application.
+
+Usage:
+$(basename "$0") [--dir=path/to/directory/of/plugin/jars/] pluginkey [pluginver]
+
+E.g.:
+$(basename "$0") com.adaptavist.confluence.contentFormattingMacros
+$(basename "$0") --dir=\$ATL_ROOT/plugins-temp/temp com.adaptavist.confluence.contentFormattingMacros
+
+
+EOF
+	exit 2
+}
+main "$@"

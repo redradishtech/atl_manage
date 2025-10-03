@@ -1,0 +1,87 @@
+#!/bin/bash -eu
+# Backs up the database to the previous/ data directory. This backup is
+# completely separate from those in $ATL_BACKUP_ROOT This script is intended to
+# be run AFTER atl_upgrade_switchver, but BEFORE the new version is started.
+# That is because we typically don't want database backups floating around in
+# our data directory. If we backed up to $ATL_DATADIR/ before backing that up,
+# we would then need to remove the backup from current/ after copying current/
+# to previous/.
+# As a nice side-effect, if replication is still running for the previous
+# version, this backup will be replicated to the standby.
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+set -o pipefail # Don't let the gzip hide mysqldump failure
+
+main() {
+	if [[ -n ${ATL_NEWVER:-} ]]; then
+		error "This script should only be run AFTER atl_upgrade_switchver. (Your ATL_NEWVER variable is set)."
+	fi
+	if $ATL_DATADIR_VERSIONED; then
+		if [[ ! -L $ATL_DATADIR_BASE/previous ]]; then
+			error "$ATL_DATADIR_BASE/previous (where we usually write data) is missing"
+		fi
+		backupdir="$ATL_DATADIR_BASE/previous"
+	else
+		backupdir="$ATL_DATADIR_BASE"
+	fi
+	if [[ ! -d $backupdir ]]; then error "$backupdir does not exist. It should have been created by a atl_upgrade_switchver"; fi
+	if [[ ${1:-} = -r ]]; then upgradedirection=downgrade; else upgradedirection=upgrade; fi
+	backup="$backupdir"/${ATL_SHORTNAME}-before-${ATL_VER}-${upgradedirection}
+	case $ATL_DATABASE_TYPE in
+	postgresql*)
+		# Delete if we're on a second attempt
+		rm -rf "$backup"
+		# Postgres 10.6's pg_dump breaks if the directory exists, so only create its parent
+		mkdir -p "$backup"
+		log "Backing up to $backup"
+		warn "FIXME: If postgres is local, then atl_pg_dump runs as 'postgres', which doesn't have write permission to this directory. atl_pg_dump probably needs rewriting"
+		# If our database is remote, 'postgres' won't exist, but atl_pg_dump will still work
+		if id -u postgres; then
+			chown -R postgres "$backup" # See above - $backup shouldn't exist.
+			setfacl -m u:postgres:rX "$backup"/..
+			setfacl -m u:postgres:rX "$backup"/../..
+		fi
+		# https://paquier.xyz/postgresql-2/postgres-9-3-feature-highlight-parallel-pg_dump/
+		# https://stackoverflow.com/questions/6481005/how-to-obtain-the-number-of-cpus-cores-in-linux-from-the-command-line
+		cpucount=$(grep -c ^processor /proc/cpuinfo)
+		log "Now running pg_dump using $cpucount cores"
+		atl_pg_dump --super -Fd "$ATL_DATABASE" -j "$cpucount" -f "$backup/database"
+		log "Database backup complete: $(ls "$backup/database")"
+		ls -la "$backupdir"
+		;;
+	mysql)
+		set -x
+		if [[ -v ATL_MULTITENANT && $ATL_MULTITENANT = true ]]; then
+			# https://serversforhackers.com/c/mysqldump-with-modern-mysql
+			# The --add-drop-database is to ensure that any new tables (e.g. created after an upgrade that is being rolled back) are removed. Note that --one-database can be used to restore just one db.
+			atl_mysql_dumpall --single-transaction --add-drop-database --skip-lock-tables --routines --events | mygzip >"$backup".sql.gz
+		else
+			# Note: $ATL_DATABASE isn't passed in because atl_mysql_dump defaults to it (and breaks if passed)
+			atl_mysql_dump --single-transaction --routines --events --opt | mygzip >"$backup".sql.gz
+		fi
+		log "Database backup complete: $(ls "$backup".sql.gz)"
+		ls -la "$backupdir"
+
+		;;
+	*) error "Unknown database type $ATL_DATABASE_TYPE" ;;
+	esac
+}
+
+# If Postgres is on ZFS we can take a pre-upgrade snapshot too
+zfs_snapshot() {
+	[[ -v ATL_ZFS ]] || return 0
+	. "$ATL_MANAGE/lib/zfs.sh"
+	local label="$1"            # ZFS snapshot name
+	zfs snapshot "$ATL_ZFSPOOL" # Snapshot everything, not just the database, because we can and (currently, Apr/22) no other script does this (FIXME). It also resolves tedious problems of knowing which zfs pool hosts the Postgres files
+}
+
+mygzip() {
+	if command -v pigz >/dev/null; then
+		pigz
+	else
+		gzip
+	fi
+}
+
+main "$@"

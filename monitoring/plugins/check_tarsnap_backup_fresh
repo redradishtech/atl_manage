@@ -1,0 +1,68 @@
+#!/bin/bash -eu
+## Check tarsnap backup freshness, by checking that our most recent tarsnap backup contains files younger than X days
+## 'atl_tarsnapper' and 'atl_tarsnap' will return tarsnap archives for the current project.
+# Caller is responsible for locking. See $ATL_APPDIR/backups/backup-tarsnap-fresh.healthcheck
+
+#shellcheck source=common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh
+#shellcheck source=/opt/atl_manage/lib/jeventutils/lib/jeventutils.sh
+. "$ATL_MANAGE/lib/jeventutils/lib/jeventutils.sh"
+
+main()
+{
+	#exec 3>&1
+	[[ "$*" =~ -h  ]] && usage
+	[[ $# == 1 ]] || usage
+	local maxdays="$1"
+	[[ $maxdays =~ ^[0-9]+$ ]] || error "<maxdays> value $maxdays is not a number"
+	# Valid formats like '-x days' can be inferred from https://github.com/Tarsnap/tarsnap/blob/master/tar/getdate.c
+	# For now we only support '-x days' for ease of validation
+	local freshness_interval="-${maxdays} days"
+	tarsnapper_out=$(mktemp)
+	tarsnapper_err=$(mktemp)
+	trap 'rm $tarsnapper_out $tarsnapper_err' EXIT TERM
+
+	# Get most recent backup in $recent_backup.
+	# Rely on caller to acquire locks
+	jrun backup-tarsnap-listbackups \
+		atl_tarsnapper list 2>"$tarsnapper_err" > "$tarsnapper_out"
+	recent_backup="$(head -1 "$tarsnapper_out" | sed -e 's/^ *//')"
+
+	[[ "$recent_backup" =~ ^$ATL_SHORTNAME-[0-9]{8}-[0-9]{6}$ ]] || failcritical "There are no '$ATL_SHORTNAME' tarsnap backups (matching pattern '$ATL_SHORTNAME-[0-9]{8}-[0-9]{6}'). Recent backups are: ${recent_backup}\nTarsnapper stderr: «$(cat "$tarsnapper_err")»\nTarsnapper stdout: «$(cat "$tarsnapper_out")»"
+	echo "Most recent tarsnap backup: $recent_backup"
+
+	jrun backup-tarsnap-findnewer find_fresh_files "$@"
+	
+	## Note, before discovering tarsnap --fast-read, we used to use this loop to terminate on first output:
+	# 
+	#while read -r f
+	#do
+	#	break
+	#done < <(jwritelock -g backup-tarsnap jrun backup-tarsnap-findnewer atl_tarsnap -tf "$recent_backup" --newer-mtime "$freshness_interval")
+	# 
+	# It works (terminates early) but the jrun always returns exit code 141, for reasons I don't understand.
+	# (The while ..do .. done < <(...) construct is to avoid an inner subshell, so 'fail' (if called) exits properly.)
+}
+
+find_fresh_files()
+{
+	# Check the $recent_backup files files newer than '-${maxdays} days'
+	# --fast-read terminates on first output.
+	# The --fast-read needs --include='*' otherwise it doesn't set a nonzero exit code if nothing matches
+	local newfile
+	if newfile=$(atl_tarsnap -tf "$recent_backup" --newer-mtime "$freshness_interval" --include='*' --fast-read); then
+		echo "Backup $recent_backup looks good: file $newfile is newer than $freshness_interval since $(date)"
+		: # all good
+	else
+		failcritical "No files within tarsnap backup '$recent_backup' are newer than $freshness_interval"
+	fi
+}
+
+usage()
+{
+	echo >&2 "Usage: $0 <maxdays>"
+	echo >&2 "Checks the most recent tarsnap backup for freshness, by checking it has at least one file modified less than <maxdays> days ago"
+	exit 255
+}
+
+main "$@"

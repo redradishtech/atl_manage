@@ -1,0 +1,3 @@
+#!/bin/bash -eu
+
+echo "select propertyvalue from propertyentry pe JOIN propertytext pt USING (id) where property_key='com.onresolve.jira.groovy.groovyrunner:customfields';" | atl_psql -tAXq | jq -r '.[] | [.FIELD_SCRIPT_FILE_OR_SCRIPT.scriptPath // "«inline»", .name] | @tsv' | column -t -s$'\t'

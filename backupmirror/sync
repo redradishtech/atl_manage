@@ -1,0 +1,122 @@
+#!/bin/bash  -eu
+## Syncs a backup from source to destination. 
+## Usage: sync_backup [-v] [hourly.0 | hourly.1 | ... ]
+
+# We can rely on ATL_ variables being defined.
+
+#shellcheck source=/opt/atl_manage/backupmirror/common.sh
+. "$ATL_MANAGE/backupmirror/common.sh"
+
+main()
+{
+	if [[ -v $SOURCE ]]; then
+		# Note: syncing filesystems inherently requires root/sudo on the destination, and may require root on the source too.
+		# - On the destination, the home directory might have root-owned files, perhaps even root-readonly files (like backups) whose ownership and permissions we need to preserve. We also need write access to touch the .lastsync marker file.
+		# - On the source, we may have backups in the home dir written as root, which $ATL_USER can't access
+		# Therefore we use 'sudo -E' on the next line. The remoterun script logs into the destination as $ATL_BACKUPMIRROR_DESTINATION_SYNCUSER. If ATL_BACKUPMIRROR_DESTINATION_SYNCUSER is 'root' (default) then 'sudo -E' has no effect; if we're running as $ATL_USER, then the sudoers file must grant password-free access to 'sync_filesystem' and also preserve SSH_AUTH_SOCK. Granting this sudo permission is handled by $ATL_MANAGE/events/install-post/backups-mirror ('sudosnippet').
+		# Note that if invoked from backupmirror.healthcheck, we would have locked on backup.lock to avoid running at the same time as rsnapshot
+		"$ATL_MANAGE/lib/remote/run" sudo -E "$ATL_MANAGE/backupmirror/sync" "$@"
+	elif [[ -v $DESTINATION ]]; then
+		[[ $EUID = 0 ]] || error "Unexpectedly running without sudo/root. This should have been invoked with 'sudo -E' by the source (see above) or in sync_filesystem"
+		if [[ "$*" =~ -v ]]; then verbose=true; else verbose=; fi
+		if [[ $verbose ]]; then set -x; fi
+		rootdir="$(dirname "$ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT")"		# Usually evaluates to $ATL_DATADIR_BASE
+		destdir="$(basename "$ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT")"	# Usually evaluates to 'backups-from-production'
+		cd "$rootdir"
+		[[ -d $destdir ]] || mkdir "$destdir"
+
+		#echo $ATL_BACKUP_TYPES | tr , '\n' | while IFS=, read backuptype; do
+		#shellcheck disable=SC2043
+		for backuptype in rsnapshot; do
+		case "$backuptype" in
+			rsnapshot)
+				# Use the no-vanished variant of rsync because when we copy the live index, we might have files change under us (breaking monitoring)
+				sshcmd=(ssh -F "$(gethomedir "${!DESTINATION_SYNCUSER}")/.ssh/config"  -o UserKnownHostsFile="$(gethomedir "${!DESTINATION_SYNCUSER}")/.ssh/known_hosts")
+				# See replication/sync for why we break up -a into its constituent flags minus -t 
+				rsync=("$ATL_MANAGE"/lib/rsync-no-vanished -e "${sshcmd[*]}" -rHKlpgoD --delete)
+				if [[ ${1:-} = -v ]]; then rsync+=(-v); shift; fi
+				backup_instance="${1:-hourly.0}"
+				# Database backups are already compressed, so no -z
+
+				validate_backupmirror_source_ssh
+				validate_backupmirror_source_uname
+
+				
+				flock -x "$ATL_LOCKDIR"/backupmirror.database.lock "${rsync[@]}" -R "backupmirror_source:$ATL_BACKUPMIRROR_SOURCE_BACKUP_ROOT/./$backup_instance/database/" "$destdir"
+
+				[[ ! -v ATL_REPLICATION_STANDBY_MIRROR_OF_PRIMARY_DATADIR ]] || fail "ATL_REPLICATION_STANDBY_MIRROR_OF_PRIMARY_DATADIR should be replaced by ATL_REPLICATION_STANDBY_MIRRORDIR"
+				if [[ -v ATL_REPLICATION_STANDBY_MIRRORDIR && -d $ATL_DATADIR/$ATL_REPLICATION_STANDBY_MIRRORDIR ]]; then
+					## We can only hardlink if our usernames match. If our standby runs as 'jira' and we are 'jira-staging', then if we hardlink standby $ATL_DATADIR to sandbox $ATL_BACKUPMIRROR_DESTINATION_BACKUP_ROOT/hourly.0/home, and then hardlink again to jira-staging $ATL_DATADIR, then the owner of the files will be wrong for one app or the other ('jira' or 'jira-staging'). 
+					if [[ -v ATL_REPLICATION_PRIMARY_SYNCUSER ]]; then
+						if [[ ${ATL_REPLICATION_PRIMARY_SYNCUSER} = "$ATL_USER" ]]; then
+							# We're on standby; that means we already have a pristine copy of the primary's data. Let's hardlink to that to save space.
+							# https://stackoverflow.com/questions/2564634/convert-absolute-path-into-relative-path-given-a-current-directory-using-bash
+							rsync+=(--link-dest=../../../"$(python -c "import os.path; print os.path.relpath(os.environ['ATL_DATADIR'] + '/' + os.environ['ATL_REPLICATION_STANDBY_MIRRORDIR'], os.getcwd())")")
+							warn "This rsync --link-dest calculation is very experimental (after changing from ATL_REPLICATION_STANDBY_MIRROR_OF_PRIMARY_DATADIR to ATL_REPLICATION_STANDBY_MIRRORDIR) : ${rsync[*]}"
+						else
+							if [[ $verbose ]]; then
+								log "Can't hardlink to our standby mirror as our standby user '$ATL_REPLICATION_PRIMARY_SYNCUSER' != our user '$ATL_USER'"
+							fi
+						fi
+					else
+						if [[ $verbose ]]; then
+							log "Please set ATL_REPLICATION_PRIMARY_SYNCUSER in the profile - if it is the same user as ours ('$ATL_USER') then we could hardlink to save space"
+						fi
+					fi
+				elif [[ $backup_instance != 'hourly.0' && -d $destdir/hourly.0 ]]; then
+					# We're getting an older backup, but we have an hourly.0 backup - might as well reuse it
+					rsync+=(--link-dest=../../hourly.0/home/)
+				fi
+				if [[ $ATL_BACKUPMIRROR_SOURCE_UID != "$ATL_UID" ]]; then
+					rsync+=(--usermap "$ATL_BACKUPMIRROR_SOURCE_UID:$ATL_UID" --groupmap "$ATL_BACKUPMIRROR_SOURCE_GID:$ATL_GID")
+				fi
+				ATL_BACKUPMIRROR_SOURCE_BACKUP_ROOT_HOME="${ATL_BACKUPMIRROR_SOURCE_BACKUP_ROOT_HOME:-$ATL_BACKUPMIRROR_SOURCE_BACKUP_ROOT/$backup_instance/home}/"   # Note we add the trailing / so our rsync doesn't break if the caller set ATL_BACKUPMIRROR_SOURCE_BACKUP_ROOT_HOME without one
+				log "Copying backup 'home'"
+				# Sadly we can't use -R and the '/./' path trick, as above, because ATL_BACKUPMIRROR_SOURCE_BACKUP_ROOT_HOME won't know about it
+				# Exclude export/indexsnapshots, because although it isn't present in Jira backups, we later copy it from the live ATL_DATADIR and we don't want this rsync --delete to delete it.
+				(
+					flock --exclusive 200	# Write lock to make $ATL_MANAGE/backupmirror/restore_backup wait until we're done
+					# --numeric-ids prevents rsync from doing username mapping, e.g. preserving 'jira'  from source to dest where we have deliberately chosen UIDs so 'jira' on source is 'jira-test' on dest.
+					"${rsync[@]}" -z --numeric-ids "backupmirror_source:$ATL_BACKUPMIRROR_SOURCE_BACKUP_ROOT_HOME" "$destdir/$backup_instance/home" --exclude "**/export/" --exclude "**/index" --delete-excluded
+
+					## Backups intentionally don't include index files, which are big and can be regenerated. However since we don't want to wait for index regeneration, let's sync index backups over.
+					if [[ $ATL_PRODUCT = jira ]]; then
+						log "Copying index snapshots.."
+						## The ../current/ hack wasn't working when backups is a symlink, as with LO. Here we presume that ATL_BACKUPMIRROR_SOURCE_DATADIR is defined
+
+						"${rsync[@]}" -R "backupmirror_source:$ATL_BACKUPMIRROR_SOURCE_DATADIR/./export/indexsnapshots" "$destdir/$backup_instance/home/"
+					elif [[ $ATL_PRODUCT = confluence ]]; then
+						log "Copying indexes.."
+						# Conf 6.15.6 uses 'index'.
+						"${rsync[@]}" -R "backupmirror_source:$ATL_BACKUPMIRROR_SOURCE_DATADIR/./index" "$destdir/$backup_instance/home"
+					fi
+				) 200>"$ATL_LOCKDIR"/backupmirror.home.lock
+				;;
+		esac
+		done
+		if [[ $* =~ -v ]]; then set +x; fi
+	else
+		error "$(uname -n) is neither source nor destination"
+	fi
+}
+
+validate_backupmirror_source_ssh()
+{
+	if ! output="$("${sshcmd[@]}" backupmirror_source true 2>&1)"; then
+		error "On $(uname -n), running as $USER (HOME=$HOME), with ssh-agent containing «$(ssh-add -l)», the following command failed: ${sshcmd[*]} backupmirror_source true\n$output"
+	fi
+}
+
+validate_backupmirror_source_uname()
+{
+	[[ -v ATL_BACKUPMIRROR_SOURCE_HOST_UNAME ]] || error "Please set ATL_BACKUPMIRROR_SOURCE_HOST_UNAME on $(uname -n):${ATL_VARIABLE_SOURCE:-the relevant .env}"
+	local sourcehost_uname
+	sourcehost_uname="$("${sshcmd[@]}" backupmirror_source uname -n)"
+	if [[ $ATL_BACKUPMIRROR_SOURCE_HOST_UNAME != "$sourcehost_uname" ]]; then
+		error "We connected from $(uname -n) to $ATL_BACKUPMIRROR_SOURCE_HOST${ATL_BACKUPMIRROR_SOURCE_PORT:+:$ATL_BACKUPMIRROR_SOURCE_PORT} expecting to find server $ATL_BACKUPMIRROR_SOURCE_HOST_UNAME, (the ATL_BACKUPMIRROR_SOURCE_HOST_UNAME setting), but instead the server identified itself as $sourcehost_uname. Please either fix ATL_BACKUPMIRROR_SOURCE_HOST / ATL_BACKUPMIRROR_SOURCE_PORT or set ATL_BACKUPMIRROR_SOURCE_HOST_UNAME to '$sourcehost_uname'"
+	else
+		log "Validated uname over SSH"
+	fi
+}
+
+main "$@"

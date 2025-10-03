@@ -1,0 +1,100 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+source "$ATL_MANAGE"/lib/profile.sh
+
+main() {
+	if [[ $# = 1 && $1 =~ -h ]]; then usage; fi
+	[[ $ATL_DATABASE_TYPE = mysql ]] || fail "ATL_DATBASE_TYPE set to '$ATL_DATABASE_TYPE'"
+
+	if [[ $ATL_DATABASE_HOST = localhost ]]; then
+		if ! pkginstalled mysql-server-"$ATL_DATABASE_VERSION"; then
+			if ! pkginstalled mariadb-server-"$ATL_DATABASE_VERSION"; then
+				pkginstall mariadb-server-"$ATL_DATABASE_VERSION"
+			fi
+		fi
+		grant_clients_access "$@"
+	else
+		if ! pkginstalled mysql-common; then
+			if ! pkginstalled mariadb-common; then
+				pkginstall mariadb-client mariadb-common
+			fi
+		fi
+	fi
+	set_superuser_password "$@"
+}
+
+usage() {
+	echo >&2 "Purpose: Installs $ATL_DATABASE_TYPE $ATL_DATABASE_VERSION. If the database is running on a separate server to clients, we optionally grant remote TCP access to indicated clients"
+	echo >&2 "Usage: $0 [<remoteclient> ...]"
+	echo >&2
+	echo >&2 "Where:"
+	echo >&2 "    <client> is the IP or hostname of a remote client to allow access from. This is not needed for local connections"
+	echo >&2
+	exit 1
+}
+
+grant_clients_access() {
+	while [[ $# -gt 0 ]]; do
+		fail "Granting client access is not yet implemented for mysql"
+	done
+}
+
+set_superuser_password() {
+	((i = 3))
+	while ! check_superuser_connection && ((i--)); do
+		if [[ $ATL_DATABASE_HOST = localhost ]]; then
+			local sourcedprofiles
+			# Convert space-separated string to array
+			sourcedprofiles=(${ATL_PROFILEFILES_SOURCED})
+			best_profile_file="$ATL_PROFILEDIR/${sourcedprofiles[1]:-${sourcedprofiles[0]}}" # [0] is the most generic (e.g. [host=myserver]), but may not be set, so fall back to [0] ('jira.foo.com')
+			while [[ ! -v ATL_DATABASE_SUPERUSER ]]; do
+				warn "Please set ATL_DATABASE_SUPERUSER. E.g. { echo ATL_DATABASE_SUPERUSER=root >> '$best_profile_file'; }"
+				"$SHELL"
+				_atl_profile load "$ATL_LONGNAME"
+			done
+			while [[ ! -v ATL_DATABASE_SUPERPASSWORD ]]; do
+				if [[ ${ATL_DATABASE_HOST:-} = localhost ]]; then
+					local newpass
+					newpass="$(pwgen -1s)"
+					warn "Please set ATL_DATABASE_SUPERPASSWORD for superuser $ATL_DATABASE_SUPERUSER. If this is currently unset, set it with: 
+					sudo su - -c mysql       
+					# ALTER USER 'root'@'localhost' IDENTIFIED BY '$newpass';
+					exit
+					{ echo \"ATL_DATABASE_SUPERPASSWORD='$newpass'\" >> '$best_profile_file'; }"
+					"$SHELL"
+				else
+					warn "Please set ATL_DATABASE_SUPERPASSWORD, so we can connect to $ATL_DATABASE_SUPERUSER@$ATL_DATABASE_HOST."
+					"$SHELL"
+				fi
+				_atl_profile load "$ATL_LONGNAME"
+			done
+
+			if [[ $ATL_DATABASE_SUPERPASSWORD = "$ATL_DATABASE_USER" || $ATL_DATABASE_SUPERPASSWORD = "$ATL_DATABASE_SUPERUSER" ]]; then
+				fail "Sorry, '$ATL_DATABASE_SUPERPASSWORD' is a terrible password. Please: { echo ATL_DATABASE_SUPERPASSWORD=$(pwgen -1s) >> '$best_profile_file'; } and try again"
+			fi
+
+			# At this point we failed an initial connection attempt, but perhaps our database is newly installed with the default password (''). Try to connect with socket auth as 'root':
+			if ATL_DATABASE_SUPERUSER=root ATL_DATABASE_SUPERPASSWORD='' check_superuser_connection --protocol=socket; then
+				warn "Please now set the 'root' TCP password with:
+				mysql -uroot --password='' -e \"ALTER USER '$ATL_DATABASE_SUPERUSER'@'localhost' IDENTIFIED BY '$ATL_DATABASE_SUPERPASSWORD';\""
+				"$SHELL"
+			fi
+		else
+			if [[ -v ATL_DATABASE_SUPERUSER || -v ATL_DATABASE_SUPERPASSWORD ]]; then
+				error "Database is remote, but ATL_DATABASE_SUPERUSER and/or ATL_DATABASE_SUPERPASSWORD are unset. These variables are required for rsnapshot database backups and other purposes (see TODO)"
+			fi
+			error "FIXME: Modify $0 with code to set the '$ATL_DATABASE_SUPERUSER' remote password to '$ATL_DATABASE_SUPERPASSWORD'. I think it is just: alter user \"$ATL_DATABASE_SUPERUSER\" with password '$ATL_DATABASE_SUPERPASSWORD';"
+		fi
+	done
+	((i > 0)) || fail "Failed to set superuser password"
+}
+
+check_superuser_connection() {
+	# Note that we have to specify the database because the default, $ATL_DATABASE, probably doesn't exist yet.
+	# Hardcode path to atl_mysql in case $ATL_APPDIR/.env/atl_mysql is defined but has %{tokens} (patchqueue not pushed)
+	"$ATL_MANAGE"/bin/atl_mysql --super --database=mysql "$@" -e 'select 1;' >/dev/null
+}
+
+main "$@"

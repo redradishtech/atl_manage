@@ -1,0 +1,128 @@
+#!/bin/bash -eu
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+# shellcheck source=/opt/atl_manage/lib/zfs.sh
+source "$ATL_MANAGE/lib/zfs.sh" --
+
+main() {
+	sanity_checks
+	if [[ -v ATL_ZFS ]]; then
+
+		# Our directories user marker files to indicate upgrade history. These marker files would be lost under a clean ZFS snapshot restore, so we note what the markerfile is and restore it later.
+		# The rsync equivalent has an --exclude to avoid the same problem.
+		log "Looking in $ATL_DATADIR_NEW for DOWNGRADED_* markerfiles"
+		local markerfile=$(
+			shopt -s nullglob
+			echo "$ATL_DATADIR_NEW"/DOWNGRADED_*
+		)
+		zfs_delete_filesystem_if_exists "${ATL_ZFSPOOL}$ATL_DATADIR_NEW"
+
+		local snap_before_upgrade="${ATL_ZFSPOOL}$ATL_DATADIR@before-upgrade-to-$ATL_NEWVER"
+		if zfs_snapshot_exists  "$snap_before_upgrade"; then
+			warn "Snapshot from prior upgrade attempt will be deleted: $snap_before_upgrade"
+			zfs_delete_snapshot_if_exists "${ATL_ZFSPOOL}$ATL_DATADIR@before-upgrade-to-$ATL_NEWVER"
+		fi
+		zfs_clone "${ATL_ZFSPOOL}$ATL_DATADIR" "${ATL_ZFSPOOL}$ATL_DATADIR_NEW" "before-upgrade-to-$ATL_NEWVER"
+		if [[ -n "$markerfile" ]]; then
+			LOG "Recreating $markerfile"
+			touch "$markerfile"
+		fi
+	else
+		do_rsync "$@"
+	fi
+}
+
+sanity_checks() {
+	[[ ! -v ATL_DATADIR_VERSIONED || $ATL_DATADIR_VERSIONED = true ]] || error "ATL_DATADIR_VERSIONED=false means 'atl_upgrade_copydata' should never be called"
+	[[ -v ATL_NEWVER ]] || error "ATL_NEWVER is unset. Please 'atl_edit' and set ATL_NEWVER to indicate the new version"
+	[[ -v ATL_DATADIR_NEW ]] || error "ATL_DATADIR_NEW is unset. It should be auto-set by atl_profile"
+	$ATL_DATADIR_VERSIONED || error "$0 should not be called for apps without versioned data directories"
+	[[ -d "$ATL_DATADIR" ]] || error "Missing $ATL_DATADIR data directory"
+	# ls -A tests for any contents in the directory (https://superuser.com/questions/352289/bash-scripting-test-for-empty-directory). Needed, since atl_upgrade_switchver creates an empty dir to symlink to.
+}
+
+hardlink() {
+	[[ $ATL_ROLE != prod || $* =~ --hardlink ]]
+	# Perhaps we need a flag analogous to ATL_BACKUPMIRROR_HARDLINK=true
+}
+
+# Checks if there is enough free disk space to copy $ATL_DATADIR to $ATL_DATADIR_NEW/
+check_diskspace() {
+	# https://stackoverflow.com/questions/8110530/check-free-disk-space-for-current-partition-in-bash/8110535
+	((free = $(($(stat -f --format="%a*%S" "$ATL_DATADIR")))))
+	warn "Now doing a very slow 'du' of $ATL_DATADIR"
+	((src = "$(du -sb "$ATL_DATADIR/" | awk '{print $1}')"))
+	if [[ -d "$ATL_DATADIR_NEW/" ]]; then
+		warn "Now doing a very slow 'du' of $ATL_DATADIR_NEW"
+		local dest="$(du -sb "$ATL_DATADIR_NEW/" | awk '{print $1}')"
+	else
+		local dest=0
+	fi
+	needed=$((src - dest))
+	if ((free > needed)); then
+		log "We have enough free disk space $(((free - needed) / 1024 / 1024 / 1024))Gb free *after* copy"
+	else
+		local msg="Boo, not enough free disk space. Data is $((needed / 1024 / 1024 / 1024))Gb, we have only $((free / 1024 / 1024 / 1024))Gb left. Not proceeding"
+		if hardlink "$@"; then
+			# If we're hardlinking then we don't actually know how much disk space is required, but it probably isn't much. Print a warning instead of an error
+			warn "$msg"
+		else
+			error "$msg"
+		fi
+	fi
+}
+
+do_rsync() {
+	case $ATL_PRODUCT in
+	jira)
+		args=(--exclude .jira-home.lock "--exclude=log/**")
+		;;
+	confluence | crowd)
+		args=("--exclude=logs/**")
+		;;
+	*)
+		args=()
+		;;
+	esac
+
+	if hardlink "$@"; then
+		# If not in production, speed things up by hardlinking to the old version
+		args+=("--link-dest=$ATL_DATADIR/")
+	fi
+	if [[ -e $ATL_DATADIR_NEW ]] && [[ -n $(ls -A "$ATL_DATADIR_NEW") ]] && ! [[ $* =~ -f ]]; then
+		warn "$ATL_DATADIR_NEW already exists. If you are SURE $ATL_NEWVER doesn't contain anything original, add -f"
+	else
+		check_diskspace "$ATL_DATADIR" "$@"
+		# Note: we don't copy ACLs (--acls) because (unlike in ATL_APPDIR) as yet we don't have any
+		set -x
+		# We exclude DOWNGRADED_TO.*.txt for the situation when we atl_upgrade, atl_downgrade, then atl_upgrade again. On the last atl_upgrade we 'atl_upgrade_copydata -f' as usual, which would blow away the DOWNGRADED_TO marker. However losing that marker would cause switchver to then fail, because we have a next/ symlink pointing to that directory and switchver expects it to contain a DOWNGRADED_TO marker.
+		# It's slightly ugly to hardcode knowledge of switchver here, but it's a cost of switchver's marker file technique
+		# First rsync ignoring changes to our source, which is still live
+		"$ATL_MANAGE"/lib/rsync_ignore_vanished -raH --delete "$ATL_DATADIR/" "$ATL_DATADIR_NEW" --exclude "DOWNGRADED_TO*" "${args[@]}"
+		rsync -raH --delete "$ATL_DATADIR/" "$ATL_DATADIR_NEW" --exclude "DOWNGRADED_TO*" "${args[@]}"
+	fi
+
+	check_using_jndi
+}
+
+check_using_jndi() {
+	local configfile
+	case "$ATL_PRODUCT" in
+	crowd) configfile="$ATL_DATADIR/shared/crowd.cfg.xml" ;;
+	confluence) configfile="$ATL_DATADIR/confluence.cfg.xml" ;;
+	jira) configfile="$ATL_DATADIR/dbconfig.xml" ;;
+	esac
+	case "$ATL_PRODUCT" in
+	jira | confluence)
+		if [[ -n "$configfile" ]]; then
+			grep -q java:comp/env/jdbc/ "$configfile" || warn "WARNING: the config file '$configfile' does not contain a JNDI path. We need to use JNDI for JavaMelody to do its thing"
+		fi
+		;;
+	esac
+}
+
+if [[ $0 =~ atl_upgrade_copydata ]]; then
+	main "$@"
+fi

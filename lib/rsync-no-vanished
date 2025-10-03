@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# A variant of rsync that avoids 'file has vanished:' errors when the source fileset changes (e.g. when syncing live Jira indexes in $ATL_MANAGE/backupmirror/sync_backup)
+# https://unix.stackexchange.com/questions/86879/suppress-rsync-warning-some-files-vanished-before-they-could-be-transferred
+# https://git.samba.org/?p=rsync.git;a=blob_plain;f=support/rsync-no-vanished;hb=HEAD
+
+IGNOREEXIT=24
+IGNOREOUT='^(file has vanished: |rsync warning: some files vanished before they could be transferred)'
+
+set -o pipefail
+
+rsync "${@}" 2>&1 | (egrep -v "$IGNOREOUT" || true)
+ret=$?
+
+if [[ $ret == $IGNOREEXIT ]]; then
+	ret=0
+fi
+
+exit $ret

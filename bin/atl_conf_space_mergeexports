@@ -1,0 +1,47 @@
+#!/bin/bash -eu
+
+. /opt/atl_manage/lib/common.sh --nolog
+shopt -s lastpipe
+
+main() {
+	#	outfile="$1"; shift
+	#	[[ ! -f "$outfile" ]] || fail "$outfile already exists"
+	#	[[ $outfile =~ .+.zip ]] || fail "First arg expected to be the form <something>.zip"
+	declare -a infiles
+	while (($#)); do
+		infile="$1"
+		shift
+		[[ -f "$infile" ]] || fail "$infile does not exist"
+		infiles+=("$(readlink -f "$infile")")
+	done
+	spaces=()
+	rm -rf tempMergedExport
+	mkdir -p tempMergedExport
+	cd tempMergedExport
+	for f in "${infiles[@]}"; do
+		log "Processing $f"
+		rm -f exportDescriptor.properties
+		unzip -q "$f" -x entities.xml || :
+		eval $(cat exportDescriptor.properties | grep spaceKey)
+		log "$f contained space $spaceKey"
+		spaces+=("$spaceKey")
+	done
+	outzip="${spaces[*]}.zip"
+	outzip="${outzip// /_}"
+	zip -r ../"$outzip" *
+	log "Generated $outzip"
+	log "Now generating merged entities.xml"
+	rm -f entities.xml
+	/home/jturner/repos/edgecast-import/confluence/confspacezipmerger/bin/confspacezipmerger "${infiles[@]}"
+	zip -u "$outzip" entities.xml
+	log "Finished: $outzip"
+
+}
+
+usage() {
+	echo >&2 "Usage $0 zip1 [zip2 ....]"
+	exit 2
+}
+
+(($#)) || usage
+main "$@"

@@ -1,0 +1,70 @@
+#!/bin/bash
+
+. /opt/atl_manage/lib/common.sh
+
+base="$(dirname "$(readlink -f "$0")")"
+log "base $base"
+# shellcheck source=/opt/atl_manage/lib/appfetcher/fetch
+. "$base/../fetch"
+
+tmp="/tmp/appfetcher-tests"
+
+main() {
+
+	test_unarchive_zip "$@"
+	#test_unarchive_corrupt_zip "$@"
+	#test_unarchive_git "$@"
+	#test_fetch_http "$@"
+	#test_fetch_git "$@"
+}
+
+test_fetch_git() {
+	[[ -d "$tmp/gitrepo" ]] || mkgitrepo
+
+	url() { echo "file:$tmp/gitrepo"; }
+	ver() { echo "tip"; }
+	cd "$(fetch)"
+	[[ -d .git ]] || fail
+}
+
+test_fetch_http() {
+	url() { echo "http://localhost"; }
+	ver() { echo "master"; }
+	validate() { :; }
+	[[ $(file "$(fetch)") =~ HTML ]]
+}
+
+test_unarchive_zip() (
+	url() { echo "$base/fakeapp-1.0.zip"; }
+	ver() { echo "1.0"; }
+	cd "$(unarchive "$(url)")"
+	[[ -f file1.txt ]] || fail
+	[[ -f file2.txt ]] || fail
+)
+
+test_unarchive_corrupt_zip() {
+	url() { echo "$base/corrupt.zip"; }
+	ver() { echo "1.0"; }
+	unarchive "$(url)" || log "Exit code $?"
+	log "Boo"
+}
+
+test_unarchive_git() {
+	url() { echo "$tmp/gitrepo"; }
+	ver() { echo "tip"; }
+	cd "$(unarchive "$(fetch_git)")"
+	[[ -d .git ]] || fail
+	[[ -f foo.txt ]] || fail
+}
+
+mkgitrepo() (
+	mkdir -p "$tmp/gitrepo"
+	cd "$_"
+	date > foo.txt
+	git init
+	git add foo.txt
+	git commit -am "Test commit"
+	git rev-list --reverse --topo-order --first-parent HEAD | sed 1q >&2
+) >/dev/null
+main "$@"
+

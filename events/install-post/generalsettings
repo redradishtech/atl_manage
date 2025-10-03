@@ -1,0 +1,13 @@
+#!/bin/bash -eu
+
+_install() (
+	set -euo pipefail
+)
+
+_uninstall() (
+	set -euo pipefail
+)
+
+_install "$@"
+
+# vim: set ft=sh:

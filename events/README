@@ -1,0 +1,33 @@
+# AtlManage Events
+
+We have an event system modelled on Debian packaging (preinst, postinst, etc).
+
+When an 'event' (e.g. application deploy, stop, start, restart, upgrade, error) occurs, we want to take various actions
+depending on what features the deployed application uses. This events/ directory has subdirectories for each event
+(usually `<event>-pre` and `<event>-post`). Scripts found in the `<event>-<state>/` directory are run when `<event>`
+fires when the app is in `<state>`.
+
+## Event triggers
+
+Events can be triggered manually with `atl_event` (e.g. `atl_event start-pre`), but are usually a result of another
+script or event:
+
+`atl_start` triggers `start-pre` and `start-post`
+`atl_stop` triggers `stop-pre` and `stop-post`
+`atl_reload` triggers `reload-pre`
+`atl_install` triggers `install-pre` and `install-post`
+`atl_activate` triggers `install-post`
+`atl_upgrade` triggers (directly or indirectly) `upgrade-running-pre`, `stop-pre`, `stop-post`, `upgrade-stopped-pre`, `install-post`, `upgrade-stopped-post`, `start-pre`, `start-post`, `upgrade-running-post`.
+
+
+For systemd-managed-apps, the systemd service calls `start-pre`/ `start-post` on starting, and `stop-pre` / `stop-post`
+ on stopping. `start-pre` lets us check:
+  - that this isn't a standby instance (`start-pre/00_check_role`)
+  - that the database is listening (`start-pre/01_wait_for_database`)
+  - that the app deployment is ok (`start-pre/check_appdeployment`)
+  - that email isn't disabled (`start-pre/check_email`)
+  - etc
+
+Nagios monitoring may trigger `outofmemory`, `highload`, `servicedown`, `slowness` or `toomanyactivethreads` events.
+E.g. an `outofmemory` event will invoke (`outofmemory/diagnostics`), which calls `atl_diagnostics` to capture
+information about the problem.

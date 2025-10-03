@@ -1,0 +1,25 @@
+#!/bin/bash -eu
+
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+main() {
+	local issueid="$1"
+	local ids="$(zgrep -h -F "JIRA.$issueid" /var/log/mail.log{,.[1..2]*} | awk -F: '{print $4}' | xargs | sed -e 's/ /|/g')"
+	zegrep "($ids)" /var/log/mail.log{,.[1..2]*} >/tmp/relevant-logs.txt || true
+	cat /tmp/relevant-logs.txt | grep to= | perl -pe 's/.*to=<(.+)>, .*/\1/g' | sort | uniq
+	#cat /tmp/relevant-logs.txt | grep to=
+}
+
+usage() {
+	echo >&2 "Usage: $0 <issueid>"
+	exit 2
+}
+
+if [[ $# != 1 ]]; then
+	usage
+fi
+
+main "$@"

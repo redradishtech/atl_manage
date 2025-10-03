@@ -1,0 +1,11 @@
+#!/bin/bash -eu
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/switchver.sh
+source "$ATL_MANAGE/lib/switchver.sh"
+
+main() {
+	switchver "$@"
+}
+
+main "$@"

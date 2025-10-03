@@ -1,0 +1,68 @@
+#!/bin/bash -eu
+# Installs the LetsEncrypt certificate renewal cronjob and montitoring script.
+# This script is aliased to the various LetsEncrypt renewal implementation post-functions (http01, dns, etc)
+
+install-post() {
+	validate_cert_exists() {
+		if [[ -v ATL_SSLCERTFILE && -f "$ATL_SSLCERTFILE" ]]; then
+			log "LetsEncrypt cert found"
+			return
+		fi
+	}
+
+	install_certbot() (
+		# The 'activate' bash script doesn't like -eu (at least on dlp)
+		set +eu
+		. "$ATL_MANAGE"/venv/bin/activate
+		pip3 install wheel certbot
+		# FIXME: We either need to install cloudflare:
+		#pip3 install certbot-dns-cloudflare
+		# Or apt-get install libaugeas0
+		# and pip3 install certbot-apache python-augeas
+	)
+
+	[[ -v ATL_SSLCERT_VIA_LETSENCRYPT ]] || fail "Expected ATL_SSLCERT_VIA_LETSENCRYPT to be set"
+	install_certbot
+	if [[ -d "$ATL_APPDIR"/letsencrypt ]]; then
+		atl_install_monitoring_services "$ATL_APPDIR"/letsencrypt/
+	fi
+	validate_cert_exists
+	# For Ubuntu 20.04 we need certbot python3-certbot-apache
+	# Note that certbot-dns-cloudflare requires a version more recent than exists in the PPA to support non-global API keys (https://certbot-dns-cloudflare.readthedocs.io/en/stable/#). So we do it with pip3 above instead of debs.
+	# 	if ! command -v certbot > /dev/null; then
+	# 		apt-get update
+	# 		apt-get install software-properties-common
+	# 		add-apt-repository universe
+	# 		add-apt-repository ppa:certbot/certbot
+	# 		apt-get update
+	# 		apt-get install certbot python-certbot-apache
+	# 		# pkginstall won't upgrade installed packages
+	# 		#pkginstall certbot python-certbot-apache
+	# 	fi
+	#	warn "FIXME FIXME FIXME FIXME FIXME"
+	#	warn "FIXME FIXME FIXME FIXME FIXME"
+	#	warn "No LetsEncrypt certificate found."
+	#	warn "If you wish to register a $ATL_FQDN LE cert, authenticating via HTTP, please run the following command without --dry-run:"
+	#	set -x
+	#	#certbot certonly --dns-cloudflare --dns-cloudflare-credentials $ATL_APPDIR/.secrets/cloudflare.ini -d coastec.net.au
+	#	#certbot certonly --agree-tos ${ATL_LETSENCRYPT_EMAIL:+-m $ATL_LETSENCRYPT_EMAIL} --webroot -w "$ATL_APPDIR" -d "$ATL_FQDN"  --dry-run || true
+	#	set +x
+	#	warn "FIXME FIXME FIXME FIXME FIXME"
+	#	warn "FIXME FIXME FIXME FIXME FIXME"
+	#	warn "Then set in $ATL_PROFILEDIR/$ATL_SHORTNAME:"
+	#	warn "ATL_SSLCERTFILE=/etc/letsencrypt/live/$ATL_FQDN/fullchain.pem"
+	#	warn "ATL_SSLCERTKEYFILE=/etc/letsencrypt/live/$ATL_FQDN/privkey.pem"
+	#	warn "FIXME FIXME FIXME FIXME FIXME"
+	#	warn "FIXME FIXME FIXME FIXME FIXME"
+}
+
+uninstall-pre() {
+	atl_uninstall_monitoring_services "$ATL_APPDIR"/letsencrypt/letsencrypt-renew.healthcheck
+}
+
+enabled() {
+	[[ $ATL_ROLE = prod ]]
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

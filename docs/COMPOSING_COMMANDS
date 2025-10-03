@@ -1,0 +1,55 @@
+Sometimes a script calls a lower-level script. For instance 'atl_logstats index' is equivalent to 'lib/atl_jira_indexstats'
+
+To implement this:
+- The callee must be sourceable without executing, and must have a 'main' function e.g.:
+
+main() {
+... 
+}
+
+if [[ $0 =~ atl_jira_indexstats ]]; then
+	main "$@"
+fi
+
+
+- The callee must have a 'usage' function that allows a CMD variable to serve the purpose of $0:
+usage()
+{
+	local cmd="${CMD:-$0}"
+	cat <<EOF
+Usage: $cmd <jq expression>"
+Purpose: $(grep -m1 '##' "$0" | sed -e 's/## //')"
+Examples:"
+	$cmd 'last'				# Print most recent stats "
+
+
+
+- The caller's getopt unfortunately has to understand all the callee's args. E.g. storing them in a 'subopts' array, for later passing::
+
+	while true; do
+		case "$1" in
+			--) shift; break	;;
+			--annotate)	subopts+=(--annotate);;
+			--full)	subopts+=(--full);;
+			-h|--help) usage	;;
+			*) usage ;;
+		esac
+		shift
+	done
+
+- The caller can then execute the callee with something like:
+
+	if [[ $monitor = index ]]; then
+		(
+		. "$ATL_MANAGE"/lib/atl_jira_indexstats
+		CMD="atl_logstats index" main "${subopts[@]}" "$@";
+		)
+	else
+	...
+
+- The caller's usage() function can incorporate the callee's usage with:
+
+$(
+. "$ATL_MANAGE"/lib/atl_jira_indexstats
+CMD="atl_logstats index" usage 2>&1 "${subopts[@]}" "$@";
+)

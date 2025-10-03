@@ -1,0 +1,151 @@
+#!/bin/bash -eu
+## Verify that the app is going to connect to the correct database, as specified by ATL_DATABASE* variables.
+
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+[[ "$ATL_PRODUCT" = jira || "$ATL_PRODUCT" = confluence ]] || exit 0
+
+main() {
+	addnl() { awk 1; } # Awful hack to ensure lines end with newline. https://unix.stackexchange.com/questions/418060/read-a-line-oriented-file-which-may-not-end-with-a-newline
+
+	# The %-* converts 'postgresql-rds' to 'postgresql'
+	local expected_jdbcurl="jdbc:${ATL_DATABASE_TYPE%-*}://$ATL_DATABASE_HOST:$ATL_DATABASE_PORT/$ATL_DATABASE"
+	declare -a xmlstarlet_operations
+	declare -A props
+
+	case "$ATL_PRODUCT" in
+	jira)
+		configfile="$ATL_DATADIR"/dbconfig.xml
+		if [[ ! -f $configfile ]]; then warn "Missing $configfile" && exit; fi
+
+		if [[ -v ATL_STARTUP_NO_DBCONFIG_WARNING ]]; then return; fi
+
+		if [[ "${ATL_DATABASE_USE_JNDI:-}" = true ]]; then
+			# Use JNDI
+			local expected_jndiname="java:comp/env/jdbc/${ATL_PRODUCT_CAPITALIZED}DS"
+
+			if xmlstarlet sel -t -v "/jira-database-config/jdbc-datasource" "$configfile" >/dev/null; then
+				# ..but we're configured for JDBC! migrate to JNDI
+				log "Migrating from direct jdbc parameters to datasource in $configfile:"
+				xmlstarlet_operations=(--delete '/jira-database-config/jdbc-datasource'
+					--subnode '/jira-database-config' -t elem -n jndi-datasource -v ""
+					--subnode /jira-database-config/jndi-datasource -t elem -n jndi-name -v "$expected_jndiname")
+			else
+				# Verify we have the expected JNDI datasource declared
+				xmlstarlet sel -t -v "/jira-database-config/jndi-datasource/jndi-name" "$configfile" | addnl | while read -r jndiname; do
+					[[ $jndiname = "$expected_jndiname" ]] || fail "$configfile was expected to contain $expected_jndiname, not $jndiname"
+				done || fail "Missing jndi datasource field in $configfile"
+			fi
+		else
+			# Use direct JDBC
+			if xmlstarlet sel -t -v "/jira-database-config/jndi-datasource" "$configfile" >/dev/null; then
+				# ..but we're configured for JNDI! Remove 'jndi-datasource' node, replacing with a stub 'jdbc-datasource' node to be populated below
+				log "Migrating from datasource to direct parameters in $configfile:"
+				xmlstarlet_operations=(--delete '/jira-database-config/jndi-datasource'
+					--subnode '/jira-database-config' -t elem -n jdbc-datasource -v "")
+			fi
+
+			props["url"]="$expected_jdbcurl"
+			props["username"]="$ATL_DATABASE_USER"
+			props["password"]="$ATL_DATABASE_PASSWORD"
+			props["driver-class"]="$ATL_DATABASE_DRIVER"
+			props["pool-min-size"]="20"
+			props["pool-max-size"]="20"
+			props["pool-max-wait"]="30000"
+			props["pool-max-idle"]="20"
+			props["pool-remove-abandoned"]="true"
+			props["pool-remove-abandoned-timeout"]="300"
+			props["validation-query"]="select version();"
+			props["min-evictable-idle-time-millis"]="60000"
+			props["time-between-eviction-runs-millis"]="300000"
+			props["pool-test-while-idle"]="true"
+			props["pool-test-on-borrow"]="false"
+
+		fi
+		;;
+	confluence)
+		configfile="$ATL_DATADIR"/confluence.cfg.xml
+		if [[ ! -f "$configfile" ]]; then warn "Missing $configfile" && exit; fi
+		# We're expecting a line: <property name="hibernate.connection.datasource">java:comp/env/jdbc/ConfluenceDS</property>
+		xmlstarlet sel -t -v /confluence-configuration/setupStep "$configfile" | addnl | while read -r setupStep; do
+			if [[ $setupStep != complete ]]; then
+				log "$configfile is in setupStep $setupStep; continuing.."
+				exit 0
+			fi
+		done || {
+			log "$configfile is missing /confluence-configuration/setupStep node. Assuming we're early in the setup"
+			exit 0
+		}
+
+		if [[ "${ATL_DATABASE_USE_JNDI:-}" = true ]]; then
+			warn "ATL_DATABASE_USE_JNDI is set, but unfortunately Confluence these days requires direct JDBC connections. Leaving config file unmodified"
+			exit 0
+		fi
+
+		if xmlstarlet sel -t -v "/confluence-configuration/properties/property[@name='hibernate.connection.datasource']" "$configfile" >/dev/null; then
+			log "Migrating from datasource to direct parameters in $configfile:"
+			prop confluence del "hibernate.connection.datasource"
+		fi
+
+		props["hibernate.connection.url"]="$expected_jdbcurl"
+		props["hibernate.connection.username"]="$ATL_DATABASE_USER"
+		props["hibernate.connection.password"]="$ATL_DATABASE_PASSWORD"
+		props["hibernate.connection.driver_class"]="$ATL_DATABASE_DRIVER"
+
+		;;
+	*) : ;;
+	esac
+
+	# $props contains key:value pairs we need. This loop populates $xmlstarlet_operations to set the right values
+	for key in "${!props[@]}"; do
+		expected="${props[$key]}"
+		actual=$(prop "$ATL_PRODUCT" get "$key") || prop "$ATL_PRODUCT" add "$key" "$expected"
+		if [[ $actual != "$expected" ]]; then
+			warn "$configfile had wrong $key property value '$actual'. Changing to $expected"
+			prop "$ATL_PRODUCT" del "$key"
+			prop "$ATL_PRODUCT" add "$key" "$expected"
+		fi
+	done
+
+	if [[ -v xmlstarlet_operations ]]; then
+		# Apply the changes. We want to preserve the original $configfile ownership and permissions, so we get the new contents into a temporary $configfile.new, then blat that over $configfile
+		xmlstarlet ed -P -S "${xmlstarlet_operations[@]}" "$configfile" | xmllint -format - >"$configfile.new"
+		cat "$configfile.new" >"$configfile"
+		rm "$configfile.new"
+	fi
+}
+
+# Get, set or delete db props in the config file. Actually, we only populate $xmlstarlet_operations to be later run in bulk
+prop() {
+	local app="$1"
+	shift # jira, confluence
+	local operation="$1"
+	shift # get, del, add
+	case "$app" in
+	jira)
+		xpath="/jira-database-config/jdbc-datasource/$1"
+		case "$operation" in
+		get) xmlstarlet sel -t -v "$xpath" "$configfile" ;;
+		del) xmlstarlet_operations+=(--delete "$xpath") ;;
+		add) xmlstarlet_operations+=(--subnode /jira-database-config/jdbc-datasource -t elem -n "$1" -v "$2") ;;
+		esac
+		;;
+	confluence)
+		xpath="/confluence-configuration/properties/property[@name='$1']"
+		case "$operation" in
+		get) xmlstarlet sel -t -v "$xpath" "$configfile" ;;
+		del) xmlstarlet_operations+=(--delete "$xpath") ;;
+		add)
+			xmlstarlet_operations+=(--subnode /confluence-configuration/properties -t elem -n propertyTMP -v "$2"
+				-i //propertyTMP -t attr -n name -v "$1"
+				-r //propertyTMP -v property)
+			;;
+		esac
+		;;
+	esac
+}
+
+main "$@"

@@ -1,0 +1,13 @@
+#!/bin/bash -eu
+## Prints the time range that webserver access log files (some gzipped) cover.
+
+anycat() {
+	if [[ $1 =~ .gz ]]; then zcat "$1"; else cat "$1"; fi
+}
+
+cd /var/log/"$ATL_WEBSERVER"/"$ATL_LONGNAME"
+for f in access.log access.log.1 access.log.{2..14}.gz; do
+	from=$(anycat "$f" | head -1 | grep -o '\[.*\]')
+	to=$(anycat "$f" | tail -1 | grep -o '\[.*\]')
+	echo "$f $from $to"
+done

@@ -1,0 +1,5 @@
+#!/bin/bash
+## Invokes a shell editing a copy of $ATL_APPDIR.
+## If the shell exits with a non-zero exit code, the $ATL_APPDIR copy's changes are copied safely back to $ATL_APPDIR without affecting the running application.
+
+atl_workingcopy bash

@@ -1,0 +1,31 @@
+#!/bin/bash -eu
+## Print all JQL functions defined (statically) in a plugin
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
+
+usage() {
+	echo >&2 "Usage: $0 <pluginkey>"
+	echo >&2 "E.g.: $0 com.nolddor.jql-booster-pack"
+	exit 1
+}
+main() {
+	if [[ $# -ne 1 ]]; then usage; fi
+	key="$1"
+	jar=$(atl_plugin_jar "$key")
+
+	[[ -f $jar ]] || error "Couldn't find jar for plugin $key"
+
+	set -x
+	atl_plugin_descriptor "$key" |
+		xmlstarlet sel --template --value-of '/atlassian-plugin/jql-function/@class' |
+		while read -r class; do
+			echo >&2 "Inspecting JQL class $class"
+			javap -c -l -cp "$jar" "$class" |
+				awk '/public java.lang.String getFunctionName/,/areturn/ {print}'
+		done |
+		grep 'ldc.*String ' |
+		awk '{print $NF}'
+}
+
+main "$@"

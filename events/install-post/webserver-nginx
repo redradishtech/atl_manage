@@ -1,0 +1,79 @@
+#!/bin/bash
+
+install-post() {
+	set -euo pipefail
+	enable_webserver_site() {
+		if [[ $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then
+			log "Enabling Nginx vhost: $ATL_LONGNAME"
+			ln -sf /etc/nginx/sites-available/"${ATL_LONGNAME}".conf /etc/nginx/sites-enabled/"${ATL_LONGNAME}".conf
+			nginx -t || warn "Something is wrong with Nginx's config files. Fix before restarting"
+		else
+			error "Our $ATL_APPDIR_BASE/current/ symlink does not point to \$ATL_VER ($ATL_VER). We expect it should, as we're in the POST install step. atl_install does not mess with current/ at all - that is the job for atl_upgrade. Please fix"
+		fi
+	}
+
+	install_webserver_globalconfig() {
+		install -d -m 755 /etc/nginx/conf.d
+		install -o root -g root -m 644 "$ATL_MANAGE/templates/nginx_global.conf" /etc/nginx/conf.d/
+	}
+
+	fix_nginx_logrotate() {
+
+		if [[ -f $(echo /etc/logrotate.d/*nginx) ]]; then
+			if grep -q '^/var/log/nginx/\*.log {$' /etc/logrotate.d/nginx; then
+				log "Warning: nginx log files are not being rotated"
+				set -x
+				perl -i -pe 's,^/var/log/nginx/\*.log \{$,/var/log/nginx/*.log /var/log/nginx/*/*.log {,g' /etc/logrotate.d/nginx
+				set +x
+			fi
+			if ! grep -q dateext /etc/logrotate.d/nginx; then
+				warn "FIXME: Use datestamps rather than counter for archived Apache logs"
+				#( cd /etc/logrotate.d; patch -p2 < "$ATL_MANAGE/templates/nginx.logrotate" )
+			fi
+		else
+			error "Strange; We're post-install configuring Nginx, but there is no /etc/logrotate.d/nginx file"
+		fi
+	}
+
+	define_internal_interface # Define $ATL_SHORTNAME.internal
+	pkginstall nginx-full
+	install_webserver_listener # Make the webserver listen on $ATL_SHORTNAME.internal
+	install_webserver_globalconfig
+	install_webserver_config nginx
+	fix_nginx_logrotate
+	# Create the log directory that our CustomLog and ErrorLog directives specify
+	create_logdir nginx
+	install_webserver_selfsigned_ssl
+	enable_webserver_site
+	nginx -t
+	log "FIXME: manually reload nginx"
+	rotatelogs nginx
+}
+
+uninstall-pre() {
+	set -euo pipefail
+	disable_webserver_site() {
+		symlink=/etc/nginx/sites-enabled/"$ATL_LONGNAME".conf
+		if [[ -e $symlink ]]; then
+			if [[ ! -L $symlink ]]; then error "'$symlink' is unexpectedly not a symlink"; fi
+			log "Removing symlink $symlink"
+			rm /etc/nginx/sites-enabled/"$ATL_LONGNAME".conf
+		fi
+	}
+	if [[ $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then
+		uninstall_webserver_selfsigned_ssl
+		disable_webserver_site
+		undefine_internal_interface
+	else
+		error "Our $ATL_APPDIR_BASE/current/ symlink does not point to \$ATL_VER ($ATL_VER). We expect it should. Not disabling $ATL_WEBSERVER (which uses current/ symlinks) as we risk breaking things. Please fix current/ and try again"
+	fi
+}
+
+enabled() {
+	[[ $ATL_WEBSERVER = nginx ]]
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.webserver-common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.webserver-common.sh
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

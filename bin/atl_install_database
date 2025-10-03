@@ -1,0 +1,6 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed
+
+. atl_install_"$ATL_DATABASE_TYPE" "$@"

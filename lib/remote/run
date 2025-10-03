@@ -1,0 +1,179 @@
+#shellcheck shell=bash
+
+# Parametrized 'remoterun' script used by /opt/atl_manage/backupmirror/sync and /opt/atl_manage/replication/sync
+# Typically this is not called directly, but via $ATL_MANAGE/replication/remoterun or $ATL_MANAGE/backupmirror/remoterun
+
+set -o pipefail
+# We can rely on ATL_ variables being defined.
+
+if [ $# -eq 0 ]
+then
+	echo >&2 "Invokes the given command on ${!DESTINATION_HOST}, with ssh-agent and SSH tunnel access back to $(uname -n)."
+	echo >&2 "Usage: $0 [-t] <command>"
+	echo >&2
+	echo >&2 "Use -t force-allocate a tty, e.g. with '$0 bash' (useful for debugging)"
+	exit 1
+fi
+
+main()
+{
+	ATLASSIAN_SPECIFIC_SSH_PORT=1122
+	REMOTE_FORWARDED_PORT=1123
+	if issource; then
+		hasdestination || fail "Destination not defined"
+
+		if [[ "${!DESTINATION_HOST}" =~ ' ' ]]; then
+			fail "More than one host specified in ${DESTINATION_HOST} (${!DESTINATION_HOST}). The code currently needs fixing to properly support this. Specifically, ${DESTINATION_HOST_UNAME} need to become arrays containing one value per DESTINATION_HOST. Fix this before continuing"
+		fi
+
+		systemctl --quiet is-active ssh_for_atlassianapps || fail "ssh_for_atlassianapps systemd service is not running"
+		# The -4 is to stop 'Cannot assign requested address' on ipv6-enabled destinations. https://www.electricmonk.nl/log/2014/09/24/ssh-port-forwarding-bind-cannot-assign-requested-address/
+		sshcmd=(ssh -o "LogLevel=ERROR" -A "-o PreferredAuthentications=publickey" "-o ConnectTimeout=2" -4 -R "$REMOTE_FORWARDED_PORT:localhost:$ATLASSIAN_SPECIFIC_SSH_PORT")
+		launch_ssh_agent "$@"		# Launch ssh-agent, and append settings to $sshcmd
+		# Mar/23: nowadays we rely on a port 1122 sshd being launched via systemd.
+
+		# Bash 4.3.48 doesn't like ${sshargs[@]}, hence the +. https://lists.gnu.org/archive/html/bug-bash/2010-12/msg00136.html. Bash 4.4.19 doesn't care
+		# Note: we can't use -q to suppress banners, because that also suppresses error messages like 'Permission denied (publickey,password)'. LogLevel=ERROR suppresses the banner but not errors. https://serverfault.com/questions/66986/suppressing-ssh-banner-from-openssh-client
+		# The ConnectTimeout is to prevent long hangs when manually installing, and the replication pair is down. The shorter timeout shouldn't hurt a healthy setup
+		sshdest=("${!DESTINATION_SYNCUSER}@${!DESTINATION_HOST}") 
+		validate_outgoing_ssh
+
+		sshargs=()
+		if [[ $1 = -t ]]; then
+			sshargs=("$1")
+			shift
+		fi
+		sshcmd+=(${sshargs[@]:-})
+
+		invoke_command_via_ssh "$@"
+
+	elif isdestination; then
+		ssh -F "$(gethomedir "${!DESTINATION_SYNCUSER}")/.ssh/config"  -o UserKnownHostsFile="$(gethomedir "${!DESTINATION_SYNCUSER}")/.ssh/known_hosts" "${!SOURCE_SYNCUSER}@localhost" -p $REMOTE_FORWARDED_PORT "$@"
+	else
+		error "Neither SOURCE nor DESTINATION variables is defined. The caller will normally define these by sourcing e.g. $ATL_MANAGE/backupmirror/common.sh or $ATL_MANAGE/replication/common.sh"
+	fi
+}
+
+gethomedir()
+{
+	# https://unix.stackexchange.com/questions/247576/how-to-get-home-given-user
+	getent passwd "$1" | cut -d: -f6
+}
+
+launch_ssh_agent()
+{
+	# Load a ssh-agent with SYNCUSER's private key. We will forward this ssh-agent to the destination so it can authenticate when rsync SSH'es back.
+
+	eval "$(ssh-agent| grep -v echo)" # This sets SSH_AGENT_PID
+	#shellcheck disable=SC2064
+	trap "kill $SSH_AGENT_PID" EXIT INT TERM   # Kill our ssh agent on normal and unclean termination. If this is ever changed, change it again below where it is re-done (can't have multiple traps)
+	export SSH_KEYFILE="$(gethomedir "${!SOURCE_SYNCUSER}")"/.ssh/id_ed25519
+	if ! grep -qF "$(cat "$SSH_KEYFILE".pub)" /etc/ssh/ssh_for_atlassianapps/authorized_keys; then
+		log "Configuring our root-friendly SSH to trust ${!SOURCE_SYNCUSER}'s ssh key"
+		cat "$SSH_KEYFILE".pub >> /etc/ssh/ssh_for_atlassianapps/authorized_keys
+	else
+		: #log "Root-friendly SSH already trusts ${!SOURCE_SYNCUSER}'s ssh key"
+	fi
+
+	ssh-add "$SSH_KEYFILE" 2>&1 | grep -v "Identity added" || true
+	sshcmd+=(-o IdentitiesOnly=yes -o IdentityFile="$SSH_KEYFILE")
+
+}
+
+
+# In some environments (LO), the source (e.g. usw-jira01) /etc/ssh/sshd_config has
+# 'PermitRootLogin no'. This prevents $ATL_MANAGE/backupmirror/sync from
+# SSH'ing to the primary as root@. We really need root, because (unlike with
+# replication) backupmirror syncs database backups which are root-only. 
+#
+# One workaround would be to allow 'jira' on usw-jira01 to run 'sudo rsync' and
+# then rsync --rsync-path 'sudo rsync'.  That is probably bad for security, as an
+# attacker controlling 'jira' then can rsync any file. We really, reall do want
+# to SSH in as root.
+# 
+# Our workaround is to run a second sshd, 'ssh_for_atlassianapps.service', that
+# allows root logins (/opt/atl_manage/lib/remote/sshd/) on the replication
+# standby/backupmirror source, then port-forward its port to the
+# failover/destination, which can then rsync from root@localhost:<forwarded
+# port>.
+#
+# If you were wondering what happens if the backupmirror destination blocks
+# root: that is okay; sync_backup is invoked with sudo, which we can allow in
+# sudoers since it's just one script. An alternative would be to run
+# ssh_for_atlassianapps.service on the destination as well as the source, but
+# then we'd be exposing a second root-allowing SSH port for the world.
+#
+# Going forward, we should just insist on sane PermitRootLogin. 
+
+validate_outgoing_ssh()
+{
+	[[ -v SOURCE_HOST_UNAME ]] || fail "SOURCE_HOST_UNAME must be set"
+	[[ -v $SOURCE_HOST_UNAME ]] || fail "Please set $SOURCE_HOST_UNAME on $(uname -n)"
+	[[ "${!SOURCE_HOST_UNAME}" = "$(uname -n)" ]] || fail "Source host is expected to have uname $SOURCE_HOST_UNAME (${!SOURCE_HOST_UNAME}), not '$(uname -n)'"
+	[[ -v $DESTINATION_HOST_UNAME ]] || fail "Please set $DESTINATION_HOST_UNAME on $(uname -n)"
+	# LogLevel=ERROR to suppress banners, which otherwise get appended endlessly to our log file. https://serverfault.com/questions/66986/suppressing-ssh-banner-from-openssh-client
+	local destinationhost_uname
+	# The 'exec 0<&-' closes stdin, so it doesn't claim what's meant for the later ssh. This allows echo 'echo $ATL_VER' | ./remoterun bash to work
+	destinationhost_uname="$(exec 0<&-; "${sshcmd[@]}" "${sshdest[@]}" uname -n)" || fail "Failed to connect to ${!DESTINATION_SYNCUSER}@${!DESTINATION_HOST}: $destinationhost_uname"
+
+	if [[ -z $destinationhost_uname ]]; then fail "Connected to ${!DESTINATION_SYNCUSER}@${!DESTINATION_HOST} but got blank uname"; fi
+	if [[ ${!DESTINATION_HOST_UNAME} != "$destinationhost_uname" ]]; then
+		fail "We connected from $(uname -n) to ${!DESTINATION_HOST}:22 expecting to find server ${!DESTINATION_HOST_UNAME}, (the $DESTINATION_HOST_UNAME setting), but instead the server identified itself as $destinationhost_uname. Please either fix $DESTINATION_HOST or set $DESTINATION_HOST_UNAME to '$destinationhost_uname'"
+	fi
+}
+
+invoke_command_via_ssh() 
+{
+
+	# It would be slightly nicer to have a here doc write all commands to stdin (https://stackoverflow.com/questions/4412238/what-is-the-cleanest-way-to-ssh-and-run-multiple-commands-in-bash), but that causes 'remoterun -t bash' to fail.
+
+	#shellcheck disable=SC2068,SC2154,SC2029
+	SSH_KNOWN_HOSTS="[localhost]:$REMOTE_FORWARDED_PORT $(cat /etc/ssh/ssh_for_atlassianapps/host_ed25519_key.pub)"
+	"${sshcmd[@]}" "${sshdest[@]}" " set -eu   # Fail fast
+	echo \"$SSH_KNOWN_HOSTS\" > ~/.ssh/known_hosts
+	cat > ~/.ssh/config <<-EOF
+	# Automatically generated by $0 on $(uname -n) at $(date). Feel free to delete - this will be regenerated.
+	# Variables assume a sshd has been port-forwarded to localhost:$REMOTE_FORWARDED_PORT
+	Host ${destination_type}_source
+		Hostname localhost
+		Port $REMOTE_FORWARDED_PORT
+		User ${!SOURCE_SYNCUSER}
+		PreferredAuthentications publickey
+		LogLevel ERROR
+	EOF
+	# ssh is strict on permissions, and our default umask gives group write access
+	chmod 644 ~/.ssh/config
+
+	appdir=\"${!DESTINATION_APPDIR_BASE}/$ATL_VER\"
+	[[ -d \$appdir ]] || { echo >&2 \"\$appdir does not exist on \$HOSTNAME\"; exit 1; }
+	[[ -d \$appdir/.env ]] || { echo >&2 \"\$appdir/.env does not exist on \$HOSTNAME\"; exit 1; }
+	. \"\$appdir/.env/atl_env\"
+
+	# Set a variable with the SSH command to access the ${destination_type} source
+	# I have settled on a variable because:
+	# - a function can't be inherited through 'sudo -E', as happens in the sync_backup script
+	# - a script in ~/.ssh would need to have a name incorporating \$ATL_SHORTNAME to avoid race conditions. But the script on ${destination_type} doesn't necessarily know \$ATL_SHORTNAME on the source side (e.g. 'jira' vs 'jira-test').
+	# So a variable it is. Note we don't embed the '${destination_type}_source' hostname part because we want to use this as 'sudo -e \$ssh_to_${destination_type}_source' which mustn't include a hostname
+	if [ -t 1 ]; then echo 'Hint: Try ssh ${destination_type}_source \"uname -a\"'; fi
+	#ss --no-header --processes --all --tcp \"( sport = :$REMOTE_FORWARDED_PORT )\" >&2
+	#ssh-keyscan -p $ATLASSIAN_SPECIFIC_SSH_PORT -t ed25519 localhost >&2
+	#ssh-add -l >&2
+	#cat ~/.ssh/known_hosts >&2
+	#cat ~/.ssh/config >&2
+
+	#set -x
+	${*@Q}"
+}
+issource() { [[ -v $SOURCE ]]; }
+isdestination() { [[ -v $DESTINATION ]]; }
+hassource() { [[ -v $SOURCE_HOST ]]; }
+hasdestination() { [[ -v $DESTINATION_HOST ]]; }
+
+fail() {
+	echo >&2 "$*"
+	exit 1
+}
+
+main "$@"
+# Note that we should not emit anything to stdout/stderr, unless something goes wrong, as the caller ($ATL_MANAGE/backupmirror/sync_filesystem) relies on zero-size logfiles as an indication of success
+# vim: set ft=sh:

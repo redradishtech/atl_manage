@@ -1,0 +1,29 @@
+#!/bin/bash -eu
+# Checks whether the primary can SSH to the standby and SSH back again (with SSH credentials agent-forwarded)
+# This is a necessary prerequisite for filesystem replication to work
+
+#shellcheck source=/opt/atl_manage/replication/common.sh
+. "$ATL_MANAGE/replication/common.sh"    # Define our ATL_REPLICATION_STANDBY_MIRROR_OF_PRIMARY_DATADIR var
+main()
+{
+	if issource; then
+		"$ATL_MANAGE/replication/verify" "$@"
+		echo "OK; SSH roundtrip to ${!DESTINATION_SYNCUSER}@${!DESTINATION_HOST} works"
+	elif isdestination; then
+		echo "OK; unable to test from standby"
+	fi
+}
+
+log()
+{
+	echo >&2 "$@"
+}
+
+failwarn()
+{
+	echo "$1"
+	exit 1
+}
+
+
+main "$@"

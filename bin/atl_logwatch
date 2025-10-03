@@ -1,0 +1,157 @@
+#!/bin/bash -eu
+
+PURPOSE="Watches logs of the currently selected app"
+USAGE="${0} [-f] [--access-logs]    (-f to print logs since last boot)"
+
+ATL_LOG_DISABLE_LARGEFILE_TRUNCATION=true
+
+# shellcheck source=../lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+if [[ ${1:-} = --help ]]; then
+	echo "-------------------------------------"
+	echo "Purpose: $PURPOSE"
+	echo "  Usage:"
+	echo "         $USAGE"
+	echo "-------------------------------------"
+	return 1
+fi
+
+colourize() {
+	"$ATL_MANAGE"/lib/highlight/highlight --filter RED,SEVERE --filter RED,ERROR --filter GREEN,'(?<!\w)(org|com|sk|de)\.(?!(?:atlassian|springframework|eclipse|apache|osgi|dom4j\.factory|pyxis\.greenhopper|ofbiz.core|sun|picocontainer|tuckey\.web\.filters|hazelcast|postgresql|google\.common|mchange\.v2\.c3p0|eea\.jira\.natural-searchers|quartz|codehaus\.groovy|opensymphony|com.github.kristofa.brave.servlet.BraveServletFilter))[-\w\.]+' --filter GREEN,RUNNABLE --filter GREY16,TIMED_WAITING
+}
+
+ignoretimestamps() {
+	# filter out timestamps of the form:
+	# 2016-12-09 12:20:05,824
+	case "$ATL_PRODUCT" in
+	jira)
+		# JIRA appends the thread id (e.g. 'ajp-nio-127.1.200.4-8009-exec-1') right after the timestamp. Filter that out too.
+		sed -e 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9:,]\{12\} [^ ]\+ //g'
+		;;
+	confluence)
+		# Confluence appends the thread id after the severity, e.g.:
+		# 2017-01-04 23:38:33,717 WARN [localhost-startStop-1]
+		# Our regexp extracts the priority ('WARN').
+		sed -e 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9:,]\{12\} \([^ ]\+\) [^ ]\+/\1/g'
+		;;
+	crowd)
+		# Sample crowd log:
+		#2016-12-17 02:17:56,599 http-bio-127.0.0.105-8095-exec-176 WARN ..
+		sed -e 's/^[0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\} [0-9:,]\{12\} [^ ]\+ //g'
+		;;
+	*)
+		cat -
+		;;
+	esac
+}
+
+watch_journalctl() {
+	if [[ -v ATL_SYSTEMD_SERVICENAME ]]; then
+		if [[ $* =~ -f ]]; then
+			starttime="$(systemctl show -p ActiveEnterTimestamp "$ATL_SYSTEMD_SERVICENAME" | awk '{print $2 $3}')"
+			journalctl --no-pager -o cat -fu "$ATL_SYSTEMD_SERVICENAME" --since "$starttime" | colourize | ignoretimestamps
+		else
+			journalctl --no-pager -o cat -fu "$ATL_SYSTEMD_SERVICENAME" -n 100 | colourize | ignoretimestamps
+		fi
+	fi
+}
+
+watch_logfiles() {
+	log "What ho! Logging files ${atl_logfiles[*]}"
+	set -vx
+	# Not sure what this complicated logic achieved. It returns blank for catalina.out without timestamps
+	#taillines=$(tac "${atl_logfiles[*]}" | awk -v n=$logentriestoprint '$2 ~ /[0-9;\.]+/ && !--n { print NR; exit; }')
+	taillines=100
+	tail -n "$taillines" -F "${atl_logfiles[@]}" | colourize | ignoretimestamps
+	set +vx
+
+}
+#tail -F "$logfile" | ignoretimestamps # | $ATL_MANAGE/lib/highlight/highlight --filter RED,SEVERE --filter RED,ERROR
+#tac "$logfile" | awk -v n=$logentriestoprint '$2 ~ /[0-9;\.]+/ && !--n { print NR; exit; } {print "Got ",$1, " at ",n }'
+#tac "$logfile" | perl -npe '/org.apache.catalina.startup.Catalina.start Server startup in (64321) ms/ {print "Started" }
+#/org.apache.catalina.startup.VersionLoggerListener.log CATALINA_HOME:         \/opt\/atlassian\/redradish_jira\/(7.0.5)/ { print "Eek", \1 }'
+
+# Note: the --follow stuff expands the array into multiple --follow statements. See http://unix.stackexchange.com/questions/90938/possible-to-use-brace-permutation-and-array-expansion-simultaneously
+#tail -n "$taillines" -F ${atl_logfiles[*]} | $ATL_MANAGE/lib/highlight/highlight --filter RED,SEVERE --filter RED,ERROR  --filter GREEN,'(?<!\w)(org|com|sk|de)\.(?!(?:atlassian|springframework|eclipse|apache|osgi|dom4j\.factory|pyxis\.greenhopper|ofbiz.core|sun|picocontainer|tuckey\.web\.filters|hazelcast|postgresql|google\.common|mchange\.v2\.c3p0|eea\.jira\.natural-searchers|quartz|codehaus\.groovy|opensymphony))[-\w\.]+'  | ignoretimestamps
+#tail -n "$taillines" -F ${atl_logfiles[*]} | $ATL_MANAGE/lib/highlight/highlight --filter RED,SEVERE --filter RED,ERROR  --filter GREEN,'(?<!\w)(org|com|sk|de)\.(?!(?:atlassian|springframework|eclipse|apache|osgi|dom4j\.factory|pyxis\.greenhopper|ofbiz.core|sun|picocontainer|tuckey\.web\.filters|hazelcast|postgresql|google\.common|mchange\.v2\.c3p0|eea\.jira\.natural-searchers|quartz|codehaus\.groovy|opensymphony))[-\w\.]+'  | ignoretimestamps
+
+atl_logfiles=()
+get_rawlogfiles
+#log "Considering logfiles ${atl_rawlogfiles[*]}"
+for f in "${atl_rawlogfiles[@]}"; do
+	# Ignore application-level access_logs - we'll rely on webserver logs instead
+	log "Considering $f"
+	case "$(basename "$f")" in
+	access_log*)
+		log "Ignoring $f"
+		continue
+		;;
+	*gc-*)
+		log "Ignoring $f"
+		continue
+		;;
+	*synchrony.log)
+		log "Ignoring $f"
+		continue
+		;;
+	*incoming-mail.log)
+		log "Ignoring $f"
+		continue
+		;;
+	eazybi-*log)
+		log "Ignoring $f"
+		continue
+		;;
+	atlassian-jira-security.log)
+		log "Ignoring $f"
+		continue
+		;;
+	esac
+
+	# http://www.fvue.nl/wiki/Bash:_Error_%60Unbound_variable%27_when_appending_to_empty_array
+	#log "Considering $f . Currently atl_logfiles is ${atl_logfiles[@]-}"
+	if [[ -f $f ]]; then
+		LOGFILE_TOOLARGE=2000 # Only watch the last this-many-Mb to avoid slowness
+		LOGFILE_TOOLARGE_BYTES=$((LOGFILE_TOOLARGE * 1024 * 1024))
+		fsize="$(stat -c%s "$f")"
+		if [[ $fsize -gt $LOGFILE_TOOLARGE_BYTES && ! -v ATL_LOG_DISABLE_LARGEFILE_TRUNCATION ]]; then
+			#log "$f is huge"
+			newfile=$(mktemp -u -t "$(basename "$f")".subset.XXXXXX)
+			mkfifo "$newfile"
+			#shellcheck disable=SC2064
+			trap "echo \"Deleting fifo: $newfile\"; rm -f \"$newfile\"" EXIT TERM
+			#tail -c$LOGFILE_TOOLARGE_BYTES $f > $newfile
+			log "Log file '$f' is $((fsize / 1024 / 1024))Mb, over ${LOGFILE_TOOLARGE}Mb. Only viewing last ${LOGFILE_TOOLARGE}Mb via $newfile ( $(ls -lah "$newfile") )."
+			f="$newfile"
+		else
+			#log "$f is tiny"
+			:
+		fi
+		atl_logfiles+=("$f")
+		#log "$f is in; appended to ${atl_logfiles[@]}"
+	fi
+done
+log "We have logfiles: \n$(echo "${atl_logfiles[*]:-}" | tr ' ' '\n')"
+
+if [[ $* =~ --access-logs ]]; then
+	atl_logfiles+=(/var/log/"$ATL_WEBSERVER"/"${ATL_LONGNAME}"/{access,error}.log)
+fi
+# Set TERM, since lnav dies silently with a TERM like screen-256color
+# 18/Jun/21: unset TERM to give lnav 0.9.0 a chance
+# 25/Jun/23: use lnav wherever it is installed. Currently that is from a snap
+cmd=(lnav)
+cmd+=(-c "|partition-by-restart" -c "|app-common" -c "|app-${ATL_PRODUCT}")
+# https://stackoverflow.com/questions/9612090/how-to-loop-through-file-names-returned-by-find
+if [[ -d "$ATL_APPDIR/lnav" ]]; then
+	while IFS= read -r -d '' lnav; do
+		cmd+=(-c "|$lnav")
+	done < <(find "$ATL_APPDIR/lnav" -name "*.lnav" -print0)
+fi
+cmd+=("${atl_logfiles[@]}") # If atl_logfiles is empty, this expression won't evaluate to anything, not even ""
+# lnav 0.9.0 tries to stat each file, and breaks on process substitutions. There shouldn't be anything interesting in this file anyway
+#cmd+=(<(journalctl -fu "$ATL_SYSTEMD_SERVICENAME"))
+set -x
+TZ='America/Los_Angeles' TMPDIR=/tmp "${cmd[@]}"
+set +x
+wait

@@ -1,0 +1,27 @@
+#!/bin/bash -eu
+
+case "$ATL_DATABASE_TYPE" in
+	postgresql)
+		# Note we don't match postgresql-rds, where we can't tweak these settings.
+		# https://stackoverflow.com/questions/6571826/how-to-omit-heading-in-df-k-command-of-sunos
+		#partition="$(df  --output='source' /var/lib/postgresql  | sed 1d)"  # e.g. /dev/sda1
+		#device=${partition%[0-9]}
+		# https://unix.stackexchange.com/questions/65595/how-to-know-if-a-disk-is-an-ssd-or-an-hdd
+		#rotational=$(cat /sys/block/sda/queue/rotational)
+		if [[ ! -v ATL_FILESYSTEM_TYPE || $ATL_FILESYSTEM_TYPE = ssd ]]; then
+			atl_psql -tAXqc "show random_page_cost" | while read -r rpc; do
+				atl_psql -tAXqc "show seq_page_cost" | while read -r spc; do
+					if (( rpc == 4 && spc == 1 )); then
+						echo >&2 "Postgresql settings for random_page_cost ($rpc) and seq_page_cost ($spc) are not optimal for SSDs (https://amplitude.engineering/how-a-single-postgresql-config-change-improved-slow-query-performance-by-50x-85593b8991b0). Fix with: atl_psql --super -tAXc \"alter system set random_page_cost=1;\" and then wait for next Postgres reload"
+						exit 1
+					fi
+				done
+			done
+		fi
+		check_postgres.pl -H "$ATL_DATABASE_HOST" -p "$ATL_DATABASE_PORT" -db "$ATL_DATABASE" -u "$ATL_DATABASE_USER" --dbpass="$ATL_DATABASE_PASSWORD"  --action query_time -c 30
+		if [[ $(atl_psql -tAXqc "show log_statement") = all ]]; then
+			echo >&2 "Postgres 'log_statement' is set to 'all'. This will produce excessive logs"
+			exit 1
+		fi
+		;;
+esac

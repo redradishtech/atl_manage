@@ -1,0 +1,4 @@
+Caused by: org.eclipse.egit.github.core.client.RequestException: You have triggered an abuse detection mechanism. Please wait a few minutes before you try again. (403)
+Wait attempt timed out - waited 30000 milliseconds
+For issues with a large amount of comments and worklogs this may cause serious performance problems
+java.lang.OutOfMemoryError

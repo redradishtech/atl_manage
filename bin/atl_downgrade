@@ -1,0 +1,21 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+set -x
+atl_upgrade_switchver downgrade
+set +x
+backupdir="$ATL_DATADIR_BASE/current/${ATL_SHORTNAME}-before-${ATL_VER}-upgrade/database"
+# FIXME: when this is actually scripted, we should 'jwritelock database' to let other processes, like rsnapshot backups, know that the db is being modified
+
+if [[ $ATL_ROLE = prod ]]; then
+	log "Now run:
+atl_kill && \
+	wait_for_stop && \
+	atl_dropdb && \
+	atl_createdb && \
+	pg_restore -f - $backupdir  | atl_psql --super -tAXq"
+else
+	log "In a $ATL_ROLE environment there probably isn't a backup at $backupdir. You will have to atl_backupmirror_restore"
+fi

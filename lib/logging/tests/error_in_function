@@ -1,0 +1,15 @@
+#!/bin/bash
+
+. /opt/atl_manage/lib/logging.sh
+
+failer() {
+        error "boo"
+}
+
+main() {
+        log before_failure
+        failer
+        log after_failure   # Should not print
+}
+
+main "$@"

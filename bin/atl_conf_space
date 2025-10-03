@@ -1,0 +1,68 @@
+#!/bin/bash
+#set -o pipefail
+## Perform operations (delete, restore, add/delete label) on Confluence spaces, via curl HTTP call
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+# shellcheck source=/opt/atl_manage/lib/http.sh
+source "$ATL_MANAGE/lib/http.sh" --nolog
+
+gettaskid() {
+	grep -Po '(?<=<meta name="ajs-taskId" content=")([^"]+)(?=">)'
+}
+
+case "$(basename "$0")" in
+atl_conf_space_del)
+
+	(($#)) || fail "Usage: $(basename "$0") SPACEKEY"
+	spacekey="$1"
+	out="$(_curl '/spaces/doremovespace.action?key='"$spacekey" --data-raw 'confirm=OK' --compressed)" || exitcode=$?
+	;;
+atl_conf_space_restore)
+	(($#)) || fail "Usage: $(basename "$0") SPACEZIP where SPACEZIP is one of: $(cd "$ATL_DATADIR/restore" && echo -- *.zip)"
+	zipfile="$1"
+	out="$(_curl '/admin/restore-local-file.action' --data-raw 'buildIndexLocalFileRestore=true&edit=Import' --data-urlencode "localFileName=${zipfile}" --compressed)" || exitcode=$?
+	;;
+
+atl_conf_space_label_add)
+	(($# == 2)) || fail "Usage: $(basename "$0") LABEL SPACEKEY"
+	label="$1"
+	spacekey="$2"
+	_curl '/spaces/addteamlabeltospace.action' \
+		--data-raw 'newTeamLabel='"$label"'&Add=Add&key='"$spacekey"'&labelType=team' \
+		--compressed
+	;;
+atl_conf_space_label_del)
+	_curl '/rest/ui/1.0/space/FIN/label/301662210' -X 'DELETE' --compressed
+	;;
+esac
+
+if [[ -z $exitcode ]]; then
+	taskid=$(echo "$out" | gettaskid || :)
+	if [[ -n "$taskid" ]]; then
+		log "$ATL_BASEURL/longrunningtaskxml.action?taskId=$taskid"
+		taskstatus="$(_curl "/longrunningtaskxml.action?taskId=$taskid")"
+		if [[ $taskstatus =~ "Import mutex held" ]]; then
+			log "Another import is running"
+			exit 1
+		else
+			echo "$taskstatus"
+			exit 0
+		fi
+	elif [[ $out =~ A\ space\ with\ the\ key.*already\ exists ]]; then
+		log "${BASH_REMATCH[0]}"
+		exit 0
+	else
+		log "No taskid, no recognized output. Output:"
+
+		echo "$out" | html2text
+		#| sensible-pager
+		exit 2
+	fi
+elif ((exitcode == 4)); then
+	log "Space $spacekey does not exist"
+	exit 1
+else
+	fail "curl exit code $exitcode"
+	exit $exitcode
+fi

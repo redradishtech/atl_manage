@@ -1,0 +1,45 @@
+#!/bin/bash
+## Test basic functionality of multitool.sh, especially whether symlinking works
+
+base="$(dirname "$(realpath --no-symlinks "$0")")"
+
+fail() { echo >&2 "$*"; exit 1; }
+
+if [[ -d testdir ]]; then rm -r testdir; fi
+mkdir testdir
+#shellcheck disable=SC2064
+trap "rm -r $base/testdir" ERR EXIT TERM
+cd testdir || fail
+
+# Basic functionality 
+echo "foo() { echo flibble; }
+sudofunc() { _sudome;  echo \"EUID is \$EUID\"; }
+. $base/multitool.sh" > orig.sh
+chmod +x orig.sh
+./orig.sh _createsymlinks
+[[ -L foo ]] || fail "Script did not create foo symlink for foo function"
+[[ -L sudofunc ]] || fail "Script did not create sudofunc symlink for sudofunc function"
+./foo | grep -q flibble || fail "foo symlink did not invoke function"
+./sudofunc | grep -q "EUID is 0" || fail "_sudome did not work"
+./orig.sh foo | grep -q flibble || fail "orig.sh foo should have invoked foo()"
+./orig.sh --help | grep -q Usage: || fail "orig.sh --help did not print Usage"
+ln -s orig.sh invalidsymlink
+./orig.sh _createsymlinks
+[[ -L foo ]] || fail "_createsymlinks deleted foo when it shouldn't have"
+[[ ! -e invalidsymlink ]] || fail "_createsymlinks failed to delete invalid symlink"
+mv orig.sh common.sh
+./common.sh _createsymlinks
+[[ $(readlink foo) = ./common.sh ]] || fail "After renaming our script, _createsymlinks did not recreate symlinks properly: $(readlink foo) != common.sh"
+
+# Check that a script can be symlinked and still works (creating and deleting symlinks) as expected
+mkdir subdir
+cd subdir
+ln -s ../common.sh new.sh
+./new.sh _createsymlinks
+[[ -L ./new.sh ]] || fail "Oops, _createsymlinks deleted the symlink to ../orig.sh"
+[[ -L foo ]] || fail "Script did not create foo symlink for foo function"
+./new.sh foo | grep -q flibble || fail "new.sh foo should have invoked foo()"
+
+
+echo
+echo "Success! All tests passed!"

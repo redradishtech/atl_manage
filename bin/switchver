@@ -1,0 +1,10 @@
+#!/bin/bash
+## Run in $ATL_APPDIR_BASE or $ATL_DATADIR_BASE, handles moving and symlinking directories for upgrades and downgrades.
+# This is a thin wrapper that sources ZFS-specific functions
+
+# shellcheck source=/opt/atl_manage/lib/zfs.sh
+source "$ATL_MANAGE/lib/switchver.sh"
+
+# shellcheck source=/opt/atl_manage/lib/versioned_directories/switchver
+switchver "$@"
+ 

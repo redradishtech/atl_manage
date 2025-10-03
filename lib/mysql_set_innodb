@@ -1,0 +1,3 @@
+#!/bin/bash
+
+sed -e 's/ENGINE=MyISAM /ENGINE=InnoDB /g'

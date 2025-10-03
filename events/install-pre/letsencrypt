@@ -1,0 +1,15 @@
+#!/bin/bash -eu
+
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh
+
+hg qselect | grep -q letsencrypt || exit 0
+if hg qselect | grep -E -q "letsencrypt-(http01|dns01)"; then
+	: # We're okay
+else
+	error "The 'letsencrypt' patch is enabled, but a LetsEncrypt 'challenge type' patch needs to also be enabled. Please run:
+cdwc
+echo letsencrypt-http01 >> .hg/patches/guards ## OR ## echo letsencrypt-dns01-cloudflare >> .hg/patches/guards
+hg qpop -a && hg qpush -a && hg commit --mq -m 'Enable LE challenge patch'
+atl_reinstall -ur     # -r to resume, using our workingcopy
+"
+fi

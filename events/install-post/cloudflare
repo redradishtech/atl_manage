@@ -1,0 +1,25 @@
+#!/bin/bash
+set -euo pipefail
+
+install-post() {
+	# Since we're running behind cloudflare, ensure the SSL cert is issued by the CF Origin CA
+	validate_cloudflare_origin_cert() {
+		local expected_issuer actual_issuer
+		expected_issuer='issuer=C=US, O=CloudFlare, Inc., OU=CloudFlare Origin SSL Certificate Authority, L=San Francisco, ST=California'
+		certfile="$ATL_APPDIR/cloudflare/cloudflare_origin_cert/cert.pem"
+		[[ -f "$certfile" ]] || fail "Missing expected certfile '$certfile'"
+		# openssl before version 3.4.1 (e.g. 3.0.2) printed quotes and whitespace, e.g.:
+		# subject=O = "CloudFlare, Inc.", OU = CloudFlare Origin CA, CN = CloudFlare Origin Certificate
+		actual_issuer="$(openssl x509 -noout -issuer <"$certfile" | sed -e 's/ = /=/g' -e 's/"//g')"
+		[[ $expected_issuer = "$actual_issuer" ]] || fail "Certificate '$certfile' was issued by:
+		'$actual_issuer'
+		, not:
+		'$expected_issuer'
+		as expected for Cloudflare"
+	}
+
+	validate_cloudflare_origin_cert
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh

@@ -1,0 +1,48 @@
+#!/bin/bash 
+
+#shellcheck source=/opt/atl_manage/lib/common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../../lib/common.sh --nolog
+
+fail()
+{
+	echo >&2 "$@"
+	exit 2
+}
+
+main()
+{
+	[[ "$ATL_ROLE" != standby ]] || return 0    # Standbys won't have a log file to inspect
+	case "$ATL_PRODUCT" in
+		jira|confluence)
+			get_rawlogfiles
+			# Caused by: org.eclipse.egit.github.core.client.RequestException: You have triggered an abuse detection mechanism. Please wait a few minutes before you try again. (403)
+			local patternfile="$ATL_MANAGE/monitoring/errors_in_logs/$ATL_PRODUCT/fixedpatterns"
+			[[ -f "$patternfile" ]] || exit
+			if log=$(grep --max-count=5 -F -f "$patternfile")
+			then
+				fail "Problematic line found in logs: $log"
+			fi < <(tail -20000 "$atl_logfile" || kill $$)  # https://unix.stackexchange.com/questions/217605/bash-how-to-propagate-errors-in-process-substitution
+		;;
+		jethro)
+			local tstamp="$(date -d '10 minutes ago' +"%d-%b-%Y %H")"
+			local logfile="/var/log/$ATL_PRODUCT_RUNTIME_TECHNOLOGY.log"
+			# Note: log file will often contain max_children WARNINGS:
+			# [23-Sep-2023 22:29:33] WARNING: [pool stpauls.easyjethro] server reached max_children setting (20), consider raising it
+			# These are harmless, caused by person reports linking to many photos, all of which are requested at once.
+			local regex="\[$tstamp.*\] ERROR"
+			#log "Checking $logfile for $regex"
+			if grep -P "$regex"  "$logfile"; then
+				fail "Problematic lines in $logfile"
+			fi
+			;;
+	esac
+	if [[ $EUID == 0 ]]; then
+		# FIXME: hardcode the assumption that this script is called once an hour
+		if oomkill=$(journalctl -k -S '1 hours ago' | grep oom-kill:); then
+			fail "OOM killer detected in syslog: $oomkill"
+		fi
+	fi
+}
+
+
+main "$@"

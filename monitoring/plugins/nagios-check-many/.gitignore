@@ -1,0 +1,5 @@
+*~
+debian/files
+debian/nagios-check-many.debhelper.log
+debian/nagios-check-many.substvars
+debian/nagios-check-many/

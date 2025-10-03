@@ -1,0 +1,48 @@
+#!/bin/bash -eu
+# @provides sql
+shopt -s extglob
+set -o pipefail
+PATH="$ATL_MANAGE/lib/requiresort:$PATH"
+
+upgrade-running-pre() {
+	# Interpret every SQL/*.sql file containing '@provides queries.<something>' as defining a <something> view in
+	# the queries schema, that we should tear down lest it interfere with the upgrade.
+	# shellcheck disable=SC2046
+	mapfile -t sqlfiles < <(compgen -G "$ATL_APPDIR"/SQL/'*.sql')
+	(( ${#sqlfiles} )) || { warn "No SQL files"; return 0; }
+	sql="$(
+	while read -r view; do
+		echo "drop view if exists $view cascade;"
+	done < <(grep --no-filename -Po '(?<=@provides ).*' $(requiresort "${sqlfiles[@]}" | tac) || :))"
+	if [[ $ATL_ROLE = standby ]]; then
+		log "At this point we would run SQL to drop database views that could interfere with DML changes. However as we're on a read-only standby, we can't do this. It will happen in production"
+	else
+		echo "Running SQL:\n$sql\n"
+		echo "$sql"	| atl_psql --super --echo-queries -tAXq
+	fi
+}
+
+upgrade-running-post() {
+	_runscripts "$@"
+}
+
+_runscripts() {
+	local sqldir="$ATL_APPDIR/SQL"
+	checkperms
+	mapfile -t scripts < <(
+		shopt -s nullglob
+		requiresort "$sqldir"/*.sql
+	)
+	for script in "${scripts[@]:-}"; do
+		log "Running $script"
+		chronic atl_psql --echo-queries -tAXq <"$script"
+	done
+}
+
+checkperms() {
+	local sqldir="$ATL_APPDIR/SQL"
+	! sudo -u "$ATL_USER" test -r "$sqldir" || fail "For security, $sqldir should not be readable by $ATL_USER"
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh

@@ -1,0 +1,6 @@
+#!/bin/bash -eu
+
+. /opt/atl_manage/lib/common.sh
+. /opt/atl_manage/lib/appfetcher.sh
+
+echo "You probably want atl_deploydir"

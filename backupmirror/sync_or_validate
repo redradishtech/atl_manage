@@ -1,0 +1,15 @@
+#!/bin/bash -eu
+## Invoked from $ATL_APPDIR/backups/backupmirror.healthcheck (which is invoked from cron), this script kicks off sync_backup auto (on the mirror source) or check_backupmirror_freshness (on the mirror destination).
+# The script will emit logs only if the sync failed (see $ATL_MANAGE/lib/log)
+
+# This script is kicked off on backupmirror source and destination at the same time (barring clock skew). The source side initiates the rsync, the destination side verifies the results:
+if [[ -v ATL_BACKUPMIRROR_SOURCE ]]; then
+	# Invoked from the backup source: kick off a sync. 'sync_backup_auto' acquires a lock for the duration of the rsync.
+	"$ATL_MANAGE"/backupmirror/sync_backup "$@"
+elif [[ -v ATL_BACKUPMIRROR_DESTINATION ]]; then
+	# Invoked on the backup destination: check that the source-spawned sync_backup process does its job.
+	# We acquire the same 'backupmirror' lock that the source-spawned 'sync_backup_auto' script claims. We want to do our verification after sync_backup_auto has done its job, so we sleep for a bit to give the source-initiated script a chance to grab the lock.
+	sleep 10
+	# Run with 'sudo -E' because the database backup is unreadable except by root. See equivalent 'sudo -E' in backupmirror/sync_backup
+	sudo -E "$ATL_MANAGE/monitoring/plugins/check_backupmirror_freshness"
+fi

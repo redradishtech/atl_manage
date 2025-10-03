@@ -1,0 +1,103 @@
+#!/bin/bash -eu
+
+set -euo pipefail
+
+fixperms() {
+	# In the past we could rely on /opt/atlassian/<app> being 755. Nowadays for security reasons we don't allow any access to 'other'
+	setfacl -m u:nagios:rX "$ATL_APPDIR_BASE"
+	setfacl -m u:nagios:rX "$ATL_APPDIR"
+}
+validateperms() {
+	validateperms_healthcheck "$ATL_APPDIR"/monitoring
+	log "✓"
+}
+
+install-post() { # Note, this used to be a subshell. Why?
+	local eventhandler="$ATL_APPDIR"/monitoring/.eventhandler
+
+	sudo_eventhandler_script() {
+		rm -f /etc/sudoers.d/"${ATL_SHORTNAME}" # Remove obsolete variant of this sudo snippet
+		log "Editing sudoers to allow nagios sudo-free access to '$eventhandler'."
+		sudosnippet monitoring "# This /etc/sudoers.d/ snippet allow Nagios to run a script which invokes 'servicedown' and 'slowness' atl_events, which need root access for taking thread dumps and other root diagnostics.\nnagios  ALL=(ALL)NOPASSWD:SETENV:${eventhandler}"
+	}
+
+	# We want nagios on non-prod environments like sandboxes that need to replicate real functionality
+	#[[ $ATL_ROLE = prod ]] || { log "Not installing Nagios on non-prod (ATL_ROLE=$ATL_ROLE) instance"; return; }
+	# Let's always reinstall nagios, in case atlmanage.cfg has changed.
+	# This might be the first time an $ATL_PRODUCT app has been installed, in which case atl_install_monitoring will install the /opt/atl_manage/monitoring/templates/$ATL_PRODUCT.nagios.cfg template
+	# Aug/23: disable this, as it slows down everyday operations
+	#atl_install_monitoring || :   # Slightly controversial but: if monitoring is borked, keep going
+	# Note: fixperms must go after atl_install_monitoring as it depends on 'nagios' existing
+	fixperms
+	[[ -d $ATL_APPDIR/monitoring ]] || error "$ATL_APPDIR/monitoring doesn't exist. The 'monitoring' patch should have created it"
+
+	sudo_eventhandler_script
+	# The services in monitoring/ have quite possibly changed, so first uninstall the artifacts (.cron, .cfg) from any old services, before we reinstall
+	uninstall-pre
+	atl_install_monitoring_services "$ATL_APPDIR"/monitoring
+	validateperms
+	# Note: restart, not just 'start'. Our /etc/nagios4/conf.d/*-nagios.cfg files have hardcoded versions in paths, and Nagios must be restarted to pick up the new paths in the rewritten .cfg files
+	atl_monitoring restart # uninstall-pre Pick up monitoring service changes.
+	atl_monitoring notifications-enabled 2>/dev/null || warn "$ATL_MONITORING notifications are still disabled"
+}
+
+uninstall-pre() {
+	[[ -d $ATL_APPDIR/monitoring ]] || fail "No $ATL_APPDIR/monitoring/ directory - something is badly wrong"
+	# Uninstall any services, but without checking the health of icinga afterwards. This is done because other icinga services like replication/*.healthcheck and backups/*.healthcheck rely on monitoring/nagios.cfg definitions, and if we're processing in order (called from install-post()) then after this call, icinga won't be valid, and we should ignore errors until the subsequent atl_install_monitoring_services call cleans things up
+	# This doesn't help if the monitoring/*.healthcheck file has already been removed. Then, the $monitoring_confdir/$ATL_SHORTNAME-*.cfg and /etc/cron.d/$ATL_SHORTNAME-* files need to be removed by hand
+	atl_uninstall_monitoring_services --no-health-checks-or-reload "$ATL_APPDIR"/monitoring
+	# We can't reload, as the comment above says.
+	# atl_monitoring reload
+	#log "Removing any of this service's nagios checks:\n$(find $monitoring_confdir -type l -name "$ATL_SHORTNAME"* -print -delete)"
+}
+
+uninstall-post() {
+	# We uninstalled monitoring services from monitoring/, replication/ and elsewhere in the uninstall-pre step. Now we reload nagios so the disappeared services are noticed.
+	log "Reloading monitoring, to take notice of uninstalled services"
+	atl_monitoring reload || :
+}
+
+cleanup() {
+	# We used to have a $ATL_APPDIR/logs/highload_events/ directory for high load snapshots.
+	# Move its contents to $ATL_APPDIR/logs/events/$timestamp_higload
+	logsdir=$ATL_APPDIR/${ATL_TOMCAT_SUBDIR}logs
+	if [[ -d $logsdir/highload_events ]]; then
+		mkdir -p "$logsdir"/events
+		for event in $(
+			shopt -s nullglob
+			echo "$logsdir"/highload_events/*
+		); do
+			eventdir="$(basename "$event")"
+			if ! [[ $eventdir =~ ^[0-9-]{8} ]]; then
+				warn "$logsdir/events/$event does not start with a timestamp, so will break sorting. Please fix manually"
+				dst="$logsdir"/events/"$eventdir"
+			else
+				dst="$logsdir"/events/"$eventdir"_highload
+			fi
+			log "Moving $event to $dst"
+			mv "$event" "$dst"
+		done
+		log "Deleting hopefully-empty highload_events dir: $(ls -la "$logsdir"/highload_events)"
+		rm -r "$logsdir"/highload_events
+	fi
+
+	# I once found a file, /etc/cron.d/redradish_jira-nagios_cfg generated from nagios/config_applied.healthcheck
+	local badfile=/etc/cron.d/$ATL_SHORTNAME-nagios_cfg
+	if [[ -f $badfile ]]; then
+		warn "Cleaning up unexpected file: $badfile"
+		rm "$badfile"
+	fi
+}
+
+upgrade-running-pre() {
+	log "Disabling $ATL_MONITORING notifications prior to upgrade"
+	atl_monitoring disable-notifications || : # If monitoring is broken, we don't care
+}
+
+upgrade-running-post() {
+	log "Enabling $ATL_MONITORING notifications after upgrade"
+	atl_monitoring enable-notifications
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

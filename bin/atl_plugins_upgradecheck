@@ -1,0 +1,76 @@
+#!/bin/bash -eu
+
+# Prints info about installed plugins
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE"/lib/common.sh --
+source "$ATL_MANAGE"/lib/http.sh --
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	PARSED=$(getopt --options 'h' --longoptions 'help,all,ageatleast:,fromcount:' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	veropts=("--from=$ATL_VER")
+	if [[ -v ATL_PRODUCT_ENTERPRISE ]]; then veropts+=(--enterprise); fi
+	while true; do
+		case "$1" in
+		--)
+			shift
+			break
+			;;
+		--all) veropts+=(--all) ;;
+		--ageatleast)
+			veropts+=("--ageatleast=$2")
+			shift
+			;;
+		--fromcount)
+			veropts+=("--fromcount=$2")
+			shift
+			;;
+		-h | --help) usage ;;
+		*) usage "Invalid option: $1" ;;
+		esac
+		shift
+	done
+	if [[ ! ${veropts[*]} =~ --fromcount ]]; then
+		veropts+=("--fromcount=4")
+	fi
+
+	# }}}
+	installjq
+	atl_latestver "$ATL_PRODUCT_FULL" "${veropts[@]}" --fields=version,build,daysreleased 2>/dev/null | head -3 | while IFS=' ' read -r ver build days; do
+		echo "If $ATL_PRODUCT was upgraded to $ver (build $build), which has been public $days days ..."
+		echo -e "\t${ver}-incompatible:"
+		getcompatibility "$build" | jq -r '.incompatible[] | "\t\t" + .name'
+		echo -e "\t${ver}-unknown compatibility:"
+		getcompatibility "$build" | jq -r '.unknown[] | "\t\t" + .name'
+	done
+	log "Hint: if there is no output, $ATL_PRODUCT $ATL_VER is within 4 version of the latest"
+
+}
+
+usage() {
+	cat <<EOF
+$*
+Purpose: Queries installed $ATL_PRODUCT plugins
+Usage:
+atl_plugins [--format] [--save] [--refresh]
+
+Where --format is:
+	report-tests	Table with old/new columns and rows for each plugin's tests. Suitable for a company-specific but version-independent upgrade report template
+	report-data	Comma-separated plugin data, suitably for passing to atlassian_product_upgradereport to replace the version-specific holes in 'report-tests'
+	report-summary	Table of plugin versions/states, suitable as a summary pasted into a version-specific upgrade report
+	cwiki		Prints a simple Confluence table in cwiki format
+
+      --refresh  causes the cache to be flushed
+      --save     causes the output to be saved to $ATL_PLUGINDATA_JSON
+If no --format is specified, output suitable for the terminal is printed.
+EOF
+	exit
+}
+
+main "$@"

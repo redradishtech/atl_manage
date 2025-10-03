@@ -1,0 +1,16 @@
+#!/bin/bash
+## Wrapper for LetsEncrypt 'certbot' that uses our locking and logging. Invoked from $ATL_APPDIR/monitoring/letsencrypt-renew.healthcheck.
+
+# The +eu is to avoid activate breaking with: line 6: _OLD_VIRTUAL_PATH: unbound variable
+set +eu
+. "$ATL_MANAGE/venv/bin/activate"
+
+# If two certbots are run at the same time, the second will fail. Get a global writelock to prevent that
+jwritelock -g certbot \
+	jrun certbot \
+	certbot certonly \
+		--agree-tos --no-eff-email \
+		-m "${ATL_LETSENCRYPT_EMAIL}" \
+		--noninteractive \
+		"$@"
+exit $?

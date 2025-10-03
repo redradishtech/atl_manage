@@ -1,0 +1,22 @@
+#!/bin/bash -eu
+# Syncs filesystem from primary to standby.
+
+#shellcheck source=/opt/atl_manage/backupmirror/common.sh
+. "$ATL_MANAGE/backupmirror/common.sh"
+
+if [[ -v $SOURCE ]]; then
+	# Note, no 'ssh -q', since that suppresses errors
+	# LogLevel=Error suppressed banners but not auth errors (unlike -q).
+	if [[ "$*" =~ -v ]]; then set -x; fi
+	hostname_via_ssh=$(. "$ATL_MANAGE/lib/remote/run" sudo -E "$ATL_MANAGE/backupmirror/verify" "$@")
+	if [[ "$*" =~ -v ]]; then set +x; fi
+	[[ $hostname_via_ssh = "${!SOURCE_HOST_UNAME}" ]] || fail "Roundtrip failed: destination thinks our uname is «$hostname_via_ssh», not «${!SOURCE_HOST_UNAME}»"
+
+elif [[ -v $DESTINATION ]]; then
+	[[ $EUID = 0 ]] || error "Unexpectedly running without sudo/root. This should have been invoked with 'sudo -E' by the primary (see above) or in sync_filesystem_auto"
+	source_uname=$(. "$ATL_MANAGE/lib/remote/run" 'uname -n')
+	[[ $source_uname = "${!SOURCE_HOST_UNAME}" ]] || fail "Although the destination host $(uname -n) could SSH back to the source host, the hostname_via_ssh of 'uname -n' was «$source_uname», not ${!SOURCE_HOST_UNAME} as the destination expected."
+	echo "$source_uname"
+else
+	error "$ATL_SHORTNAME on $(uname -n) is neither primary nor standby"
+fi

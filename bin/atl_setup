@@ -1,0 +1,367 @@
+#!/bin/bash -eu
+
+## Given an /opt/atl_manage directory, prepares a clean server for Atlassian app deployment. This involves installing packages, checking out (or creating) /etc/atlassian_app_profiles/, and making small server tweaks.
+
+# Before any of this will work, you have to install atl_manage by hand:
+#test -d /opt/atl_manage || hg clone ssh://hg@bitbucket.org/redradish/atl_manage /opt/atl_manage
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed --required_vars=ATL_ORGANIZATION --record_last_run
+source "$ATL_MANAGE/lib/http.sh"
+
+main() {
+	$SCRIPT_CHANGED || [[ $* =~ "--force" ]] || {
+		log "No changes since last run. Add --force"
+		exit 0
+	}
+	# Can't remember what this achieved..
+	#if [[ ! -f ~/.ssh/config ]]; then
+	#	touch ~/.ssh/config
+	#	chown "$SUDO_UID":"$SUDO_GID" ~/.ssh/config
+	#fi
+
+	setlocale
+	install_devbox
+	install_venv || true
+	pkginstall util-linux # flock, ionice (used by rsnapshot backups)
+	# Note we don't require Mercurial, but assume the caller did so
+	# In fact we uninstall it later, assuming our venv install worked
+	pkginstall build-essential
+	pkginstall make
+	# For add-apt-repository
+	pkginstall software-properties-common
+	# atl_backup_restore now assumes zstdcat
+	pkginstall zstd
+	pkginstall htop
+	pkginstall byobu
+	pkginstall atop
+	install_time_synchronization
+	pkginstall pigz
+	pkginstall acl                # For setfacl
+	pkginstall unzip              # Our start-pre script wants this
+	pkginstall moreutils          # for 'sponge' used in /opt/atl_manage/events/install-pre/.common.sh, 'chronic' and 'ts' used in systemd and replication logging
+	pkginstall pwgen              # for pg_createuser
+	pkginstall libxml2-utils      # For xmllint, used by /opt/atl_manage/events/start-pre/check_for_database_connection_settings
+	pkginstall xmlstarlet         # Required by /opt/atl_manage/events/start-pre/check_for_database_connection_settings and atl_check_appdeployment
+	pkginstall python3-setuptools # Requires for 'pip3 install certbot' to work. https://stackoverflow.com/questions/14426491/python-3-importerror-no-module-named-setuptools
+	pkginstall net-tools          # netstat
+	pkginstall libwww-perl        # For monitoring/plugins/check_apachestatus.pl
+	pkginstall links              # provides www-browser, used by 'atl_diagnostic server-info'
+	pkginstall telnet             # for ad-hoc checking if ports are listening
+	pkginstall dos2unix           # for appfetcher
+	#if apt-cache show python2 >/dev/null; then  pkginstall python2; fi	# For nagios-cli. 'python2' isn't present in ubuntu 18.04 (it's just 'python')
+	remove_ubuntu_weekly_reminder
+	install_atl_manage_permissionhooks
+	# Perhaps we shouldn't be setting up the database here, as we may not have a profile loaded.
+	if [[ -v ATL_DATABASE ]]; then atl_install_database; fi
+	setup_firewall
+	setup_email
+	setup_mercurial
+	setup_tarsnap
+	#setup_redo  # This is now committed, rather than rebuilt each time
+
+	if [[ ${ATL_DATABASE_TYPE:-} = postgresql ]]; then
+		echo "# TODO: If this server is SSD-based, Optimize Postgres for SSDs (https://amplitude.engineering/how-a-single-postgresql-config-change-improved-slow-query-performance-by-50x-85593b8991b0) and disable THPs (https://docs.mongodb.com/manual/tutorial/transparent-huge-pages/)"
+	fi
+	if ! dpkg -s "unattended-upgrades" &>/dev/null; then
+		echo "unattended-upgrades?"
+	fi
+	if ! dpkg -s "fail2ban" &>/dev/null; then
+		echo "fail2ban		If public-facing SSH"
+	fi
+
+	install_profilesdir
+	disable_apport
+	#install_lnav
+}
+
+setlocale() {
+	# LXC containers default to LC_CTYPE=C, which causes the JVM to default to ASCII but for the presence of -Dfile.encoding, which causes atl_check_appdeployment to complain. Avoid all that by setting a UTF-8 locale
+	# Also, Postgres the defaults to ASCII, which causes restores from UTF-8 backups to potentially fail
+	locale | grep -q UTF-8 || {
+		if locale | grep -ql LANG=C; then
+			echo "Changing system locale from C to en-AU.UTF-8"
+			perl -i -pe 's/# en_AU.UTF-8 UTF-8/en_AU.UTF-8 UTF-8/g' /etc/locale.gen
+			locale-gen
+			localectl set-locale LANG=en_AU.UTF-8
+		else
+			error "locale is not UTF-8, but isn't C either. Please fix manually (hint: edit /etc/locale.gen, run locale-gen and localectl)"
+		fi
+	}
+}
+
+install_devbox() {
+	command -v devbox >/dev/null || curl -fsSL https://get.jetify.com/devbox | bash
+	cd "$ATL_MANAGE"
+	devbox install
+}
+
+install_venv() {
+	log "Installing venv in $ATL_MANAGE/venv (potentially required for atl_tarsnapper, borgbackup)"
+	pkginstall python3-dev # Required for 'pip install tarsnapper'
+	pkginstall python3-venv || {
+		warn "Failed to install python3-venv (older Debian?)"
+		return 1
+	} # necessary for install_venv
+	command -v python3 >/dev/null || error "Please install python3 so we can install venv"
+	if [[ ! -d "$ATL_MANAGE/venv" ]]; then
+		python3 -m venv "$ATL_MANAGE"/venv || {
+			warn "Failed to install $ATL_MANAGE/venv. events/install-post/backups-tarsnap  will fail to install tarsnapper"
+			return 1
+		}
+	fi
+	[[ -f $ATL_MANAGE/venv/bin/activate ]]
+	# https://github.com/pypa/virtualenv/issues/1029
+	set +eu
+	. "$ATL_MANAGE"/venv/bin/activate
+	pip3 install mercurial # Get a more up-to-date Mercurial just in case our OS version is ancient.
+	dpkg -P mercurial      # At this point, delete the old mercurial
+	pip3 install yq        # for XML parsing in atl_plugin_jars
+	# check_systemd is useful for auxiliary systemd processes, like the email2jira patch needs
+	pip3 install wheel check_systemd
+	pip3 install sqlparse		# For sqlformat
+	set -eu
+}
+
+install_time_synchronization() {
+	# TODO: replace this awful hackery with ansible or something
+	local markerline="# Prepended by $0"
+	local configfile='/etc/chrony/chrony.conf'
+	if "$ATL_MANAGE/lib/is_aws"; then
+		# https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/set-time.html
+		# Some companies like ntp; leave it installed
+		if dpkg -s ntp &>/dev/null; then
+			warn "Server has 'ntp' installed. systemd-timesyncd is preferred (e.g. by Redhat and AWS), but leaving ntp alone. Please uninstall 'ntp' and re-run atl_setup if you want systemd-timesyncd."
+			return
+		fi
+		#$SUDO timedatectl set-ntp on  # Possibly unnecessary - see https://www.reddit.com/r/linuxadmin/comments/2k4odu/ntp_is_enabled_but_not_starting_on_boot_systemd/
+	fi
+	# Ubuntu 20.04+ and Debian 12.5+ have systemd-timesyncd preinstalled, so we don't need to bother with chrony
+	if pkginstalled systemd-timesyncd; then
+		log "systemd-timesyncd is installed"
+		return
+	else
+		fail "No systemd-timesyncd!?"
+	fi
+}
+
+install_profilesdir() {
+	# Check out (or possibly create) the $ATL_PROFILEDIR directory
+	if [[ ! -d $ATL_PROFILEDIR ]]; then
+		/usr/bin/hg clone "$ATL_PROFILE_REPO" "$ATL_PROFILEDIR"
+		chmod -R o-rwx,o+t "$ATL_PROFILEDIR" # Profile files will contain sensitive stuff like database passwords. Our umask (set in lib/common.sh) is very restrictive, so newly created files within an atl_profile session are fine, but set the sticky bit to enforce just in case
+	fi
+}
+
+disable_apport() {
+	# apport intercepts crashes and generates huge /var/crash/* files. We don't want it in production, but it is a dependency of 'ubuntu-server' which might be needed for successful upgrades, so we can't just uninstall it.
+	if dpkg -s apport &>/dev/null; then
+		if grep -q enabled=1 /etc/default/apport; then
+			perl -i -pe 's/enabled=1/enabled=0/' /etc/default/apport
+			if systemctl is-enabled apport >/dev/null; then
+				systemctl stop apport
+				systemctl disable apport
+			fi
+		fi
+	fi
+}
+
+remove_ubuntu_weekly_reminder() {
+	# Remove Ubuntu's annoying weekly reminders to do-release-upgrade.
+	if [[ -f /etc/cron.weekly/update-notifier-common ]]; then
+		mv /etc/cron.weekly/{,.#}update-notifier-common
+	fi
+}
+
+install_atl_manage_permissionhooks() {
+
+	# Adds a permissions-fixing hook to $ATL_MANAGE/.hg/hgrc
+	# The patchscript hook applies .hgpatchscript/* ACLs on each queue operation. Used e.g. to grant nagios access to nagios/
+	#
+	# *.healthcheck scripts invoked at $ATL_USER will generally delegate to $ATL_MANAGE/monitoring/plugins/ scripts, and perhaps $ATL_MANAGE/bin/* too, so everything in $ATL_MANAGE must be o:r (files) or o:rx (directories).
+	# setfacl's o:X notation means "set +x if executable by the primary user"
+	if ! grep -q "^update = $ATL_MANAGE/\.hghooks/hgpatchscript" "$ATL_MANAGE/.hg/hgrc"; then
+		log "Installing .hghooks permission in $ATL_MANAGE/.hg/hgrc"
+		{
+			echo -e "[hooks]\n# Ensure files are ugo+rX so e.g. nagios can access scripts it needs"
+			for op in update merge commit; do
+				echo -e "\n$op = $ATL_MANAGE/.hghooks/hgpatchscript"
+			done
+		} >>"$ATL_MANAGE/.hg/hgrc"
+		log "Fixing $ATL_MANAGE permissions"
+		(
+			cd "$ATL_MANAGE"
+			. ./.hghooks/hgpatchscript
+		)
+	fi
+}
+
+setup_firewall() {
+	log "Please allow incoming SSH, HTTP(S) on this $ATL_SERVER_ROLE instance:
+	ufw allow ssh
+	ufw allow 2929/tcp comment \"Alternate SSH port to avoid log noise\"
+	ufw allow 'Apache Full'
+	ufw allow out to $(dig +short A monitoring.redradishtech.com | tail -1) port 25 comment \"monitoring.redradishtech.com, for $ATL_MONITORING alerts\"
+	ufw allow out to $(dig +short AAAA monitoring.redradishtech.com | tail -1) port 25 comment \"monitoring.redradishtech.com, for $ATL_MONITORING alerts\"
+	"
+}
+
+setup_email() {
+	# Automated processes (backups, replication) tend to email 'root' if things go wrong. Make sure someone sees those emails.
+
+	atl_install_postfix
+	pkginstall mutt
+	# Certainly the postfix shouldn't be receiving email from non-localhost IPs, but is it our job to configure this?
+	#perl -i -pe 's/inet_interfaces = all/inet_interfaces = 127.0.0.1/g' /etc/postfix/main.cf      # Only accept mails from local processes
+
+	[[ -v ATL_ORGANIZATION ]] || return 0
+	local oldrootemail="jeff+$ATL_ORGANIZATION@redradishtech.com"
+	local rootemail="root-$HOSTNAME-$ATL_ORGANIZATION@monitoring.redradishtech.com"
+
+	# Special case: if we are also the monitoring system, we don't want root@ mail forwarded to root-..@monitoring.redradishtech.com, because we're it
+	if postconf -p mydestination | grep -qF monitoring.redradishtech.com; then
+		ATL_NO_ROOT_EMAIL_ALIAS=true
+	fi
+
+	if grep -q "^root:" /etc/aliases; then
+		# We already has a root alias of some sort..
+		if [[ -v ATL_NO_ROOT_EMAIL_ALIAS ]]; then
+			# ..we don't want it!
+			warn "We don't want root@ emails (ATL_NO_ROOT_EMAIL_ALIAS is set), but they may be configured in /etc/aliases: $(grep '^root:' /etc/aliases). Please remove /etc/aliases entry and run 'newaliases' (or unset ATL_NO_ROOT_EMAIL_ALIAS)"
+		else
+			# ..we do want an alias, but is the current one right?
+			if grep -qF "root: root, $oldrootemail" /etc/aliases; then
+				# Older style - replace it
+				log "/etc/aliases: replacing old root alias '$oldrootemail' with '$rootemail'"
+				# This is all to avoid 'perl -i -pe', which would require escaping regexes in variables
+				{
+					cat /etc/aliases | grep -vF "root: root, $oldrootemail"
+					echo "root: root, $rootemail"
+				} >/etc/aliases.new
+				chmod 644 /etc/aliases.new
+				mv /etc/aliases.new /etc/aliases
+				newaliases
+			elif grep -q "^root: root, .*$rootemail" /etc/aliases; then
+				: #  Current style - already present. Note that this allows for multiple kinds
+			else
+				# Root alias not present
+				warn "/etc/aliases: $rootemail is not an alias for 'root'. Please add «root: root, $rootemail» and run 'newaliases'"
+			fi
+		fi
+	else
+		# We don't have any root aliases
+		if [[ -v ATL_NO_ROOT_EMAIL_ALIAS ]]; then
+			# .. we don't want a root alias
+			log "Note: no alias for root@, as indicated by setting of the ATL_NO_ROOT_EMAIL_ALIAS flag"
+		else
+			# Add our root alias
+			log "/etc/aliases: adding root alias '$rootemail'"
+			{
+				echo "# Notify redradishtech if cron jobs or anything unexpectedly fails"
+				echo "root: root, $rootemail"
+			} >>/etc/aliases
+			newaliases
+		fi
+	fi
+
+	if [[ $ATL_SERVER_ROLE = staging || $ATL_SERVER_ROLE = dev || $ATL_SERVER_ROLE = sandbox ]]; then
+		if ! iptables -L | grep -E -q 'udp dpt:(587|submission) reject-with icmp-port-unreachable'; then
+			# The tail -1 is not really applicable for monitoring.redradishtech.com but is needed if using smtp.socketlabs.com instead, for example
+			error "Please block outgoing email on this $ATL_SERVER_ROLE instance:
+				ufw allow out to $(dig +short A monitoring.redradishtech.com | tail -1) port 25 comment \"monitoring.redradishtech.com, for $ATL_MONITORING alerts\"
+				ufw allow out to $(dig +short AAAA monitoring.redradishtech.com | tail -1) port 25 comment \"monitoring.redradishtech.com, for $ATL_MONITORING alerts\"
+				ufw reject out 587 comment \"Block outgoing email submission on $ATL_SERVER_ROLE server\"
+				ufw reject out 25 comment \"Block outgoing email relay on $ATL_SERVER_ROLE server\"
+				ufw enable"
+		fi
+	fi
+}
+
+setup_mercurial() {
+	[[ -d /etc/mercurial ]] || return 0 # Mercurial might be from nix
+	# Enable 'hg q*' commands for everyone
+	local rcfile=/etc/mercurial/hgrc.d/mq.rc
+	if [[ ! -f $rcfile ]]; then
+		log "Enabling Mercurial patch queue extension globally ($rcfile)"
+		{
+			echo "# Enable 'hg q*' patch queue commands for managing Atlassian apps"
+			echo "[extensions]"
+			echo "hgext.mq ="
+		} >"$rcfile"
+	fi
+	if [[ -f $rcfile ]]; then
+		if ! grep -q '^prompt =' $rcfile; then
+			{
+				echo "# Enable 'hg prompt' for everyone - necessary for $ATL_MANAGE/lib/create_patchqueue and other scripts"
+				echo "[extensions]"
+				echo "prompt = $ATL_MANAGE/.hgext/hg-prompt/prompt.py"
+			} >"$rcfile"
+		fi
+	fi
+	# The install_profilesdir() function above may have done a new hg checkout of $ATL_PROFILEDIR. If so, its .hg/hgrc file will be owned by our account.
+	# If we're not root, then if any other user (including root) later runs this script, Mercurial will print ugly warnings, like:
+	#
+	# 	not trusting file /etc/atlassian_app_profiles/.hg/hgrc from untrusted user jturner, group jturner
+	#	not trusting file /etc/atlassian_app_profiles/.hg/hgrc from untrusted user jturner, group jturner
+	#
+	# and then fail.
+	# To avoid this failure, we need other users (like root) to trust .hgrcs created by us ($USER, or 'jturner' in the example above).
+	# This is accomplished globally by the following lines:
+	if [[ $USER != root ]]; then
+		rcfile=/etc/mercurial/trusted.$USER.rc
+		if [[ ! -f $rcfile ]]; then
+			log "Ensuring all other users trust $ATL_PROFILEDIR/.hg/hgrc and other .hgrc files created by us ($USER). ($rcfile)"
+			{
+				echo "[trusted]"
+				echo "users = $USER"
+			} >"$rcfile"
+		fi
+	fi
+}
+
+setup_tarsnap() {
+	[[ "${ATL_BACKUP_TYPES:-}" =~ tarsnap ]] || return 0
+	# Install per https://www.tarsnap.com/pkg-deb.html
+	set -x
+	local gpg=/usr/share/keyrings/tarsnap-archive-keyring.gpg
+	if [[ ! -f $gpg ]]; then
+		gpgasc=$(mktemp)
+		curl "https://pkg.tarsnap.com/tarsnap-deb-packaging-key.asc" -o "$gpgasc"
+		[[ $(sha1sum "$gpgasc" | awk '{print $1}') = c750c33b22d4cf9646cdef2f348097d1632b454f ]] || fail "The tarsnap GPG key $gpg no longer matches what we expect"
+		cat "$gpgasc" | gpg --dearmor >"$gpg"
+		rm "$gpgasc"
+		chmod ugo+r "$gpg"
+	fi
+
+	listfile="/etc/apt/sources.list.d/tarsnap.list"
+	listfilestr="deb [signed-by=$gpg] http://pkg.tarsnap.com/deb/$(lsb_release -s -c) ./"
+	[[ -f "$listfile" && "$(cat $listfile)" = "$listfilestr" ]] || {
+		echo "$listfilestr" >"$listfile"
+	}
+	set +x
+
+	pkginstall tarsnap
+}
+
+setup_redo() {
+	local tmpdir="/tmp/install_do"
+	mkdir -p "$tmpdir"
+	cd "$tmpdir"
+	[[ -d redo ]] || git clone https://github.com/apenwarr/redo
+	cd redo
+	DESTDIR="$ATL_MANAGE/lib/redo" PREFIX=/ chronic ./do install
+}
+
+install_lnav() {
+	# Ubuntu 24.04 inside proxmox has no snap!
+	# Disabled until lnav formats can be fixed
+	command -v snap && snap install lnav || apt install -y lnav
+	# We rely on lnav being bundled in atl_manage
+	log "Installing lnav formats for user $USER"
+	if [[ ! -d ~/.lnav/formats/installed/.hg ]]; then
+		mkdir -p ~/.lnav/formats
+		hg clone http://hg.sr.ht/~redradishtech/lnav_atlassian ~/.lnav/formats/installed
+	fi
+}
+
+main "$@"

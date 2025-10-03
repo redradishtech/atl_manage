@@ -1,0 +1,304 @@
+#!/bin/bash -eu
+
+script="$(basename "$0")"
+#shellcheck source=/opt/atl_manage/replication/common.sh
+case "$script" in
+backups-mirror) . "$ATL_MANAGE/backupmirror/common.sh" ;;
+replication) . "$ATL_MANAGE/replication/common.sh" ;;
+*) fail "Unknown script $script" ;;
+esac
+
+validateperms() {
+	# Ensure that Nagios can read any .cfg files. Permissions should have been restored from the patchqueue.
+	# Ensure the sync script has access to its lockfile/logfile
+	# Evaluates to $ATL_APPDIR/replication/ or $ATL_APPDIR/backups/
+	validateperms_healthcheck "$destination_type_rootdir"
+	echo "✓"
+}
+
+install-post() {
+	set -euo pipefail
+
+	gethomedir() {
+		# https://unix.stackexchange.com/questions/247576/how-to-get-home-given-user
+		getent passwd "$1" | cut -d: -f6
+	}
+	getshell() {
+		# https://unix.stackexchange.com/questions/352316/finding-out-the-default-shell-of-a-user-within-a-shell-script
+		getent passwd | awk -F: -v user="$1" '$1 == user {print $NF}'
+	}
+
+	installsshkey() {
+		[[ -v SOURCE_HOST ]] || fail "Missing SOURCE_HOST"
+		[[ -n $SOURCE_HOST ]] || fail "$SOURCE_HOST is defined but blank"
+		[[ -n ${!SOURCE_HOST} ]] || fail "$SOURCE_HOST is unset"
+		log "Ensuring SSH key exists for $(basename "$0")"
+		# Previously we used 'uname -n' since we didn't assume ATL_REPLICATION_PRIMARY_HOST was available on standby. After loosening that assumption this changes
+		local keycomment="Key used to sync ${!SOURCE_HOST} data"
+		if issource; then
+			syncuser="${!SOURCE_SYNCUSER}"
+		elif isdestination; then
+			syncuser="${!DESTINATION_SYNCUSER}"
+		else
+			fail "??"
+		fi
+		sshdir=$(gethomedir "$syncuser")/.ssh
+		[[ -d $sshdir ]] || install -d -o "$syncuser" -g "$syncuser" -m 700 "$sshdir"
+		[[ $(getshell "$syncuser") = /bin/bash ]] || fail "Please set the '$syncuser' user's shell to /bin/bash, to allow the remote side to log in"
+		# Strangely I am able to SSH into a 'locked' account on the destination, but not when looping back to the source. Comment out this check for now (or restrict it to the source)
+		#read  -r _ locked _ _ _ _ _ < <(passwd -S "$syncuser")
+		#if grep -q "^$syncuser"':!' /etc/shadow; then
+		#	fail "Account $syncuser is locked. Unlock with: usermod -p '*' $syncuser; passwd --unlock $syncuser"  # https://unix.stackexchange.com/questions/193066/how-to-unlock-account-for-public-key-ssh-authorization-but-not-for-password-aut
+		#fi
+
+		local privkey="$sshdir/id_ed25519"
+		local pubkey="$sshdir/id_ed25519.pub"
+		local authkeyfile="$sshdir/authorized_keys"
+
+		install_instructions='\ninstall -d -o ${!DESTINATION_SYNCUSER} -g ${!DESTINATION_SYNCUSER} ~${!DESTINATION_SYNCUSER}/.ssh
+	\necho \"$(cat "$pubkey")\" >> ~${!DESTINATION_SYNCUSER}/.ssh/id_ed25519_${!SOURCE_HOST_UNAME}.pub
+	\necho \"$(cat "$pubkey")\" >> ~${!DESTINATION_SYNCUSER}/.ssh/authorized_keys
+	\nchown ${!DESTINATION_SYNCUSER}: ~${!DESTINATION_SYNCUSER}/.ssh/authorized_keys'
+
+		if issource; then # ATL_REPLICATION_PRIMARY set
+
+			# We're the primary, and are responsible for creating the SSH keypair
+
+			if [[ ! -f $privkey ]]; then
+				# Run as the runtime user to get the permissions right
+				sudo -u "${!SOURCE_SYNCUSER}" ssh-keygen -t ed25519 -P "" -C "$keycomment" -f "$privkey"
+				log "Generated private key: $privkey"
+				log "Please run the following on ${!DESTINATION_SYNCUSER}@${!DESTINATION_HOST}: \
+					$(eval "echo -e \"$install_instructions\"")
+				"
+				read -r -p "Continue with SSH test? (Y/n): " yesno
+				case $yesno in
+				n | N) error "Please run 'atl_event install-post replication' or 'atl_activate' when you have copied across the key" ;;
+				esac
+			else
+				if ! "$ATL_MANAGE/$destination_type/verify"; then
+					log "Private key ($privkey) exists, but SSH attempt failed. The SSH public key must be installed on ${!DESTINATION_SYNCUSER}@${!DESTINATION_HOST}:~${!DESTINATION_SYNCUSER}/.ssh/authorized_keys . If not, do so with:: $(eval "echo -e \"$install_instructions\"")"
+				fi
+			fi
+			[[ -f "$pubkey" ]] || fail "??"
+			# Our $ATL_MANAGE/lib/remote/run script loads $privkey in a ssh-agent, forwards it to other hosts, who then use it to auth against our root-friendly sshd.
+			# Here we tell our root-friendly sshd to trust $privkey by putting $pubkey in its authorized_keys file
+			local authkeys=/etc/ssh/ssh_for_atlassianapps/authorized_keys # From /opt/atl_manage/lib/remote/sshd/install
+			[[ -f "$authkeys" ]] || fail "Please run /opt/atl_manage/lib/remote/sshd/install"
+			if ! grep -qF "$(cat "$pubkey")" "$authkeys"; then
+				log "Configuring our root-friendly sshd to trust ${!SOURCE_SYNCUSER}'s ssh key"
+				cat "$pubkey" >>"$authkeys"
+			fi
+
+		elif isdestination; then # ATL_REPLICATION_STANDBY set
+			pubkey="$sshdir/id_ed25519_${!SOURCE_HOST_UNAME}.pub"
+			while [[ ! -f "$pubkey" ]]; do
+				warn "Missing $pubkey. Please go to ${!SOURCE_HOST_UNAME} and re-run the $destination_type setup process ('atl_event install-post $script'), then try again"
+				bash
+			done
+			while ! grep -qF "$(cat "$pubkey")" "$authkeyfile"; do
+				warn "Please install the SSH key: $(eval echo -e \"$install_instructions\")"
+				bash
+			done
+		fi
+
+		if [[ ! -f $authkeyfile ]] || ! grep -qF "$(cat "$pubkey")" "$authkeyfile"; then
+			log "Updating $authkeyfile"
+			cat "$pubkey" >>"$authkeyfile"
+			chmod u=rw,g=r,o= "$authkeyfile"
+			chown "${syncuser}." "$authkeyfile"
+		fi
+	}
+
+	test_ssh_working() {
+		if issource; then
+			log "Now attempting to SSH to our $destination_type pair"
+			if "$ATL_MANAGE/$destination_type/verify"; then
+				log " $? $destination_type SSH roundtrip succeeded"
+			else
+				warn "$destination_type SSH failed."
+				warn "Please run $ATL_MANAGE/$destination_type/verify -v and fix before trying again"
+			fi
+		fi
+	}
+
+	# Grant $ATL_USER permission to run our filesystem sync script
+	sudo_scripts() {
+		if [[ ${!DESTINATION_SYNCUSER} != root ]]; then
+			# Grant permission for sync and verify scripts
+			sudosnippet $destination_type "# This /etc/sudoers.d/ snippet allows the $destination_type standby filesystem syncer script (/etc/cron.d/$ATL_SHORTNAME-$destination_type) to write the synced data directory.\n${!DESTINATION_SYNCUSER}  ALL=(ALL)NOPASSWD:SETENV:$ATL_MANAGE/$destination_type/*,$ATL_MANAGE/monitoring/plugins/check_backupmirror_freshness,$ATL_MANAGE/monitoring/plugins/check_replication_filesystem,/bin/rsync\n# Note: $ATL_MANAGE/$destination_type/sync is deprecated in favour of lsyncd, which just needs /bin/rsync"
+		fi
+	}
+
+	initiate_destination() (
+		# subshell as we 'cd'
+
+		if [[ $ATL_REPLICATION_TYPE = rsync ]] && isdestination; then
+			# Replication keeps a pristine copy of the primary's datadir. If this copy doesn't exist, seed it here with hardlinked data
+			[[ ! -v ATL_REPLICATION_STANDBY_MIRROR_OF_PRIMARY_DATADIR ]] || fail "ATL_REPLICATION_STANDBY_MIRROR_OF_PRIMARY_DATADIR should not be defined. Please re-source lib/profile.sh and atl freeze"
+			# The cp breaks if we're setting up and ATL_DATADIR is empty. https://superuser.com/questions/352289/bash-scripting-test-for-empty-directory
+			if [[ -n "$(ls -A "$ATL_DATADIR")" ]]; then
+				cd "$ATL_DATADIR"
+				if [[ ! -d "$ATL_REPLICATION_STANDBY_MIRRORDIR" ]]; then
+					install -d -o "$ATL_USER" "$ATL_REPLICATION_STANDBY_MIRRORDIR"
+					log "Seeding standby replication's mirror directory: $ATL_DATADIR/$ATL_REPLICATION_STANDBY_MIRRORDIR .."
+					# The standby mirror is a hidden directory within $ATL_DATADIR. The '*' won't match it fortunately
+
+					cp -al ./* "$ATL_REPLICATION_STANDBY_MIRRORDIR"
+					log "Seeding of $ATL_DATADIR/$ATL_REPLICATION_STANDBY_MIRRORDIR completed"
+				fi
+			fi
+		fi
+	)
+
+	check_markerfile() {
+		if isdestination; then
+			if [[ ! -d $ATL_DATADIR ]]; then
+				warn "Slave's data dir $ATL_DATADIR does not yet exist"
+			fi
+			marker="$ATL_DATADIR/READONLY_STANDBY"
+			if [[ ! -e $marker ]]; then
+				warn "Please create marker file $marker for sync to work"
+			fi
+		fi
+	}
+
+	[[ -v $SOURCE_SYNCUSER && ${!SOURCE_SYNCUSER} == root ]] || fail "$SOURCE_SYNCUSER should be set to root, as our custom-launched sshd allows it and we need root-like permissions to rsync all the content from source"
+	[[ -v $DESTINATION_SYNCUSER && ${!DESTINATION_SYNCUSER} != root ]] || fail "$DESTINATION_SYNCUSER is set to root. We should always SSH as non-root, to avoid problems on locked-down instances, and then rely on sudo"
+	installsshkey
+	# If our replication standby is down, keep going
+	test_ssh_working
+	sudo_scripts
+	if [[ $script = replication ]]; then
+		case "$ATL_REPLICATION_TYPE" in
+		rsync)
+			initiate_destination
+			check_markerfile
+			;;
+		lsyncd)
+			# installservice actually also checks for ATL_ROLE, but make it explicit here
+			if [[ $ATL_ROLE = prod ]]; then
+				installservice "$destination_type_rootdir/$ATL_SYSTEMD_SERVICENAME-$ATL_VER-replication.service"
+			fi
+			;;
+		esac
+	elif [[ $script = backups-mirror ]]; then
+		:
+	fi
+	atl_install_monitoring_services "$destination_type_rootdir" # The $ATL_APPDIR/replication/replication_filesystem_sync.healthcheck has an internal check which no-op's if ATL_REPLICATION_TYPE isn't 'rsync'
+	validateperms
+}
+
+uninstall-pre() {
+	deactivate
+}
+
+upgrade-running-pre() {
+	[[ -v ATL_NEWVER ]] || error "Unexpected state: pre-upgrade, but ATL_NEWVER is unset"
+
+	if issource; then
+		[[ $ATL_ROLE = prod ]] || error "ATL_REPLICATION_PRIMARY is set, yet our ATL_ROLE is $ATL_ROLE, not 'prod'. This may be an error, as replication only makes sense for production envs."
+
+		standby_has_been_upgraded() {
+			## YES the ATL_VER=$ATL_NEWVER has to be here. The idea is that you upgrade the replication standby FIRST, and this ensures that $ATL_NEWVER is deployed on the standby.
+			local replver
+			replver="$(_atl_setversion "$ATL_NEWVER"; atl_replication run bash <<<'echo $ATL_VER')" || { error "Couldn't run a command on replication standby. Is it not upgraded?"; }
+			if [[ $replver != $ATL_NEWVER ]]; then
+				quit "Replication host ${!DESTINATION_HOST} is at version $replver. Please first upgrade it to $ATL_NEWVER before proceeding on replication master"
+			fi
+		}
+		standby_has_been_upgraded
+
+	elif isdestination; then
+		[[ $ATL_ROLE =~ standby ]] || error "ATL_REPLICATION_STANDBY is set, yet our ATL_ROLE is $ATL_ROLE, which doesn't mention 'standby'. Broken assumption possibly indicating trouble"
+		verify_standby_has_new_datadir() {
+			# We always upgrade replication standbys first
+			# We're a replication standby: before upgrade can proceed, verify that we have an $ATL_NEWVER data directory with a READONLY_STANDBY marker (as expected for standbys)
+			# This should have been done by our caller, i.e. atl_upgrade
+			# If our $ATL_NEWVER data directory didn't exist, the replication cronjob on the primary would recreate it from scratch when the primary upgrades, potentially consuming lots of bandwidth/cpu.
+			[[ -v ATL_DATADIR_NEW ]] || error "Unexpected state: ATL_DATADIR_NEW not defined"
+			[[ -d $ATL_DATADIR_NEW ]] || error "Unexpected state: We do not have a $ATL_DATADIR_NEW directory"
+			if [[ $ATL_REPLICATION_TYPE = rsync ]]; then
+				[[ -f $ATL_DATADIR/READONLY_STANDBY ]] || error "Unexpected state: No READONLY_STANDBY marker file in $ATL_DATADIR"
+			fi
+		}
+		verify_standby_has_new_datadir
+
+	fi
+}
+
+upgrade-stopped-pre() {
+	if issource; then
+		final_sync() {
+			log "Performing final replication filesystem sync for $ATL_VER..."
+			# Note: by the time we upgrade our replication primary, our replication standby should be already upgraded! That means we're replicating from primary's $ATL_DATADIR/$ATL_VER (current/ symlink) to standby's $ATL_DATADIR/$ATL_VER (previous/ symlink) (via intermediate $ATL_VER-mirror-from-$primary). That is by design, and the reason we keep the n-1 data directory around after an upgrade.
+
+			# Keep this in sync with $ATL_APPDIR/replication/replication.cron
+			# FIXME: it should not be necessary to atl_env this, as our caller env should be sufficient. But it more closely matches the cron job which is our aim
+			# If this fails, that suggests replication might be broken generally, in which case upgrading the primary may be a bad idea.
+			set -x
+			sudo -u "${!SYNCUSER}" "$ATL_APPDIR/.env/atl_env" "$ATL_MANAGE/$destination_type/sync"
+			set +x
+		}
+		if [[ $ATL_REPLICATION_TYPE = rsync ]]; then
+			final_sync
+		fi
+
+	elif isdestination; then
+		if [[ $ATL_REPLICATION_TYPE = rsync ]]; then
+			# Replication standby will have a clean mirror of the primary's data, e.g. if ATL_VER=8.5.1 and ATL_NEWVER=8.5.4, we'll have $ATL_DATADIR/8.5.1/.mirror-from-usw-jira01. This will be up-to-date thanks to the final_sync() call in upgrade-stopped-pre event on the replication primary (see above).
+			# Our job on the standby is to rsync ourselves a new copy of the mirror, e.g. copy $ATL_DATADIR/8.5.1/.mirror-from-usw-jira01 to  $ATL_DATADIR/8.5.4/.mirror-from-usw-jira01, to save bandwidth when the primary is upgraded and does its first replication sync.
+			[[ -d $ATL_DATADIR/$ATL_REPLICATION_STANDBY_MIRRORDIR ]] || fail "Unexpectedly missing ATL_DATADIR/ATL_REPLICATION_STANDBY_MIRRORDIR $ATL_DATADIR/$ATL_REPLICATION_STANDBY_MIRRORDIR"
+
+			log "Copying $ATL_DATADIR/$ATL_REPLICATION_STANDBY_MIRRORDIR to $ATL_DATADIR_BASE/$ATL_NEWVER/$ATL_REPLICATION_STANDBY_MIRRORDIR"
+			set -x
+			cp -al "$ATL_DATADIR/$ATL_REPLICATION_STANDBY_MIRRORDIR" "$ATL_DATADIR_BASE/$ATL_NEWVER/$ATL_REPLICATION_STANDBY_MIRRORDIR"
+			set +x
+		else
+			: # We need do nothing. In a normal upgrade, the operator runs 'atl_upgrade' on the replication standby (us) which runs 'atl_upgrade_copydata' to populate the new $ATL_DATADIR. Unlike with lsyncd there is no second copy of the live data - once started, lsyncd will start writing data to $ATL_DATADIR directly.
+		fi
+	fi
+
+}
+
+upgrade-running-post() {
+	if issource; then
+		cleanup_old_replication_intermediaries() {
+			# Our primary and standby instances are now happily running. We're now sure that replication is only syncing to the $ATL_VER data directory on standby, so we're safe to delete the intermediary -mirror-from- directories from past versions.
+
+			#ATL_OLDVER="$(basename "$(readlink -f $ATL_DATADIR_BASE/previous)")"
+			log "FIXME"
+			log "FIXME"
+			log "FIXME"
+			log "FIXME"
+			log "FIXME"
+			log "FIXME"
+			log "Fix events/install-post/replication ($BASH_SOURCE) on the source, to clean up $ATL_DATADIR_BASE/<versions sides $ATL_VER>/.mirror-from*"
+			#local patt="!($ATL_VER)/.mirror-from*"
+			#https://stackoverflow.com/questions/21108637/glob-pattern-in-bash-dont-recognize
+			#echo 'shopt -s nullglob extglob; cd $ATL_DATADIR_BASE; for d in $ATL_DATADIR_BASE/'"$patt"'; do echo "Delete old standby replication dir: atl_replication run rm -r $d"; done' | atl_replication run bash -O extglob -O nullglob
+		}
+		cleanup_old_replication_intermediaries
+	fi
+}
+
+# Only do replication stuff on primary/standby pairs, not sandbox servers
+enabled() {
+	is_source_or_destination
+}
+
+deactivate() {
+	if [[ $script = backupmirror && ${ATL_BACKUPMIRROR_DESTINATION:-} = true ]]; then
+		warn "We are a backup mirror destination for ${ATL_BACKUPMIRROR_SOURCE_HOST_UNAME:-}. Uninstalling will break backup mirroring on that host"
+	fi
+	# When replication is deactivated (e.g. via 'hg qselect'), delete any artifacts from previous installations
+	case $destination_type in
+	replication) atl_uninstall_monitoring_services "$ATL_APPDIR"/replication ;;
+	backupmirror) atl_uninstall_monitoring_services "$ATL_APPDIR"/backups/backupmirror.healthcheck ;;
+	esac
+	# FIXME: log files should be removed by an 'uninstall' function in the *.healthcheck file, rather than ad-hoc here.
+	rm -f $ATL_LOGDIR/$destination_type.log{,.json}
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

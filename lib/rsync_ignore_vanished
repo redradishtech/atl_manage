@@ -1,0 +1,18 @@
+#!/bin/bash
+## Invoke rsync, but ignore 'file has vanished' errors.
+## This script is used as a drop-in replacement for rsync by $ATL_MANAGE/replication/sync_filesystem
+# From https://git.samba.org/?p=rsync.git;a=blob_plain;f=support/rsync-no-vanished;hb=HEAD indirectly from https://unix.stackexchange.com/questions/86879/suppress-rsync-warning-some-files-vanished-before-they-could-be-transferred
+
+IGNOREEXIT=24
+IGNOREOUT='^(file has vanished: |rsync warning: some files vanished before they could be transferred)'
+
+set -o pipefail
+
+rsync "${@}" 2>&1 | (egrep -v "$IGNOREOUT" || true)
+ret=$?
+
+if [[ $ret == $IGNOREEXIT ]]; then
+	ret=0
+fi
+
+exit $ret

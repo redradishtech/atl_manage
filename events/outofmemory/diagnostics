@@ -1,0 +1,12 @@
+#!/bin/bash -eu
+# The 'outofmemory' event is generally triggered by $ATL_APPDIR/oomhandler/$ATL_SHORTNAME-oomhandler@.service, socket-activated by $ATL_APPDIR/oomhandler/$ATL_SHORTNAME-oomhandler.socket, invoked via 'nc' by $ATL_APPDIR/oomhandler/oomhandler, invoked by the JVM's -XX:OnOutOfMemoryError flag set in $ATL_APPDIR/bin/setenv-oomhandler.sh
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+[[ ${ATL_ROLE:-} = prod ]] || exit 0
+[[ ${ATL_PRODUCT_RUNTIME_TECHNOLOGY:-} =~ java ]] || exit 0
+
+atl_diagnostic snapshot outofmemory
+# This nagios definition is symlinked into /etc/nagios4/conf.d/ from $ATL_APPDIR/monitoring/oomhandler.cfg
+"$ATL_MANAGE/monitoring/notify_nagios4" "$ATL_LONGNAME" "Unexpected Restart" 2 "$ATL_PRODUCT ran out of memory at $(date)"

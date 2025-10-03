@@ -1,0 +1,22 @@
+#!/bin/bash -eu
+
+#Sample lines:
+# /*!40101 SET NAMES utf8 */;
+# /*!40100 DEFAULT CHARACTER SET latin1 */
+# SET character_set_client = utf8;
+# /*!40101 SET character_set_client = utf8 */;
+# DEFAULT CHARSET=latin1;
+# /*!50003 SET character_set_client  = latin1 */ ;
+# /*!50003 SET collation_connection  = latin1_swedish_ci */
+# `title` varchar(255) COLLATE utf8_unicode_ci NOT NULL DEFAULT '',
+#  `name` varchar(255) CHARACTER SET latin1 COLLATE latin1_general_ci NOT NULL DEFAULT ''
+#   `age_bracket` varchar(64) CHARACTER SET utf8 NOT NULL DEFAULT ''
+# We don't want to change:
+# /*!50003 SET character_set_client  = @saved_cs_client */ ;
+
+sed -e 's/CHARACTER SET [^ ]\+/CHARACTER SET utf8mb4/g' \
+	-e 's/DEFAULT CHARSET=[^;]\+;/DEFAULT CHARSET=utf8mb4;/g' \
+	-e 's/SET \(character_set_client\|character_set_results\)\( \+\)= \([^@][^ ]\+\)\([ ;]\)/SET \1\2= utf8mb4\4/g' \
+	-e 's/SET \(collation_connection\)\( \+\)= \([^ ]\+\) /SET \1\2= utf8mb4_general_ci /g' \
+	-e 's/COLLATE [^ ]\+_ci/COLLATE utf8mb4_unicode_ci/g' \
+	-e 's/SET NAMES [^ ]\+ /SET NAMES utf8mb4 /g'

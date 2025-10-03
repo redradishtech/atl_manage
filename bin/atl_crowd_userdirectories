@@ -1,0 +1,26 @@
+#!/bin/bash -eu
+## For each 'Crowd' user directory configured (that is, Crowd or Crowd-embedded-in-Jira), print the connection details. Used by $ATL_APPDIR/monitoring/userdirectories.healthcheck to validate connectivity
+
+main() {
+	atl_psql -tAXq <"$ATL_MANAGE/templates/sql/pg_crowd_userdirectories.sql"
+}
+
+usage() {
+	cat <<-'EOF'
+		Purpose: For each 'Crowd' user directory configured (that is, Crowd or Crowd-embedded-in-Jira), print the connection details
+		Usage  : atl_crowd_userdirectories
+
+		Intended to be used from a script, like $ATL_APPDIR/monitoring/userdirectories.healthcheck, e.g.:
+
+		atl_crowd_userdirectories | while IFS='|' read -r directory_id directory_name url username password; do
+		  echo "# For directory $directory_name ($directory_id):"
+		  curl -I -u '$username:$password' $url/rest/usermanagement/1/config/cookie
+		done
+	EOF
+}
+
+if [[ $# = 1 && $1 =~ "-h" ]]; then
+	usage
+else
+	main "$@"
+fi

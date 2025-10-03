@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+set -eu
+
+usage() {
+	echo "Usage: $(basename "$0") DIRECTORY ACTION [VER]"
+	echo "Upgrade or downgrade the app in DIRECTORY."
+	echo
+	echo "ACTION is:"
+	echo "	check		Check that the directory structure conforms to our expectations, If VER is specified, validate that it is the current version"
+	echo "	upgrade		Upgrade to VER"
+	echo "	downgrade	Downgrade to the version indicated by the previous/ symlink"
+	echo "	oldest		Print oldest version in old/ (i.e. not referenced by 'current' symlink) that could e.g. be deleted"
+	echo "	help		This help"
+	exit
+}
+
+switchver() (
+	(( $# >= 2 )) || usage
+	[[ -d "$1" ]] || error "Directory '$1' does not exist"
+	local base
+	base="$(realpath "$1")"; shift   # base has to be absolute
+	local action="$1"; shift
+	case "$action" in
+		up*) 
+			(( $# <= 1 )) || usage   # $1 is the upgraded-to version, or blank if we want to infer it from next/
+			upgrade "$base" "$@"
+			;;
+		down*)
+			(( $# == 0 )) || usage
+			downgrade "$base"
+			;;
+		check)
+			generic_sanitychecks "$base" "$@"
+			;;
+		oldest)
+			(( $# <= 1 )) || usage   # $1 is the number of days' unmodified to consider 'old'
+			generic_sanitychecks "$base" "$@"   # We don't want to get 'oldest' wrong due to some pointer
+			oldest "$base" "$@"
+			;;
+
+		help|*) usage;;
+	esac
+)
+
+# Given directory $1 containing UPGRADED_TO_xyz.txt marker, return xyz version.
+get_upgrade_markerver() {
+	get_markerver UPGRADED_TO "$@"
+}
+
+# Given directory $1 containing DOWNGRADED_TO_xyz.txt marker, return xyz version.
+get_downgrade_markerver() {
+	get_markerver DOWNGRADED_TO "$@"
+}
+
+get_markerver() (
+	local direction="$1"
+	local dir="$2"
+	shopt -s nullglob
+	local marker=("$dir"/"$direction"_*.txt)
+	debug "Getting markers for $dir"
+	if [[ ${#marker[@]} = 1 ]]; then
+		local markerver
+		#shellcheck disable=SC2001
+		markerver=$(echo "${marker[0]}" | sed -e 's#.*'"$direction"'_\(.*\).txt#\1#g')
+		echo "$markerver"
+	elif [[ ${#marker[@]} = 0 ]]; then
+		error "Missing $dir/${direction}_*.txt marker file"
+	else
+		error "More than one $dir/${direction}_*.txt marker file?? (${marker[*]})"
+	fi
+)
+
+assert_markerver_count() (
+	local dir="$1"
+	local count="$2"
+	shopt -s nullglob
+	local marker=("$dir"/*_TO_*.txt)
+	(( ${#marker[@]} == count )) || error "${#marker[@]} version markers in $dir (expected $count): ${marker[*]}"
+)
+
+# Sanity checks for directory $1, optionally specifying the expected current version $2
+generic_sanitychecks() {
+
+	shopt -s nullglob
+	local base="$1"
+	local ver
+	[[ -L $base/current ]] || error "Missing $base/current symlink"
+	local cur
+	cur="$(deref "$base"/current)"
+	is_valid_version_pattern "$cur" || error "$base/current points to '$cur', which does not a SemVer.org-compliant version name. Aborting"
+
+	ver=${2:-$cur}
+
+	[[ $cur = "$ver" ]] || error "$base/current symlink does not point to $ver data as expected, but rather to '$cur'"
+	[[ -d $base/$ver ]] || error "Missing current version of app at $base/$ver"
+
+	local markervers
+	assert_markerver_count "$base/current" 0
+
+	if [[ -L $base/previous ]]; then
+		local prev
+		prev="$(deref "$base"/previous)"
+		[[ $prev != "$cur" ]] || error "$base/previous points to same version ($cur) as $base/current"
+		[[ -d $base/$prev ]] || error "$base/previous is a broken symlink (referent $prev does not exist)"
+		[[ -d $base/old ]] || error "Missing $base/old/ directory"
+		[[ -L $base/old/$prev ]] || error "Could not find an $base/old/$prev symlink pointing to $prev data."
+		[[ -d $base/old/$prev ]] || error "$base/old/$prev symlink should point to a directory"
+		[[ $prev != "$ver" ]] || error "Unexpected situation: $base/previous points to current version $ver"
+		local markerver markerverstr
+		markerver=$(get_upgrade_markerver "$base"/previous)
+		[[ -n $markerver ]] && markerverstr="points to $markerver" || markerverstr="does not exist"
+		[[ $cur = "$markerver" ]] || error "Current version is $cur ($base/current/ symlink), but previous/UPGRADED_TO_*.txt markerfile $markerverstr. Is the previous/ version not actually previous?"
+
+		assert_markerver_count "$base/previous" 1
+
+	fi
+
+	for dir in "$base"/old/*; do
+		local oldver
+		oldver="$(deref "$dir")"
+		is_valid_version_pattern "$oldver" || error "$dir (specifically, '$oldver') doesn't look like version directory. Aborting"
+		local nextver
+		nextver="$(get_upgrade_markerver "$dir")"
+		[[ -L $base/previous || $nextver != "$ver" ]] || error "Missing previous/ symlink. Marker file in $dir suggests we need symlink previous -> $oldver"
+
+		assert_markerver_count "$dir" 1
+	done
+
+	[[ ! -d old/$ver ]] || error "Data already exists at '$base/old/$ver'"
+
+	if [[ -L $base/next ]]; then
+		local next
+		next="$(deref "$base"/next)"
+		[[ $next != "$cur" ]] || error "$base/next points to same version ($cur) as $base/current"
+		[[ -d $base/$next ]] || error "$base/next is a broken symlink (referent $next does not exist)"
+		[[ ! -L $base/old/$next ]] || error "$base/old/$next symlink should not exist"
+		[[ ! -d $base/old/$next ]] || error "$base/old/$next directory should not exist"
+		[[ $next != "$ver" ]] || error "Unexpected situation: $base/next points to current version $ver"
+		local markerver markerverstr
+		markerver=$(get_downgrade_markerver "$base"/next)
+		[[ -n $markerver ]] && markerverstr="points to $markerver" || markerverstr="does not exist"
+		[[ $cur = "$markerver" ]] || error "Current version is $cur ($base/current/ symlink), but next/DOWNGRADED_TO_*.txt markerfile $markerverstr. Is the next/ version not actually next?"
+		
+		assert_markerver_count "$base/next" 1
+	fi
+}
+
+
+upgrade() {
+	local base="$1"
+	local ver
+
+	infer_ver()
+	{
+		if [[ $# == 2 ]]; then
+			ver="$2"
+			debug "Explicit upgrade version $ver"
+		else
+			[[ -L $base/next ]] || error "Please specify a version to upgrade to (no $base/next symlink)"
+			ver="$(deref "$base"/next)"
+			debug "Inferring upgrade version $ver"
+		fi
+	}
+
+	sanitychecks()
+	{
+		[[ -d $base/$ver ]] || error "Version directory '$base/$ver' does not exist yet"
+		if [[ -L "$base"/current ]]; then
+			local cur
+			cur="$(deref "$base"/current)"
+			[[ $cur != "$ver" ]] || error "$base already at $ver"
+		fi
+		if [[ -L $base/previous ]]; then
+			local prev
+			prev="$(deref "$base"/previous)"
+			[[ $prev != "$ver" ]] || error "Unexpected situation: $base/previous points to new version $ver"
+		fi
+	}
+
+	update_links()
+	(	# subshell so we can 'cd'
+
+		# Search non-archived version directories for the version before $1
+		getversionafter()
+		(
+			shopt -s nullglob
+			local marker=("$base"/*/DOWNGRADED_TO_"$ver".txt)   # The '*' turns this into a glob
+			if [[ ${#marker[@]} = 1 ]]; then
+				local markerver
+				# shellcheck disable=SC2001
+				markerver=$(echo "${marker[0]}" | sed -e 's#.*/\(.*\)/DOWNGRADED_TO.*#\1#g')
+				echo "$markerver"
+			elif [[ ${#marker[@]} = 0 ]]; then
+				:  # There is no version deployed earlier than $ver. 
+			else
+				error "Expected to find just one old version directory containing a marker. Instead matched multple: ${marker[*]}"
+			fi
+		)
+
+		cd "$base"
+
+		# First, move the previous upgrades stuff into the old/ directory
+		create_archive "$base"
+
+		# Shuffle everything along. previous/ gets archived, current/ becomes previous/, and if markerfiles suggest anything
+		# comes after current/, symlink it as next/
+
+		if [[ -L previous ]]; then
+			local oldprev
+			oldprev="$(deref previous)" # We validated above that $oldprev is a directory
+			debug "Moving old version, $oldprev/ to old/ directory.."
+			archive_oldversion "$base" "$oldprev"
+			debug "..move completed."
+			rm previous
+		fi
+
+		if [[ -L current ]]; then
+			local oldcur
+			oldcur="$(deref current)"
+			mv current previous
+			cd old
+			ln -s ../"$oldcur" .
+			cd ..
+			local markerfile="UPGRADED_TO_$ver.txt"
+			echo "This is the old directory for $oldcur, prior to the $ver upgrade on $(date)" > previous/"$markerfile"
+		fi
+
+		ln -s "$ver" current
+		shopt -s nullglob
+		local markerfiles=(current/DOWNGRADED_TO_*.txt)
+		if (( ${#markerfiles[@]} )); then
+			# Say we:
+			#  upgraded 1.0 to 3.0
+			#  downgraded to 1.0
+			#  are upgrading 1.0 to 2.0
+			# next/ will be 3.0, and we'll have next/DOWNGRADED_TO_1.0.txt.
+			# but although 3.0 was 'next' after 1.0 (once), it is not necessarily 'next' for 2.0. Delete the next/ symlink, and clear the marker
+			rm -f next
+			rm "${markerfiles[@]}"
+		fi
+
+	)
+
+	infer_ver "$@"
+
+	sanitychecks
+	update_links
+	generic_sanitychecks "$base"
+}
+
+downgrade() {
+	local base="$1"
+	
+	sanitychecks()
+	{
+		[[ -L $base/previous ]] || error "Cannot revert versions, as $base/previous does not exist"
+		[[ -d $base/previous ]] || error "Cannot revert versions, as $base/previous is broken"
+	}
+
+	update_links()
+	(
+		# Search old (archived) version directories for the version prior to $1
+		getversionbefore()
+		(
+			local ver="$1"
+			shopt -s nullglob
+			local marker=("$base"/old/*/UPGRADED_TO_"$ver".txt)   # The '*' turns this into a glob
+			if [[ ${#marker[@]} = 1 ]]; then
+				local markerver
+				# shellcheck disable=SC2001
+				markerver=$(echo "${marker[0]}" | sed -e 's#.*/old/\(.*\)/UPGRADED_TO.*#\1#g')
+				echo "$markerver"
+			elif [[ ${#marker[@]} = 0 ]]; then
+				:  # There is no version deployed earlier than $ver. 
+			else
+				error "Expected to find just one old version directory containing a marker. Instead matched multple: ${marker[*]}"
+			fi
+		)
+
+		cd "$base"
+
+		local oldprev oldcur
+		oldprev="$(deref previous)"
+
+		# Shuffle everything along. next/ gets deleted, current/ becomes next/, previous/ becomes current/, and
+		# if markerfiles suggest anything comes before current/, symlink it as previous/
+
+		rm -f next
+		if [[ -L current ]]; then
+			local cur
+			if [[ -d current ]]; then
+				oldcur="$(deref current)"
+				echo "This $oldcur directory is no longer used. We downgraded to $oldprev on $(date)" > current/"DOWNGRADED_TO_$oldprev.txt"
+			else
+				echo >&2 "Warning: next/ symlink (previously current/) is broken"
+			fi
+			mv current next
+		fi
+
+		rm previous/UPGRADED_TO_*.txt
+		mv previous current
+		rm old/"$oldprev"  # Remove the symlink from old/ to what is now the current version
+		local prev
+		oldoldprev=$(getversionbefore "$oldprev")
+		if [[ -n "$oldoldprev" ]]; then
+			unarchive_oldversion "$base" "$oldoldprev"
+			( cd old; ln -s ../"$oldoldprev" .; )
+			debug "Version prior to $oldprev is $oldoldprev (per markerfile)"
+			ln -s "$oldoldprev" previous
+			debug "$(ls -la "$PWD"/previous)"
+		else
+			debug "No version older than $oldprev; not setting previous/ symlink"
+		fi
+	)
+
+	sanitychecks
+	update_links
+	generic_sanitychecks "$base"
+}
+
+# Print the oldest version in old/, that could be e.g. zfs destroyed next
+oldest() {
+	local base="$1"
+
+	oldvers=()
+	notoldest=()
+	for dir in "$base"/old/*; do
+		local oldver
+		oldver="$(deref "$dir")"
+		oldvers+=("$oldver")
+		local nextver
+		nextver="$(get_upgrade_markerver "$dir")"
+		notoldest+=("$nextver")
+	done
+	debug "Old vers: ${oldvers[*]}"
+	debug "Not oldest: ${notoldest[*]}"
+	for v in ${notoldest[@]}; do oldvers=(${oldvers[@]/$v}); done
+	(( ${#oldvers[@]} <= 1 )) || error "Unexpectedly numerous old versions in $base/old: ${oldvers[*]}"
+	echo "${oldvers[@]}"
+}
+
+# Dereference a current/ or previous/ symlink, or a raw version directory.
+deref() {
+	# If $1 is a symlink, print its referent; otherwise print directory. This is equivalent to 'readlink -f' but only dereferencing one level.
+	# We don't just use 'readlink -f' because we want to support the situation where, say, 'current/' points to '1.0-dev', and '1.0-dev' is a symlink to the app's source at ~/src/github.com/foo/myapp/. In that case 'readlink -f' would return 'myapp', which is not what we want.
+	local dir
+	if dir="$(readlink "$1")"; then
+		basename "$dir"
+	else
+		basename "$1"
+	fi
+}
+
+# Matches what a SemVer version string plausibly be, e.g. '1.2.3', '1.2.3-patchver', '1.2.3-patchver+gitrev'. Blank is NOT permitted.
+
+[[ $(type -t is_valid_version_pattern) = function ]] || is_valid_version_pattern() {
+	# From https://gist.github.com/rverst/1f0b97da3cbeb7d93f4986df6e8e5695 linked to from https://gist.github.com/jhorsman/62eeea161a13b80e39f5249281e17c39
+	[[ $1 =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$ ]]
+}
+
+## Utility functions. If we are sourced, we won't override existing definitions.
+
+_log() {
+	echo >&2 "$*"
+}
+
+
+_debug() {
+	: #echo >&2 "$*"
+}
+
+
+_error() {
+	echo >&2 "$*"
+	return 1
+	[[ $0 = switchver ]] && exit 1 || return 1
+}
+
+## Switchver mostly manages symlinks, but also takes responsibility for moving old version directories
+## into the old/ directory. We define these operations as functions here so the caller can override
+## them. For instance, on ZFS one might like to have a ZFS filesystem for the version directory, in
+## which case 'mv' is actually 'zfs rename'.
+
+# Create version archive for a versioned app at absolute path $1
+_create_archive() {
+	local base="$1"
+	mkdir -p "$base"/old
+}
+
+
+# Archive old version directory $2 for versioned app at absolute path $1
+
+_archive_oldversion() {
+	local base="$1"
+	local oldver="$2"
+	rm "$base/old/$oldver"    # This will be a symlink, so no -f
+	log "Moving $base/$oldver to old/. If old/ is on a different filesystem this may take a while"
+	mv "$base/$oldver" old/
+}
+
+		
+# Unarchive old version directory $2 for versioned app at absolute path $1
+_unarchive_oldversion() {
+	local base="$1"
+	local oldprev="$2"
+	log "Moving old/$oldprev to $base. If $oldprev/ is on a different filesystem this may take a while"
+	mv old/"$oldprev" "$base"
+}
+
+# Override these
+[[ $(type -t log) = function ]] || log() { _log "'${FUNCNAME[0]}' should be overridden"; _log "$@"; }
+[[ $(type -t debug) = function ]] || debug() { log "'${FUNCNAME[0]}' should be overridden"; _debug "$@"; }
+[[ $(type -t error) = function ]] || error() { log "'${FUNCNAME[0]}' should be overridden"; _error "$@"; }
+[[ $(type -t create_archive) = function ]] || create_archive() { log "'${FUNCNAME[0]}' should be overridden"; _create_archive "$@"; }
+[[ $(type -t archive_oldversion) = function ]] || archive_oldversion() { log "'${FUNCNAME[0]}' should be overridden"; _archive_oldversion "$@"; }
+[[ $(type -t unarchive_oldversion) = function ]] || unarchive_oldversion() { log "'${FUNCNAME[0]}' should be overridden"; _unarchive_oldversion "$@"; }
+		
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+	switchver "$@"
+fi

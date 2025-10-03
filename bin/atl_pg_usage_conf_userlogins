@@ -1,0 +1,28 @@
+#!/bin/bash -eu
+
+if [[ ${1:-} = --help ]]; then
+	echo >&2 "Purpose: SQL to print active Confluence users and their last login"
+	echo >&2 "Usage: atl_pg_usage_conf_userlogins [extrasql] | atl_psql"
+	echo >&2
+	echo >&2 "atl_pg_usage_conf_userlogins \"(successdate < now() - '6 months'::interval OR successdate is null)  ORDER BY successdate desc \"   | atl_psql -e"
+	exit 1
+fi
+
+echo "SELECT DISTINCT 
+	user_name
+	, cwd_user.email_address
+	,logininfo.successdate
+        FROM cwd_user
+		JOIN (select * from cwd_directory WHERE active='T') AS cwd_directory ON cwd_user.directory_id = cwd_directory.id
+                JOIN cwd_membership ON cwd_membership.child_user_id = cwd_user.id 
+                JOIN cwd_group ON cwd_membership.parent_id = cwd_group.id
+		JOIN (select distinct permgroupname, permusername from spacepermissions where spaceid is null and permtype IN ('USECONFLUENCE', 'ADMINISTRATECONFLUENCE', 'SYSTEMADMINISTRATOR')) AS spacepermissions ON (lower(spacepermissions.permgroupname) = cwd_group.lower_group_name OR lower(spacepermissions.permusername) = cwd_user.lower_user_name)   -- Note: it's possible only USECONFLUENCE is needed 
+		JOIN user_mapping ON user_mapping.lower_username = cwd_user.lower_user_name
+		LEFT JOIN logininfo ON user_mapping.user_key = logininfo.username
+        WHERE cwd_user.active='T'
+"
+if [[ $# != 0 ]]; then
+	echo " AND $*;"
+else
+	echo ";"
+fi

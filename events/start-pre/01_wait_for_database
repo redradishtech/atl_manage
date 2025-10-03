@@ -1,0 +1,27 @@
+#!/bin/bash
+## Wait up to 20s for Postgres to come online
+## Systemd starts apps in parallel, immediately after Postgres, and at this point Postgres might not yet be online.
+# Our other start-pre scripts require Postgres to be up.
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+case "$ATL_DATABASE_TYPE" in
+postgres*)
+	((maxcount = 50))
+	((sleepsecs = 2))
+	((counter = maxcount))
+	while ((--counter)); do
+		if atl_pg_isready --timeout="$sleepsecs"; then
+			#if atl_psql -tAXqc 'select 1' >/dev/null; then
+			exit
+		fi
+	done
+
+	warn "Postgres is not online after $((maxcount * sleepsecs))s"
+	exit 1
+	;;
+*)
+	lsof -i "@$ATL_DATABASE_HOST:$ATL_DATABASE_PORT" >/dev/null || fail "$ATL_DATABASE_TYPE is not listening on $ATL_DATABASE_HOST:$ATL_DATABASE_PORT"
+	;;
+esac

@@ -1,0 +1,16 @@
+[Unit]
+Description=%{ATL_LONGNAME} %{ATL_VER} lsyncd replication 
+After=network.target
+
+[Service]
+Restart=always
+Type=simple
+Nice=19
+#EnvironmentFile=-/etc/default/lsyncd
+#ExecStart=/usr/bin/sh -c 'eval `/usr/bin/lsyncd -nodaemon $LSYNCD_OPTIONS /etc/lsyncd/lsyncd.conf.lua`'
+ExecStart=lsyncd -nodaemon %{ATL_APPDIR_BASE}/%{ATL_VER}/replication/lsyncd.conf -pidfile %{ATL_APPDIR_BASE}/%{ATL_VER}/work/lsyncd.pid
+ExecReload=/bin/kill -HUP $MAINPID
+PIDFile=%{ATL_APPDIR_BASE}/%{ATL_VER}/work/lsyncd.pid
+
+[Install]
+WantedBy=multi-user.target

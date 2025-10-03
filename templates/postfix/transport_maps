@@ -1,0 +1,7 @@
+# Send monitoring emails straight to the monitoring host, bypassing the usual mail relay.
+# Nagios potentially generates a lot of mail, and we don't want that potentially tripping send quotas.
+# Also, monitoring.redradishtech.com is whitelisted on sandboxes that other SMTP destinations are blacklisted.
+# jeff@redradishtech.com
+# https://superuser.com/questions/749759/postfix-relay-based-on-recepient
+transport_maps = hash:/etc/postfix/relay_per_recipient
+

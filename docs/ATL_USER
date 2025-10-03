@@ -1,0 +1,11 @@
+The app runs as the ATL_USER user. This means ATL_USER needs:
+- full rw access to the database
+- full rw access to the app home directory ($ATL_DATADIR)
+- read-only access to the application ($ATL_APPDIR), but permission to write to runtime directories within (logs/, temp/, work/ in Tomcat-based apps)
+- no access to data backups. If the app is hacked, ATL_USER is hostile
+- as little access as possible to the rest of the system
+
+The app's services (backups, monitoring, etc) run as ATL_SERVICES_USER, which is typically 'root' but may be any user account in the $ATL_GROUP group.
+ATL_SERVICES_USER must not be the same user as $ATL_USER, as if the app is hacked we don't want app service config files (e.g. rsnapshot.conf) readable by ATL_USER.
+
+Files that ATL_USER must have read-only access to should be owned by root:$ATL_GROUP

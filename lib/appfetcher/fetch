@@ -1,0 +1,444 @@
+#!/bin/bash
+
+## shellcheck source=/opt/atl_manage/lib/appfetcher/common.sh
+#. /opt/atl_manage/lib/common.sh --no_profile_needed --nolog
+# TODO: add locking so if two apps try to fetch the same app, they don't conflict
+
+base="$(dirname "${BASH_SOURCE[0]}")"
+
+shopt -s lastpipe
+# Don't set pipefail. We don't need it. https://mywiki.wooledge.org/BashPitfalls#pipefail
+
+# We define a reasonable default for fetcher_cachedir() here unless the caller has already defined one
+[[ $(type -t fetcher_cachedir) = function ]] || \
+	fetcher_cachedir() { 
+		if [[ $EUID = 0 ]]; then
+			echo "/var/cache/appfetcher"
+		else
+			echo "${XDG_CACHE_HOME:-$HOME/.cache}/appfetcher"
+		fi
+	}
+
+[[ $(type -t errmsg) = function ]]			|| errmsg() { echo >&2 "$*"; }
+[[ $(type -t log) = function ]]			|| log() { echo >&2 "$*"; }
+[[ $(type -t validate) = function ]]		|| validate() { :; }
+
+fetchapp() (
+	shopt -s lastpipe
+	set -o pipefail
+
+	export app="$1"; shift
+	export ver="$1"; shift
+	log "Fetching app '$app' version '$ver'"
+
+	[[ $(type -t url) = function ]] || url() { echo "$app"; }
+	[[ $(type -t ver) = function ]] || ver() { echo "$ver"; }
+
+
+	if [[ $app =~ \.git$ || $* =~ --git ]]; then
+		validate() { [[ -d "$1" && -d "$1"/.git ]]; }
+	elif [[ $app =~ ^http ]]; then
+		validate() { [[ -f "$1" ]]; }
+	elif [[ $app =~ ^file: ]]; then
+		validate() { [[ -e "$1" ]]; }
+	fi
+
+	fetch "$(url "$ver")" "$ver" | read -r archive || return $?
+	unarchive "$archive" | read -r appdir || return $?
+	echo "$appdir"
+)
+
+fetch() {
+	local url
+	url="$(url)"
+	if [[ $url =~ ^git\+ || $url =~ \.git$ || $* =~ --git ]]; then
+		if [[ $url =~ ^git\+ ]]; then url="${url#git\+}"; fi
+		fetch_git "$@"
+	elif [[ $url =~ ^http ]]; then
+		fetch_http
+	elif [[ $url =~ ^file: ]]; then
+		fetch_file 
+	else
+		errmsg "don't know how to fetch url '$url'"
+        return 1
+	fi
+}
+
+
+fetch_usage() {
+	echo >&2 "$*"
+	echo >&2 "App Fetcher - download and cache apps from HTTP or Git sources"
+	echo >&2
+	echo >&2 "Usage: fetch APP VERSION_OR_REVISION"
+	echo >&2
+	echo >&2 "APP may be one of:"
+	shopt -s nullglob
+	for d in "$base"/definitions/*; do
+		echo >&2 "	$(basename "$d")"
+	done
+	echo >&2
+	echo >&2 "VERSION_OR_REVISION is a version (e.g. '8.20.10') or '<hash_or_tag>'"
+	exit 2
+}
+
+# fetcherhash() returns a string (hash) that will change whenever the fetcher code (here, appfetcher/fetch) changes. This means that changes in the fetching algorithm (e.g. different chmod rules) invalidate previous cache entries
+fetcherhash() {
+	echo "20250413"
+	#basefile="$ATL_MANAGE/${BASH_SOURCE[0]}"; sha1sum "${basefile}" | awk '{print $1}'
+	log "WARNING: the lib/appfetcher/fetch version of 'fetcherhash' has been called. It is normally overridden. basefile=$basefile"
+}
+
+cacheslot() {
+	local key cachedir hash
+	key="$1"
+	if [[ $key =~ ^/tmp ]]; then 
+        errmsg "Upstream error detected: key to cacheslot begins with an ephemeral directory ($key). We should only ever be generating caches of named, stable non-tmp directories"
+        return 1
+    fi
+
+	hash="$(echo "$(fetcherhash) $key" | sha1sum -)"
+	hash="${hash:0:5}"
+
+	cachedir="$(fetcher_cachedir)"
+	[[ -n "$cachedir" ]] || { errmsg "Function fetcher_cachedir returned nothing"; return 1; }
+	# Per-product so if we need to nuke the cache, we can limit the damage
+	cachedir+="/$ATL_PRODUCT"
+	[[ -d "$cachedir" ]] || mkdir -p "$cachedir"
+	[[ -w "$cachedir" ]] || { errmsg "Cannot write to cache dir '$cachedir'"; return 1; }
+	if [[ ! $* =~ --noindex ]]; then
+		if [[ ! -f "$cachedir/index" ]] || grep -qvF "$hash" "$cachedir/index"; then
+			printf "%s\t%s\n" "$key" "$hash" >> "$cachedir/index"
+		fi
+	fi
+	[[ -f "$cachedir/$hash.id" ]] || echo "$key" > "$cachedir/$hash.id"
+	echo "$cachedir/$hash"
+}
+
+cacheslot_tmp() { 
+	local tmpdir
+	tmpdir=$(cacheslot "$RANDOM" --noindex)
+	trap "rm -rf ${tmpdir@Q}" EXIT TERM
+	echo "$tmpdir"
+}
+
+# Each transform has:
+fetch_http() {
+	local url cache hash inputhash tmp httpstatus
+	# We pass in a .sha1 variant of the URL, so allow $1 to override $(url)
+	url="${1:-$(url)}"
+	#if [[ $url =~ github\.com ]]; then
+	#	warn "Useless github's ETag keeps changing - don't rely on it for caching"
+	#fi
+	cache="$(cacheslot "$url")"
+	_log() { log "fetch_http:$cache: $*"; }
+
+	# https://daniel.haxx.se/blog/2022/03/24/easier-header-picking-with-curl/
+	etag="$(curl -s -L -I "$url" | grep -i ^ETag: | cut -d: -f2- | dos2unix | xargs)"
+	_log "Upstream $url ETag: $etag"
+
+	if [[ -f $cache ]]; then
+		read -r inputhash < "$cache.inputhash"
+		if [[ $inputhash != "$etag" ]]; then
+			_log "Stale (upstream etag '$etag' is not '$inputhash'); recreating"
+			rm "${cache?}" "$cache".*
+		else
+			_log "$url hasn't changed; reusing cache"
+		fi
+	fi
+
+	if [[ ! -f $cache ]]; then
+		_log "Fetching HTTP URL: $url"
+
+		tmp="$(cacheslot_tmp)"
+		# https://stackoverflow.com/questions/687014/removing-created-temp-files-in-unexpected-bash-exit
+		#shellcheck disable=SC2064
+		httpstatus=$(curl -s -L -C- -o "$tmp" -w "%{http_code}" "$url")
+		_log "Downloaded $url to temporary file $tmp, HTTP status $httpstatus"
+		[[ $httpstatus =~ 20? ]] || { errmsg "Download failed: HTTP $httpstatus from $url"; return 1; }
+		validate "$tmp" || return $?
+		mv "$tmp" "$cache"
+		echo "$url" > "$cache".url
+		date +%s > "$cache".tstamp
+		echo "$etag" > "$cache".inputhash
+		_log "HTTP download complete."
+	fi
+	echo "$cache"
+}
+
+hashpath() {
+	(( $# )) || { errmsg "Usage: hashpath <path>"; return 1; }
+	# https://stackoverflow.com/questions/545387/linux-compute-a-single-hash-for-a-given-folder-contents
+	if [[ -f "$1" ]]; then
+		sha1sum "$1"
+	else tar -C "$1" -cf - --sort=name . | sha1sum
+	fi
+}
+
+# Import a file or directory into our cache, storing a hash of contents
+fetch_file() {
+	local url path cache filehash inputhash tmp
+	url="${1:-$(url)}"
+	[[ $url =~ ^file: ]] || { errmsg "Unexpected URL format (expected file:...): '$url'"; return 1; }
+	path="${url#file://}"
+	path="${path#file:}"
+	path="$(readlink -f "$path")" # normalize relative paths, excess slashes etc.
+	[[ -e "$path" ]] || { errmsg "Nonexistent or inaccessible path: '$path' (from URL '$url')"; return 1; }
+
+	cache="$(cacheslot "$path")"
+	_log() { log "fetch_file:$cache: $*"; }
+
+	# Unlike git and http, we can get our hands on $url's contents to infer its .inputhash
+	read -r filehash < <(hashpath "$path")
+
+	# Nuke $cache if stale
+	if [[ -e $cache ]]; then
+		read -r oldhash < "$cache.inputhash"
+		if [[ $oldhash != $filehash ]]; then
+			_log "Updating, since file hash changed"
+			rm -rf "${cache?}" "$cache".*
+		else
+			_log "$path hasn't changed; reusing cache"
+		fi
+	else
+		_log "No existing cache of $url"
+	fi
+
+	if [[ ! -e $cache ]]; then
+		_log "Fetching $url"
+		tmp="$(cacheslot_tmp)"
+		# https://stackoverflow.com/questions/687014/removing-created-temp-files-in-unexpected-bash-exit
+		if [[ -f $path ]]; then
+			# -A for ACLs
+			rsync -raA --delete "${path?}" "$tmp"
+		else
+			rsync -raA --delete "${path?}/" "$tmp"
+		fi
+
+		_log "Imported $tmp here"
+		mv "$tmp" "$cache"
+		echo "$url" > "$cache".url
+		echo "$filehash" > "$cache".inputhash
+		date +%s > "$cache".tstamp
+		_log "Import complete"
+	fi
+	echo "$cache"
+}
+
+fetch_git() {
+	local url rev cache
+	url="${1:-$(url)}"
+	rev="${2:-$(ver)}"    # e.g. for Jethro, this returns 'vx.y.z'
+	# FIXME: why did we preference the function?
+	#url=$(url); url=${1:-$url}
+	#rev=$(ver); rev=${2:-$rev}
+	if [[ $rev =~ ^git: ]]; then
+		errmsg "Obsolete git rev format '$rev'. Please use SemVer with git hash after the '+'"
+        return 1
+	fi
+
+	git_id() { set +o pipefail; git -C "$1" rev-list --reverse --topo-order --first-parent HEAD | sed 1q;  }   # https://stackoverflow.com/questions/1006775/how-to-reference-the-initial-commit
+
+	validate() {
+		[[ -d "$1"/.git ]] || { errmsg "$1 is not a valid git directory"; return 1; }
+		log "$1 looks like a valid git repo"
+	}
+
+	cache="$(cacheslot "${url}-${rev}")"
+
+	cachedrev_head_revision() (cd "$cache" && git rev-parse --short HEAD)
+
+
+	_log() { log "fetch_git:$cache: $*"; }
+
+	_log "Fetching from git '$url' at revision '$rev'"
+
+	case "$rev" in
+		*-DEV|tip)
+			if [[ -d "$cache" ]]; then
+				_log "Git tip checkout exists. Updating"
+				[[ $(git_id "$cache") == $(cat "$cache".id) ]] || { errmsg "$cache: the identity of the git repo at $url has changed from $(cat "$cache".id) to $(git_id "$cache")."; return 1; }
+				cd "$cache"
+				git fetch >&2
+				git reset --hard @{u} >&2   # @{u} is shorthand for the branch's upstream (tracking) branch
+				# -c core.fileMode=false
+				# We already have a checkout, with branches - only ever fast-forward our local branch to track the
+				# remote branch
+			else
+				tmp="$(cacheslot_tmp)"
+				#shellcheck disable=SC2064
+				_log "Cloning $url to temporary directory $tmp"
+				git config pull.ff only
+				git clone "$url" "$tmp" >&2
+				git -C "$tmp" config core.fileMode false    # So 'git diff' ignore permission changes, which we are almost certainly going to do
+
+				validate "$tmp"
+				mv "$tmp" "$cache"
+				_log "fresh clone of $url"
+			fi
+			cachedrev_head_revision > "$cache.inputhash"
+			;;
+		*)
+			if [[ -d "$cache" ]]; then
+				validate "$cache"
+				_log "$url $rev is cached"
+				headrev=$(cachedrev_head_revision)
+				read -r oldheadrev < "$cache.inputhash"
+				[[ $oldheadrev == "$headrev" ]] || { errmsg "We have a cached copy of $url supposedly at $rev, but the hash (git rev-parse --short HEAD) is different ($oldheadrev vs $headrev)"; return 1; }
+			else
+				tmp="$(cacheslot_tmp)"
+				repo_at_tip=$(fetch_git "$url" tip)
+				_log "copying from cache of tip '$repo_at_tip'"
+				cp -al "$repo_at_tip" "$tmp"
+				cd "$tmp"
+				# https://stackoverflow.com/questions/36794501/disable-warning-about-detached-head
+				git -c advice.detachedHead=false checkout "$rev" >&2
+				validate "$tmp"
+				_log "$tmp: updated to rev $rev"
+				mv "$tmp" "$cache"
+				cachedrev_head_revision > "$cache.inputhash"
+
+			fi
+			;;
+	esac
+	echo "$url" > "$cache".url
+	git_id "$cache" > "$cache".id
+	date +%s > "$cache".tstamp
+	echo "$cache"
+}
+
+#cacheslot $key --depends $a $b  # $cache.deps contains the .hash of $a and $b at time of $cache creation
+#if cacheslot_stale $id; then
+#	cacheslot_begin_update "$id"   # cd's to tmpdir
+#	# change
+#	cacheslot_commit_update "$id"  # Overwrites $cache with $tmpdir. Rewrites $cache.deps with the current state of $a.hash and $b.hash
+#else
+#	echo $cache
+#fi
+
+unarchive() {
+
+	local archive url cache hash inputhash
+	archive="$(readlink -f "$1")"		# normalize path
+	[[ -e "$archive" ]] || { errmsg "Asked to unarchive '$archive', which does not exist or is not accessible"; return 1; }
+
+	if [[ -f $archive.url ]]; then
+		# Normally $archive will be a directory in the cache created by fetch_*(), and thus will have a .url metadata file.
+		url="$(cat "$archive.url")"
+		read -r inputhash < "$archive.inputhash"
+	else 
+		# ..but it's equally possible the caller gives us a file path outside the cache, with no .url metadata, in which case the 'url' is the path
+		url="$archive"
+		inputhash="$(sha1sum "$archive" | awk '{print $1}')"
+	fi
+
+	cache="$(cacheslot "$archive-unpacked")"
+	_log() { log "unarchive:$cache: $*"; }
+
+	if [[ -d $cache ]]; then
+		read -r oldhash < "$cache.inputhash"
+		[[ -n $oldhash ]] || fail "Error: we have a unarchive dir $cache, but not a hash for it in $cache.inputhash"
+		if [[ $inputhash == "$oldhash" ]]; then
+			_log "Patchqueue hasn't changed; reusing"
+		else
+			_log "Stale (upstream hash '$inputhash' is not '$oldhash'); recreating"
+			rm -rf "${cache?}" "$cache".*
+		fi
+	fi
+
+	if [[ ! -d $cache ]]; then
+		_log "Unpacking $archive (from $url)"
+		shopt -s dotglob      # We'll be relying on * to match dotfiles
+		set -o pipefail		# If e.g. zip fails, don't let the pipe mask it
+		tmp=$(cacheslot_tmp)
+		mkdir "$tmp"
+		cd "$tmp" || fail
+		unpack() {
+			case "$url" in
+				*.tar.gz|*.tgz)
+					_log "$tmp: $url is a tar.gz file"
+					tar -zxv  --no-same-owner --no-same-permissions -f "$archive"
+					;;
+				*.zip)
+					# When unzipping, only lines beginning with 4 spaces are file entries
+					_log "$tmp: $url is a zip file"
+					unzip "$archive" | grep '^ ' | perl -pe 's/ +(creating|inflating|extracting|testing): //g'
+					;;
+				*)
+					[[ -d "$archive" ]] || { errmsg "We don't know how to unarchive file $archive (source $url)"; return 1; }
+					_log "$tmp: No 'unarchiving' needed for $url."
+					cp -al "$archive/"* . >&2
+
+					;;
+			esac || return $?
+		}
+		local firstdir
+		firstdir="$(unpack | cut -f1 -d/ | uniq)" || { errmsg "Error unpacking $archive ($url)"; return 1; }
+		if (( $(echo "$firstdir" | wc -w) == 1 )) && [[ -d "$firstdir" ]]; then
+			_log "$tmp: Removing top-level directory '$firstdir'"
+			mv "$firstdir"/* .
+			rm -rf "$firstdir"
+		else
+			_log "$tmp: There is no top-level directory in the archive $archive ($url). First-level dirs: «$firstdir»"
+		fi
+		mv "$tmp" "$cache"
+		ln -sf "$archive" "$cache.source"
+		cp "$archive.inputhash" "$cache.inputhash"   # Unpacked contents is a 1-1 transformation of $archive, so reuse its hash
+	else
+		[[ $(cat "$archive.inputhash") == $(cat "$cache.inputhash") ]] || { errmsg "Inconsistent state: Hash does not match upstream $cache.inputhash"; return 1; }
+		_log "Already contains unpacked archive $archive"
+	fi
+	echo "$cache"
+}
+
+tar_validator() {
+	[[ -e "$1" ]] || { errmsg "Download failed"; return 1; }
+	tar tf "$1" >/dev/null || { errmsg  "$1 is not a valid tar.gz file"; return 1; }
+}
+
+sha1_validator() (
+	shopt -s lastpipe
+
+	validate() {
+		sha="$(cat "$1")"
+		(( ${#sha} == 40 ))
+	}
+	log "sha1 validating $url"
+	log "Fetching $url.sha1"
+	fetch_http "$url.sha1" | read -r correctshafile
+	[[ -n $correctshafile ]] || { errmsg "fetch_http $url.sha1 returned nothing"; return 1; }
+	[[ -s $correctshafile ]] || { errmsg "fetch_http $url.sha1 returned empty file $correctshafile"; return 1; }
+	log "$url.sha1 output is in $correctshafile"
+
+	[[ -e "$1" ]] || { errmsg "Download failed"; return 1; }
+	correctsha="$(cat "$correctshafile")"
+	sha1sum "$1" | read -r actualsha _
+	log "Actual sha: $actualsha"
+	log "Desired sha: $correctsha"
+	if [[ $actualsha = "$correctsha" ]]; then
+		log "$1 sha checksum correct"
+	else
+		warn "$url download at $1 is invalid. sha1 expected to be $correctsha, not $actualsha"
+		bash
+	fi
+)
+
+zip_validator() {
+	[[ -e "$1" ]] || { errmsg  "Download failed"; return 1; }
+	unzip -t "$1" >/dev/null || { errmsg "$1 is corrupt"; return 1; }
+	log "$1 validated"
+}
+
+
+if [[ $(basename "${BASH_SOURCE[0]}") = "$(basename "$0")" ]]; then
+	(( $# >= 2 )) || fetch_usage "$@"
+	fetchapp "$@"
+fi
+
+fetch_check_app_functions_defined() {
+	# These functions must be defined by the caller, unless a straightforward http or git URL is fetched. Not all functions are needed, which is why we throw the error when the function is called rather than right now
+	for f in url ver fetch validate; do
+		[[ $(type -t "$f") = function ]] || eval "$f() { fail \"\${FUNCNAME[1]}:\${BASH_LINENO[0]}	The '$f' function needs to be defined)\"; }"
+	done
+}
+
+fetch_check_app_functions_defined

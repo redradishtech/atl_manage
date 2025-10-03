@@ -1,0 +1,60 @@
+#!/bin/bash -eu
+# Checks that there is at least 1 file below BASEDIR within WARNINGAGE or CRITICALAGE of the latest file in SOURCEDIR
+# This is useful for backups where we have access to the source files. We can check the newest file in the backup source, and specify that the backup file must be no staler than X days
+# FIXME: rewrite this in a sane language so we can take args that are fractions of a day, and can parse --no-younger-than in any position
+# FIXME: rather than finding newest files in the source, then invoking `check_file_freshness`, perhaps we should rsync -r --dry-run between src and dest to find files that are out of date. This might be faster.
+
+#shellcheck source=common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh
+
+main()
+{
+	if [[ "$#" -lt 4 || "$*" =~ -h ]]; then
+		usage "$@"
+	fi
+
+	basedir="$1"; shift
+	warndelay="${1:-2}"; shift
+	[[ $warndelay =~ ^[0-9]+$ ]] || error "<warndelay> value $warndelay is not a number"
+	criticaldelay="${1:-5}"; shift
+	[[ $criticaldelay =~ ^[0-9]+$ ]] || error "<criticaldelay> value $criticaldelay is not a number"
+	# Note that we don't bother parsing out --no-younger-than: it will be passed along with remaining args to find_youngest_file
+
+	log "Now checking that files below $basedir are not $warndelay days older than the youngest file in $*"
+
+	# Note that if we actually found the *youngest* file, this check would fail if:
+	# - There are no new files for 6 days
+	# - 6am backup is made
+	# - at 7am a new file is created
+	# - we do this check, wanting the backup to contain files younger than 1 day, which it doesn't have
+	#
+	# It's not fair to expect the backup to have files created since the last backup. So find_youngest_file really needs a --no-younger-than=$ATL_BACKUP_ROOT/hourly.0/database/tstamp arg
+	# Since we, the caller, are just given an rsync $basedir, we'd have to implement --no-younger-than for this script too.
+
+	find_youngest_file "$@"
+	[[ -v newest_file_age_days ]] || failwarn "OK; No files found (after applying filter) in $*"
+
+	
+	check_file_freshness "$basedir" $(( newest_file_age_days + warndelay))  $((newest_file_age_days + criticaldelay)) || {
+		log "Freshness check FAILED."
+		log "We searching for files $newest_file_age_days + $warndelay days and older in $basedir"
+		log "Time now      : $now_secs"
+		log "Newest file (that should have been backed up, per filters -- $*) is: $newest_file_secs	($(stat --format=%y "$(dirname "$1")/$newest_filename"))   $newest_filename"
+		log "Diff          : $newest_file_age_days"
+		log "Newest source file is ${newest_file_age_secs}s old ($newest_filename)"
+	}
+}
+
+usage() {
+	cat <<EOF
+$*
+Purpose: Checks that there is at least 1 file below BASEDIR within WARNINGAGE or CRITICALAGE of the latest file in SOURCEDIR
+Usage:
+check_file_freshness_relativeto BASEDIR WARNINGAGE CRITICALAGE [--no-younger-than=FILEPATH] SOURCEDIR [rsync opts]
+
+e.g.:
+check_file_freshness_relativeto "\$ATL_BACKUP_ROOT/hourly.0/home" 1 5 --no-younger-than="\$ATL_BACKUP_ROOT/hourly.0/database/tstamp" "$ATL_DATADIR" --filter="merge $ATL_APPDIR/backups/rsync-excludes-local" --filter="merge $ATL_APPDIR/backups/rsync-excludes-generic"
+EOF
+	exit
+}
+main "$@"

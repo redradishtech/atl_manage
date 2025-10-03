@@ -1,0 +1,32 @@
+#!/bin/bash -eu
+#shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --
+
+fail "OBSOLETE SCRIPT - DO NOT USE"
+fail "OBSOLETE SCRIPT - DO NOT USE"
+fail "OBSOLETE SCRIPT - DO NOT USE"
+fail "OBSOLETE SCRIPT - DO NOT USE"
+# https://people.freebsd.org/~seanc/postgresql/scale15x-2017-postgresql_zfs_best_practices.pdf
+
+# psql -c 'ALTER SYSTEM SET synchronous_commit = off'
+# echo 1 > /sys/module/zfs/parameters/zfs_txg_timeout
+# echo 'options zfs zfs_txg_timeout=1' > /etc/modprobe.d/zfs.conf
+# zfs set logbias=throughput tank/...
+
+main() {
+	set -vx
+	zfs create -o canmount=off -o compression=lz4 tank/$ATL_SHORTNAME
+	zfs create tank/$ATL_SHORTNAME/app
+	zfs create tank/$ATL_SHORTNAME/database
+	zfs create tank/$ATL_SHORTNAME/home
+	zfs set mountpoint=/opt/atlassian/$ATL_SHORTNAME tank/$ATL_SHORTNAME/app
+	zfs set mountpoint=/var/atlassian/application-data/$ATL_SHORTNAME tank/$ATL_SHORTNAME/home
+	zfs set mountpoint=/var/lib/postgresql/tablespace/$ATL_SHORTNAME tank/$ATL_SHORTNAME/database
+	zfs set atime=off tank/$ATL_SHORTNAME/database
+	zfs set recordsize=16k tank/$ATL_SHORTNAME/database
+	zfs set primarycache=metadata tank/$ATL_SHORTNAME/database
+	chown -R postgres. /var/lib/postgresql/tablespace/$ATL_SHORTNAME
+	log "Now create database with 'createdb ... --tablespace=/var/lib/postgresql/tablespace/$ATL_SHORTNAME"
+}
+
+main "$@"

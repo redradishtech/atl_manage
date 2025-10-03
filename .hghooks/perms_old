@@ -1,0 +1,210 @@
+#!/usr/bin/env ruby
+
+require 'pp'
+require 'set'
+require 'pathname'
+require 'pry'
+require 'pry-byebug'
+
+def log(msg)
+	$stderr.puts msg
+end
+
+def printenv()
+        puts ENV.each.select { |k,v| k=~/HG_/ }.map { |k,v| "#{k} → #{v}" }.join("\n")
+end
+
+class ACLSet
+	def str2hash(str)
+		str.split("\n\n").inject({}) do |all,rec|
+			return all if rec.empty?
+			matches = rec.match(/file: (.*)/)
+			if !matches then
+				binding.pry
+			end
+			fname = matches[1]
+			all[fname] ||= Set.new
+			all[fname] << rec
+			all
+		end
+	end
+
+	def initialize(src = {})
+		if src.respond_to? :glob then
+			@file_acl_hash = str2hash (src.glob("*").collect { |aclfile| IO.read(aclfile) }.join(""))
+		elsif src.is_a? File then
+			@file_acl_hash = str2hash(IO.read(src))
+		elsif src.is_a? String then
+			@file_acl_hash = str2hash(src)
+		else
+			@file_acl_hash = src
+		end
+
+	end
+
+	# Return a new ACLSet for this repo, with extra additions/removals for the given commit
+	def hg_commit(commithash)
+		$stderr.puts "Finding added/modified fields in commit #{commithash}"
+		new_acl_hash = @file_acl_hash.clone
+		addedfiles=`hg status -amn0 --change #{commithash}`.split(/\u0000/)
+		if ! addedfiles.empty? then
+			$stderr.puts "Added/modified files #{addedfiles}"
+			addedfiles.each { |f|
+				newhash = str2hash(`getfacl -s #{f}`)
+				if !newhash.empty? then
+					$stderr.puts "`getfacl -s #{f}` returned ACL hash #{newhash}"
+				end
+				new_acl_hash.merge!(newhash) do |fname,a,b|
+					a + b
+				end
+			}
+			#$stderr.puts "After new files, ACL keys are #{new_acl_hash.keys}"
+		else
+			$stderr.puts "No added files"
+		end
+
+		removedfiles=`hg status -rn0 --change #{commithash}`.split(/\u0000/)
+		if ! removedfiles.empty? then
+			$stderr.puts "Removed files #{removedfiles}"
+			removedfiles.each { |f|
+				new_acl_hash.delete(f)
+			}
+			$stderr.puts "After removed files, ACL keys are #{new_acl_hash.keys}"
+		else
+			$stderr.puts "No removed files"
+		end
+		return ACLSet.new(new_acl_hash)
+	end
+
+	def ==(other)
+		@file_acl_hash == other.file_acl_hash
+	end
+
+	def to_s
+		@file_acl_hash.values.collect { |aclset| aclset.to_a.join "\n\n" }.join("\n\n")
+#		@file_acl_hash.collect { |fname, set|
+#			"\n" + fname + "\n" +
+#				set.collect { |acl|
+#				"\t" + acl.gsub(/\n/, "\n\t")
+#			}.join("")
+#		}.join("")
+	end
+
+	def +(otheracl) 
+		newhash = @file_acl_hash.merge (otheracl.file_acl_hash) do |fname,a,b|
+			# Merge our hash of {filename →  Set(acls)} with another, appending sets where filenames match
+			a + b
+		end
+		ACLSet.new newhash
+	end
+
+	def -(otheracl) 
+		newhash = @file_acl_hash.merge (otheracl.file_acl_hash) do |fname,a,b|
+			# Merge our hash of {filename →  Set(acls)} with another, appending sets where filenames match
+			a - b
+		end
+		newhash.delete_if { |k,v| v.empty? }  # If subtracting removed our last custom permission, delete the entry
+		ACLSet.new newhash
+	end
+	protected
+
+	# A hash of filename → Set(acl) mappings.
+	attr_reader :file_acl_hash
+
+
+end
+
+a = ACLSet.new("""# file: nagios
+# owner: jturner
+# group: jturner
+user::rwx
+user:root:r-x
+user:131:r-x
+group::r-x
+mask::r-x
+other::r-x
+""")
+
+b = ACLSet.new("""# file: nagios
+# owner: binky
+# group: binky
+other::r-x
+""")
+
+#puts "-------------------"
+#pp a
+#puts "-------------------"
+#pp b
+#puts "-------------------"
+#a += b
+#pp (a + b)
+#puts "#{a + b}"
+#puts "-------------------"
+#
+#puts "#{a + b - b}"
+#exit
+
+def getpatch(commitid)
+	hash_to_patch = Hash[*IO.read('.hg/patches/status').split(/[:\n]/)]
+	hash_to_patch[commitid] || "default"
+        #        awk -F: "/${HG_NODE}/ {print \$2}" < .hg/patches/status 
+end
+
+acldir = Pathname('.acl')
+acldir.mkpath
+patchname = getpatch(ENV['HG_NODE'])
+aclfile = acldir + patchname
+
+case ENV['HG_HOOKTYPE']
+when "commit" then
+	if patchname == "default" then
+		old_acls = ACLSet.new(Pathname.new(".acl")) # This means .acl/default in practice.
+		newacl = old_acls.hg_commit(ENV['HG_NODE'])
+		new_acls = 
+		if allacls != newacl then
+			log "Updating #{aclfile}"
+			aclfile.write(newacl)
+			`hg add #{aclfile}`
+			log "Now commit #{aclfile}"
+			`hg commit -m "Updating perms" #{aclfile}`
+		else
+			log "No change to #{aclfile}"
+		end
+	else
+		# A patchqueue patch
+		log "A patchqueue commit"
+		old_acls = ACLSet.new(Pathname.new(".acl"))
+		old_relevant_acls = old_acls.subset_for_commit(ENV['HG_NODE'])
+
+		newacl = allacls.hg_commit(ENV['HG_NODE'])
+		if allacls != newacl then
+			log "ACL changed from «#{allacls}» to «#{newacl}»"
+			log "Updating #{aclfile} with changes relevant to the patch: #{newacl - allacls}"
+			aclfile.write(newacl - allacls)
+			`hg add #{aclfile}`
+			log "Now qrefresh"
+			`hg qrefresh`
+		else
+			log "No change to #{aclfile}"
+		end
+		if aclfile.exist? && ! aclfile.empty? then
+			$stderr.puts "Restoring ACL"
+			`setfacl --restore=#{aclfile}`
+		end
+	end
+	#printenv
+#        puts "Non-mq: getfacl -> .acls/$patch, then .acls/* -> setfacl"
+#        puts "mq: .acls/$patch was updated by the patch, so just .acls/* -> setfacl"
+when "update" then
+	if aclfile.exist? && ! aclfile.empty? then
+		$stderr.puts "Restoring ACL"
+		`setfacl --restore=#{aclfile}`
+	end
+#        puts "Non-mq: .acls/* -> setfacl"
+#        puts "mq: never happens?"
+else
+	$stderr.puts "ERROR: unhandled HG_HOOKTYPE #{ENV['HG_HOOKTYPE']}"
+end
+
+
+#printenv

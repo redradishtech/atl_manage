@@ -1,0 +1,52 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+
+main() {
+	local urlprefixes=$(atl_plugin_descriptor_urlprefixes "$@")
+	echo "{ cat /var/log/$ATL_WEBSERVER/$ATL_LONGNAME/access.log{,.1}; zcat /var/log/$ATL_WEBSERVER/$ATL_LONGNAME/access.log.*.gz; } | egrep \"(GET|POST|PUT|DELETE) $urlprefixes\" | lnav <(cat -) "
+	tmppipe=$(mktemp -u)
+	mkfifo -m 600 "$tmppipe"
+	{
+		cat "/var/log/$ATL_WEBSERVER/$ATL_LONGNAME/"access.log{,.1}
+		zcat "/var/log/$ATL_WEBSERVER/$ATL_LONGNAME"/access.log.*.gz
+	} | grep -E "(GET|POST|PUT|DELETE) $urlprefixes" >"$tmppipe" &
+	lnav "$tmppipe" || true
+	echo "$tmppipe"
+	rm "$tmppipe"
+	log "FIXME: clean up fifo code"
+
+}
+oldmain() {
+	if [[ $# = 0 || $* =~ --help ]]; then usage; fi
+	#select strftime('%Y-%m-%d %H', log_time) AS log_time
+	cat - <<EOF
+;create view z_access_log AS 
+		select strftime('%Y-%m', log_time) AS log_time
+			, cs_uri_stem  || '?' || coalesce(cs_uri_query, '') AS url
+		, sc_bytes
+		, c_requesttime
+		, cs_username
+		from logline
+		WHERE cs_uri_stem REGEXP '$(atl_plugin_descriptor_urlprefixes "$@")'
+;
+select '|' || cs_username || ' | ' || log_time || ' | ' || url || ' | ' ||  count(*) || ' |' from z_access_log group by cs_username, log_time, url order by log_time asc, count(*)  desc
+EOF
+	#;
+	#:echo $pluginkey requests
+}
+
+usage() {
+	echo >&2 "Purpose: Invokes lnav displaying access logs for URLs related to the given plugin"
+	echo >&2 "E.g.: "
+	echo >&2 "	$(basename "$0") com.tempoplugin.tempo-planner"
+	echo >&2 "	$(basename "$0") com.radiantminds.roadmaps-jira com.atlassian.teams com.atlassian.jpo"
+	exit 2
+}
+
+if [[ $# = 0 || $1 =~ -h ]]; then
+	usage
+else
+	main "$@"
+fi

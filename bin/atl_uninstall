@@ -1,0 +1,11 @@
+#!/bin/bash -eu
+
+export PATH="$ATL_MANAGE/bin:$PATH" # $ATL_APPDIR/bin/atl_event will be first in our path, and is going to disappear halfway through this command.
+cd                                  # $PWD might disappear from under us
+
+. "$ATL_MANAGE/lib/profile.sh"
+if [[ -v ATL_NEWVER ]]; then _atl_setversion "$ATL_NEWVER"; fi   # Set ATL_VER=$ATL_NEWVER so the new version is uninstalled
+atl_stop
+atl_event uninstall-pre
+atl_undeploy "$@"
+atl_event uninstall-post

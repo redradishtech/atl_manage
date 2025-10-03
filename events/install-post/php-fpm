@@ -1,0 +1,32 @@
+#!/bin/bash
+
+set -euo pipefail
+
+install-post() {
+	# The actual php package install is done in atl_deploy. This postinst script configured php-fpm pools
+	if [[ ${ATL_PRODUCT_RUNTIME_TECHNOLOGY:-} =~ php([0-9\.]+)-fpm ]]; then
+		local phpver destdir
+		phpver="${BASH_REMATCH[1]}"
+
+		srcfile="$ATL_APPDIR/php/php-fpm-pool.conf"
+		destdir="/etc/php/$phpver/fpm/pool.d"
+		destfile="$destdir/$ATL_SHORTNAME.conf"
+
+		[[ -f "$srcfile" ]] || fail "Missing '$srcfile'"
+		[[ -d $destdir ]] || fail "Missing '$destdir'. This is expected to have been provided by the ${ATL_PRODUCT_RUNTIME_TECHNOLOGY} Debian package"
+		log "Symlinking $ATL_PRODUCT_RUNTIME_TECHNOLOGY pool config file $destfile"
+		ln -sf "$srcfile" "$destfile"
+	else
+		fail "Invaid ATL_PRODUCT_RUNTIME_TECHNOLOGY value '$ATL_PRODUCT_RUNTIME_TECHNOLOGY'. It must be in format 'phpX.X-fpm'"
+	fi
+}
+
+enabled() {
+	# ATL_BACKUP_TYPES=tarsnap is typically set explicitly in the app profile
+	[[ ${ATL_PRODUCT_RUNTIME_TECHNOLOGY:-} =~ php ]]
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.webserver-common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.webserver-common.sh
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh

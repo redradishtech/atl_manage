@@ -1,0 +1,50 @@
+#!/bin/bash -eu
+
+# Add a marker to easily identify reboots in log files
+# Prefixed with an appropriately formatted date so that log viewers like lnav don't get tripped up
+#
+# Log marking is slightly ugly. Possible alternatives:
+# - create an old/ directory, moving old logs there each restart (and cleaning up old ones), so atlassian-*.log starts empty
+# - emulate logfile rotation, moving atlassian-*.log to atlassian-*.log.1 and shifting the others up, so atlassian-*.log
+# The problem is that if the app is stuck in a fast restart loop, these alternatives lose the last relevant logs. 
+
+
+command -v /usr/bin/ts >/dev/null || { echo >&2 "Missing /usr/bin/ts. Not marking logs"; exit 0; }
+
+case "$ATL_PRODUCT" in
+	jira) date="$(date +'%Y-%m-%d %H:%M:%S,%3N%:z')";;  # Equivalent to %d{yyyy-MM-dd HH:mm:ss,SSSZ} in $ATL_APPDIR/atlassian-jira/WEB-INF/classes/log4j.properties
+	confluence | *) date="$(date +'%Y-%m-%d %H:%M:%S,%3N')";;  # Equivalent to %d in $ATL_APPDIR/confluence/WEB-INF/classes/log4j.xml
+esac
+
+marker="
+
+
+
+
+
+
+
+----- RESTART ----- RESTART ----- RESTART ----- RESTART ----- RESTART ----- RESTART ----- RESTART ----- RESTART -----
+
+
+
+
+
+
+
+"
+if [[ -v ATL_LOGDIR ]]; then
+	logfile="$ATL_LOGDIR/catalina.out"
+	if [[ -f $logfile ]]; then
+		# Emulate the 'ts' timestamping found in $ATL_APPDIR/systemd/$ATL_SYSTEMD_SERVICENAME.service
+		echo "$marker" | /usr/bin/ts >> "$logfile"
+	fi
+fi
+
+if [[ -v ATL_DATALOGDIR ]]; then
+	logfile="$ATL_DATALOGDIR/atlassian-$ATL_PRODUCT.log"
+	if [[ -f $logfile ]]; then
+		# ts, given a string arg, will prepend it to each line
+		echo "$marker" | /usr/bin/ts "$date" >> "$logfile"
+	fi
+fi

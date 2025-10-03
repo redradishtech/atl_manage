@@ -1,0 +1,8 @@
+## transport_maps (default: empty)
+## Optional lookup tables with mappings from recipient address to (message delivery transport, next-hop destination). See transport(5) for details.
+#
+#  Pattern matching of domain names is controlled by the presence or absence of "transport_maps" in the parent_domain_matches_subdomains parameter value.
+#
+# Send monitoring emails straight to the monitoring host, bypassing any global 'relayhost' relay.
+# Nagios potentially generates a lot of mail, and we don't want that potentially tripping GMail send quotas
+monitoring.redradishtech.com    smtp:monitoring.redradishtech.com:25

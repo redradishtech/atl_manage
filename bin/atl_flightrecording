@@ -1,0 +1,54 @@
+#!/bin/bash -eu
+set -o pipefail
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+
+usage() {
+	echo -e "\n${RED}$*${RESET}\n"
+	echo "Purpose: controls java flight recordings"
+	cat <<EOF
+
+Usage:
+$0 <[options]>
+
+Options:
+	ls|check	Check the status of all recordings running our instance. 
+	start		Start recording
+	stop <id>	Stop a recording with a specific identification number (by default, recording 1 is stopped).
+	dump <id> <title>:	Dump the data collected so far by the recording with a specific identification number (by default, data from recording 1 is dumped).
+EOF
+	exit 2
+}
+
+main() {
+	if [[ $# == 0 || $1 =~ -h ]]; then usage; fi
+	atl_running
+	case "$1" in
+	ls | check)
+		jcmd "$(atl_pid)" JFR.check
+		;;
+	start)
+		install -d -o "$ATL_USER" "$ATL_APPDIR/flightrecordings"
+		# maxsize=1028m prevents /tmp filling up with more than 1Gb of jfr stuff. https://bugs.openjdk.java.net/browse/JDK-8198239
+		# maxage limits the amount of data dumped. https://bugs.openjdk.java.net/browse/JDK-8203930
+		jcmd "$(atl_pid)" JFR.start dumponexit=true disk=true filename="$ATL_APPDIR/flightrecordings/$(date +%Y%m%d-%H%M%S)-start-recording.jfr" maxsize=1024m maxage=1d settings=profile path-to-gc-roots=true
+		;;
+	stop)
+		shift
+		[[ $# = 1 ]] || usage "$@"
+		jcmd "$(atl_pid)" JFR.stop name="$1"
+		;;
+	dump)
+		shift
+		[[ $# = 2 ]] || usage
+		# http://hirt.se/blog/?p=1055
+		jcmd "$(atl_pid)" JFR.dump path-to-gc-roots=true name="$1" filename="$ATL_APPDIR/flightrecordings/$(date +%Y%m%d-%H%M%S)-$2.jfr"
+		;;
+	*)
+		usage
+		;;
+	esac
+}
+
+main "$@"

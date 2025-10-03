@@ -1,0 +1,4 @@
+#!/bin/bash
+## This script is symlinked to /opt/atl_manage/events/{slowreindex,slowness,servicedown,toomanyactivethreads}/atl_diagnostic_snapshot
+## These events are triggered from Nagios ($ATL_APPDIR/monitoring/nagios.cfg) via $ATL_APPDIR/.eventhandler
+atl_diagnostic snapshot "$@"

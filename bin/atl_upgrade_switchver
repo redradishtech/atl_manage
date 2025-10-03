@@ -1,0 +1,57 @@
+#!/bin/bash -eu
+# Switches the current/ symlink to point to the new (given) version. If -r ('reverse') is given, the operation is reversed.
+# This script is primarily there to be called by atl_upgrade and atl_downgrade
+#
+# The aim is a directory structure like:
+#
+# 2.0/
+# 3.0/
+# current -> 3.0
+# previous -> 2.0
+# old/2.0 -> ../2.0
+# old/1.0
+#
+# So we've always got two versions (the current and previous) directly in the top-level directory. We don't immediately move the previous version to old/ as in replication scenarios where we upgrade the standby first, the filesystem sync script may start when standby is upgraded by the primary isn't, and will try to recreate the old version of the home directory.
+# However we still want a stable location for the backup, so we symlink the previous version's data into old/
+#
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/profile.sh"
+source "$ATL_MANAGE/lib/switchver.sh"
+# shellcheck source=/opt/atl_manage/lib/versioned_directories/switchver
+source "$ATL_MANAGE/lib/versioned_directories/switchver"
+
+usage() {
+	echo "Usage: $(basename "$0") ACTION [VER]"
+	echo "Upgrade or downgrade the app, both APPDIR and DATADIR, and edit the profile in $ATL_PROFILEDIR to record the change."
+	echo
+	echo "ACTION is:"
+	echo "	check		Check that the directory structure conforms to our expectations, for version VER (if specified)"
+	echo "	upgrade		Upgrade to ${ATL_NEWVER:-ATL_NEWVER}"
+	echo "	downgrade	Downgrade to the version indicated by the previous/ symlink"
+	echo "	help		This help"
+	exit 2
+}
+
+(( $# == 1 )) || usage "$@"
+
+# First sanity-check both directories
+if $ATL_DATADIR_VERSIONED; then switchver "$ATL_DATADIR_BASE" check "$ATL_VER"; fi
+switchver "$ATL_APPDIR_BASE" check "$ATL_VER"
+
+case "$1" in
+up*)
+	if $ATL_DATADIR_VERSIONED; then switchver "$ATL_DATADIR_BASE" "$1" "${2:-$ATL_NEWVER}"; fi
+	switchver "$ATL_APPDIR_BASE" "$1" "${2:-$ATL_NEWVER}" || fail "Note: switching $ATL_APPDIR_BASE failed, but $ATL_DATADIR_BASE was already upgraded. Please resolve manually, e.g. 'cd $ATL_APPDIR_BASE; atl_switchver . upgrade'"
+	_atl_upgrade_profile
+	;;
+down*)
+	if $ATL_DATADIR_VERSIONED; then switchver "$ATL_DATADIR_BASE" "$@"; fi
+	switchver "$ATL_APPDIR_BASE" "$@" || fail "Note: switching $ATL_APPDIR_BASE failed, but $ATL_DATADIR_BASE was already downgraded. Please resolve manually, e.g. 'cd $ATL_APPDIR_BASE; atl_switchver . downgrade'"
+	_atl_downgrade_profile
+	;;
+check)
+	: # Already done
+	;;
+*) usage ;;
+esac

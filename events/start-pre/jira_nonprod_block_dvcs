@@ -1,0 +1,69 @@
+#!/bin/bash -eu
+
+## If Git integration is actually used, we want 'api.github.com' blocked on all hosts except production, otherwise we risk triggering user-wide blocks (https://developer.github.com/v3/#rate-limiting) that appear as following in the logs:
+#
+#2019-09-16 05:42:40,004 DVCSConnector.MessageExecutor:thread-1 ERROR      [c.a.j.p.d.service.message.MessageConsumer] Synchronization failed: java.io.IOException: Bad Gateway (502)
+#java.lang.RuntimeException: java.io.IOException: Bad Gateway (502)
+#        at com.atlassian.jira.plugins.dvcs.sync.GitHubPullRequestProcessor.getRemotePullRequestCommits(GitHubPullRequestProcessor.java:223)
+#        at com.atlassian.jira.plugins.dvcs.sync.GitHubPullRequestProcessor.updateLocalPullRequestCommits(GitHubPullRequestProcessor.java:186)
+#        at com.atlassian.jira.plugins.dvcs.sync.GitHubPullRequestProcessor.updateLocalPullRequest(GitHubPullRequestProcessor.java:135)
+#        at com.atlassian.jira.plugins.dvcs.sync.GitHubPullRequestProcessor.processPullRequest(GitHubPullRequestProcessor.java:90)
+#        at com.atlassian.jira.plugins.dvcs.sync.GitHubPullRequestProcessor.processPullRequest(GitHubPullRequestProcessor.java:83)
+#        at com.atlassian.jira.plugins.dvcs.sync.GitHubPullRequestSynchronizeMessageConsumer.onReceive(GitHubPullRequestSynchronizeMessageConsumer.java:75)
+#        at com.atlassian.jira.plugins.dvcs.sync.GitHubPullRequestSynchronizeMessageConsumer.onReceive(GitHubPullRequestSynchronizeMessageConsumer.java:25)
+#        at com.atlassian.jira.plugins.dvcs.service.MessageExecutor$MessageRunnable.doRun(MessageExecutor.java:338)
+#        at com.atlassian.jira.plugins.dvcs.service.MessageExecutor$ReleaseTokenAndEnqueueNextMessage.run(MessageExecutor.java:252)
+#        at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+#        at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+#        at java.lang.Thread.run(Thread.java:748)
+#Caused by: java.io.IOException: Bad Gateway (502)
+#        at org.eclipse.egit.github.core.client.GitHubClient.createException(GitHubClient.java:564)
+#        at org.eclipse.egit.github.core.client.GitHubClient.get(GitHubClient.java:740)
+#        at org.eclipse.egit.github.core.client.PageIterator.next(PageIterator.java:173)
+#        at org.eclipse.egit.github.core.service.GitHubService.getAll(GitHubService.java:151)
+#        at org.eclipse.egit.github.core.service.GitHubService.getAll(GitHubService.java:135)
+#        at com.atlassian.jira.plugins.dvcs.sync.GitHubPullRequestProcessor.getRemotePullRequestCommits(GitHubPullRequestProcessor.java:221)
+#        ... 11 more
+#2019-09-16 05:49:12,836 DVCSConnector.MessageExecutor:thread-1 INFO      [c.a.j.p.d.spi.github.GithubCommunicator] Sleeping for 12 s to avoid request rate limit overrun
+#2019-09-16 05:49:27,533 Caesium-1-1 ERROR      [c.a.j.p.d.sync.impl.DefaultSynchronizer] org.eclipse.egit.github.core.client.RequestException: API rate limit exceeded for user ID 1258471. (403)
+#java.lang.RuntimeException: org.eclipse.egit.github.core.client.RequestException: API rate limit exceeded for user ID 1258471. (403)
+#        at com.atlassian.jira.plugins.dvcs.spi.github.service.impl.PullRequestReviewCommentPayloadGitHubEventProcessor.getPullRequestByComment(PullRequestReviewCommentPayloadGitHubEventProcessor.java:83)
+#        at com.atlassian.jira.plugins.dvcs.spi.github.service.impl.PullRequestReviewCommentPayloadGitHubEventProcessor.process(PullRequestReviewCommentPayloadGitHubEventProcessor.java:41)
+#        at com.atlassian.jira.plugins.dvcs.spi.github.service.impl.GitHubEventProcessorAggregatorImpl.process(GitHubEventProcessorAggregatorImpl.java:64)
+#        at com.atlassian.jira.plugins.dvcs.service.GitHubEventServiceImpl$SyncTransactionCallback.doInTransaction(GitHubEventServiceImpl.java:222)
+#
+# Or:
+#
+# 2019-09-11 01:43:15,221 ajp-nio-127.0.0.100-8009-exec-509 url:/rest/bitbucket...epository/110/sync ERROR anonymous 103x91976221x1 - 192.30.252.96 /rest/bitbucket/1.0/repository/110/sync [c.a.j.p.d.sync.impl.DefaultSynchronizer] API rate limit exceeded for user ID 1258471. (403)
+# org.eclipse.egit.github.core.client.NoSuchPageException: API rate limit exceeded for user ID 1258471. (403)
+#         at org.eclipse.egit.github.core.client.PageIterator.next(PageIterator.java:175)
+#         at org.eclipse.egit.github.core.client.PageIterator.next(PageIterator.java:42)
+#         at com.google.common.collect.TransformedIterator.next(TransformedIterator.java:48)
+#         at com.google.common.collect.Iterators$5.hasNext(Iterators.java:548)
+#         at com.atlassian.jira.plugins.dvcs.service.GitHubEventServiceImpl.synchronize(GitHubEventServiceImpl.java:130)
+#         at com.atlassian.jira.plugins.dvcs.spi.github.GithubCommunicator.startSynchronisation(GithubCommunicator.java:609)
+#         at com.atlassian.jira.plugins.dvcs.service.remote.CachingCommunicator.startSynchronisation(CachingCommunicator.java:103)
+#         at com.atlassian.jira.plugins.dvcs.sync.impl.DefaultSynchronizer.doSync(DefaultSynchronizer.java:173)
+#         at com.atlassian.jira.plugins.dvcs.service.RepositorySyncServiceImpl.doSync(RepositorySyncServiceImpl.java:469)
+#         at com.atlassian.jira.plugins.dvcs.service.RepositorySyncServiceImpl.sync(RepositorySyncServiceImpl.java:220)
+#         at com.atlassian.jira.plugins.dvcs.rest.external.v1.RepositoryResource.startRepositoryPRSync(RepositoryResource.java:339)
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+require_app jira
+only_in_nonproduction
+require_table propertyentry
+
+githubcount="$(atl_psql -tAXqc "select count(*) from propertyentry where property_key='dvcs.connector.github.clientId' or property_key='dvcs.connector.githube.clientId'")"
+if [[ $githubcount = 1 ]]; then
+	if ! grep -qF api.github.com /etc/hosts; then
+		warn "Warning: api.github.com should be blocked (aliased to localhost) on $ATL_ROLE instances, to avoid triggering API limits in production"
+	fi
+fi
+bitbucketcount="$(atl_psql -tAXqc "select count(*) from propertyentry where property_key='dvcs.connector.bitbucket.clientId'")"
+if [[ $bitbucketcount = 1 ]]; then
+	if ! grep -qF bitbucket.org /etc/hosts; then
+		warn "Warning: bitbucket.org should be blocked (aliased to localhost) on $ATL_ROLE instances, to avoid triggering API limits in production"
+	fi
+fi

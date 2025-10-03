@@ -1,0 +1,25 @@
+#!/bin/bash -eu
+
+if [[ ${1:-} = --help ]]; then
+	echo >&2 "Purpose: SQL to print JIRA issues linked to Github pulls"
+	echo >&2 "Usage: atl_pg_usage_jira_githublinks | atl_psql"
+	echo >&2
+	exit 1
+fi
+
+echo "\\echo Linked PRs:
+WITH baseurl AS (select propertyvalue AS baseurl from propertyentry pe JOIN propertystring ps USING (id) WHERE pe.property_key='jira.baseurl')
+, issues AS (SELECT 
+		jiraissue.id AS id
+		,project.pkey || '-' || jiraissue.issuenum AS pkey
+		,baseurl || '/browse/' || project.pkey || '-' || jiraissue.issuenum AS url
+	FROM project JOIN jiraissue ON project.id = jiraissue.project
+	CROSS JOIN baseurl
+		)
+SELECT * from issues 
+	JOIN \"AO_E8B6CC_PR_ISSUE_KEY\" pr ON issues.pkey = pr.\"ISSUE_KEY\"
+ORDER BY \"PULL_REQUEST_ID\" desc
+LIMIT 5;"
+
+echo "\\echo Not sure what these remotelinks are from:"
+echo "select project.pkey || '-' || jiraissue.issuenum AS pkey, remotelink.url from project JOIN jiraissue ON project.id=jiraissue.project JOIN remotelink ON remotelink.issueid = jiraissue.id   where title ~ '/pull/' order by remotelink.id desc limit 5 ;"

@@ -1,0 +1,17 @@
+#!/bin/bash -eu
+## Set the base URL in the database to what makes sense for this instance, if we're not production.
+## This ensures sandbox and other non-primary instances always have the correct base URL after a database sync.
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+require_app jira confluence
+
+case "$ATL_PRODUCT" in
+jira | confluence)
+	if [[ $ATL_PRODUCT = jira ]]; then require_table propertyentry; fi
+	if [[ $ATL_ROLE != prod ]]; then
+		atl_pg_set "$ATL_PRODUCT" baseurl "$ATL_BASEURL" | atl_psql -tXAq
+	fi
+	;;
+esac

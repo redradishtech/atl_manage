@@ -1,0 +1,73 @@
+#!/bin/bash -eu
+# Checks that the database is replicating properly, given its role (primary or standby)
+# Note that on the primary, this uses the --super postgres credentials, which must be set. Without --super we can't see the replication delay.
+
+
+#shellcheck source=common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh
+
+shopt -s lastpipe
+
+PATH=$PATH:$ATL_MANAGE/bin
+
+ATL_REPLICATION_MAX_DATABASE_DELAY=${ATL_REPLICATION_MAX_DATABASE_DELAY:-30 seconds}
+
+# Note, we only check replication on vanilla 'postgresql' not 'postgresql-rds'
+if [[ $ATL_DATABASE_TYPE = postgresql ]]; then
+
+        is_postgres_running() { [[ $(atl_psql -tAXc 'select 1') = 1 ]]; }
+        is_postgres_primary() { [[ $(atl_psql -tAXc "select bool_or(active) from pg_replication_slots") = t ]]; }
+        is_postgres_standby() { [[ $(atl_psql -tXAc "select pg_is_in_recovery();") = t ]]; }
+        is_replicationdelay_acceptable()
+        {
+		if [[ -v ATL_REPLICATION_PRIMARY ]]; then
+			if version_greaterthan "$ATL_DATABASE_VERSION" 9.5; then
+				# https://pgdash.io/blog/monitoring-postgres-replication.html
+				atl_psql --super -tAXc "select write_lag from pg_stat_replication;" | read -r writelag
+				[[ -n $writelag ]] && echo "$writelag" || echo "0"
+				# On a mostly-inactive correctly-replicating database, write_lag is either null or a small interval (e.g. 00:00:00.000654) - hence the coalesce
+				[[ $(atl_psql --super -tAXc "select coalesce(write_lag < '$ATL_REPLICATION_MAX_DATABASE_DELAY'::interval, 't') from pg_stat_replication;") = t ]]
+			else
+				# Sadly Postgres 9.5 and earlier don't have pg_stat_replication.write_lag, so we fall back to diffing the xlog location.
+				echo "SELECT (pg_xlog_location_diff(pg_current_xlog_location(),replay_location))::bigint / 1024 as total_lag FROM pg_stat_replication;" | atl_psql --super -tAXq --quiet | read -r writelag
+				[[ -n $writelag ]] && echo "$writelag" || echo "0"
+				(( writelag < 1024 ))   # Fail if writelag exceeds an arbitrary nonzero amount. 
+			fi
+		elif [[ -v ATL_REPLICATION_STANDBY ]]; then
+			writelag=$(atl_psql -tAXc "select (now() - pg_last_xact_replay_timestamp());")
+			echo "$writelag"
+			[[ $(atl_psql -tAXc "select (now() - pg_last_xact_replay_timestamp()) < '$ATL_REPLICATION_MAX_DATABASE_DELAY'::interval;") = t ]]
+		fi
+        }
+
+
+        is_postgres_running || failcritical "Postgres isn't running"
+			#echo "select pid, status from pg_stat_wal_receiver;" | atl psql --super -tAq | IFS='|' read -r pid status
+			#[[ "$status" = running ]] || failcritical "No standby streaming replication process is running. Run 'select * from pg_stat_wal_receiver' to verify"
+
+        if [[ -v ATL_REPLICATION_PRIMARY ]]; then
+		if ! is_postgres_primary; then
+			if is_postgres_standby; then
+				failcritical "$(uname -n) is configured as a primary (ATL_REPLICATION_PRIMARY set), but the database is in standby (recovery) mode"
+			else
+				failcritical "$(uname -n) is configured as a primary (ATL_REPLICATION_PRIMARY set), but the database reports no replication activity from standbys"
+			fi
+		fi
+        elif [[ -v ATL_REPLICATION_STANDBY ]]; then
+		if ! is_postgres_standby; then
+			if is_postgres_primary; then
+				failcritical "$(uname -n) is configured as a standby (ATL_REPLICATION_STANDBY set), but the database looks like a primary (active replication slots)"
+			else
+				failcritical "$(uname -n) is configured as a standby (ATL_REPLICATION_STANDBY set), but appears to be active (not in recovery mode)"
+			fi
+		fi
+	else
+		failcritical "Misconfiguration: neither ATL_REPLICATION_PRIMARY nor ATL_REPLICATION_STANDBY is set"
+        fi
+
+        delay=$(is_replicationdelay_acceptable) || failcritical "Database replication is delayed by $delay, more than the acceptable amount ($ATL_REPLICATION_MAX_DATABASE_DELAY)"
+        echo "OK; replication is active and healthy ($delay delay)"
+else
+	# In particular, setting ATL_DATABASE_TYPE='postgresql-rds' will get us here, allowing filesystem replication without database replication
+        log "Unable to check replication status for database type: $ATL_DATABASE_TYPE. Assuming success"
+fi

@@ -1,0 +1,22 @@
+#!/bin/bash -eu
+# Return an ordered list of events in this directory, being a subset of the reversed list from ../install-post/
+
+# For upgraded hg
+export PATH=$ATL_MANAGE/venv/bin:$PATH
+
+callerdir="$(
+	cd "$(dirname "$0")"
+	pwd
+)"
+
+appliedfeatures() {
+	# Prior to 12/Dec/22 we used '$ATL_APPDIR_BASE/$ATL_VER' instead of '$ATL_APPDIR'. Not sure why - we don't want to hardcode assumptions unnecessarily
+	[[ -d "$ATL_APPDIR/.hg" ]] || return 0 # The directory doesn't exist if atl_deactivate is called when the appdir has already been deleted. In that case we have no 'applied features' (that we know about) so just exit normally.
+	hg -v qseries --cwd="$ATL_APPDIR" | awk '$2=="A" { print $3} '
+}
+
+appliedfeatures | while read -r event; do
+	if [[ -f $callerdir/$event ]]; then
+		echo "$event"
+	fi
+done

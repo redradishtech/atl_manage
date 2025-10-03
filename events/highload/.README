@@ -1,0 +1,1 @@
+Currently we don't actually care if the load is high; as long as immediate and mean response times are okay.

@@ -1,0 +1,64 @@
+#!/bin/bash -eu
+# Mercurial commit hook which executes .hgpatchscript/* scripts, which can fix permissions on files that hg qpop/qpush broke.
+# This solves the problem of 'hg update' losing pre-existing ACLs on files it updates, since technically 'hg update' recreates the files.
+
+shopt -s nullglob
+shopt -s extglob
+
+# Running 'hg qpush -a' to apply a bunch of patches applies all the patches, THEN call this script for each patch. We only really need to run once AFTER all the patches are applied.
+# Our solution here is to check for the repo's patch state (.hg/patches/status) and compare it against the last run's state stored in $laststatefile. If the state is unchanged, don't do anything.
+already_ran_against_repo_in_current_state()
+{
+	[[ -d .hg/patches ]] || return 1   # There isn't even a patchqueue applied. Return 1 to always apply .hgpatchscripts/*
+	local laststatefile laststate state
+	[[ -d .hg ]] || { echo >&2 "Error: $0 not in a hg repository as expected??"; exit 1; }
+	laststatefile=.hg/patches/.status-when-patchscripts-last-applied
+	laststate=$(if [[ -f $laststatefile ]]; then grep -v "^#" < "$laststatefile" 2>&1 ; fi)
+	#state=$([[ -f .hg/patches/status ]] && tail -1 .hg/patches/status || hg -q id | tee -- "$tmpfile")
+	state=$(if [[ -f .hg/patches/status ]]; then tail -1 .hg/patches/status; fi)
+	{ echo "# This temporary file created by $0 to speed up applying .hgpatchscript/* scripts. Do not commit to the patchqueue. Feel free to delete"; echo "$state"; } > "$laststatefile"
+	if [[ $laststate = "$state" ]]; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+main()
+{
+	local pattern
+	echo >&2 "Running hgpatchscripts"
+	# I found 'hg merge' on hg 3.7.3 did not define HG_HOOKTYPE
+	# .hgpatchscript/ is the new directory. .acl/ is the old. 18/Oct/21
+	if [[ ${HG_HOOKTYPE:-} = precommit ]]; then
+		pattern='.hgpatchscript/*.pre'
+	else
+		pattern='.hgpatchscript/!(*.pre)'
+	fi
+	fail() {
+		echo >&2 "$hgpatchscriptfile:${BASH_LINENO[0]} failed: ${1:-assert failed}"
+		exit 1
+	}
+
+	for hgpatchscriptfile in $pattern; do
+		if [[ -x $hgpatchscriptfile ]]; then
+			sanitycheck "$hgpatchscriptfile"
+			# If one .hgpatchscript fails, keep going with the others
+			#shellcheck disable=SC1090
+			#echo "applying $hgpatchscriptfile"
+			. "$hgpatchscriptfile" || :
+		fi
+	done
+}
+
+sanitycheck() {
+	local script="$1"
+	#shellcheck disable=SC2016
+	if grep -P '\${?ATL_APPDIR' "$script" | grep -v '^#'; then
+		# Note that referencing ATL_DATADIR is fine, because that isn't 
+		echo >&2 "Warning: $script uses an ATL_APPDIR variable. The script is probably running in a workdir, not in ATL_APPDIR directly, and so only the current directory (workdir or APPDIR) can be modified)"
+		exit 1
+	fi
+}
+
+already_ran_against_repo_in_current_state || main "$@"

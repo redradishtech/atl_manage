@@ -1,0 +1,28 @@
+#!/bin/bash -eu
+# Given pg_dump input, renames table and function owners to the given name
+if [ $# -ne 1 ]; then
+    echo >&2 "Usage: $0 <pgusername>"
+    echo >&2 "Eg: $0 jira   # Makes tables owned by pg user 'jira'"
+    echo >&2
+    echo >&2 "Hint: use 'atl_pg_renameowner' with no args to assume the profile username '$ATL_DATABASE_USER'"
+    exit 1
+fi
+
+newuser="$1"
+if [[ $newuser =~ - ]]; then
+    # Usernames containing hyphens must be quoted
+    newuser="\"$newuser\""
+fi
+
+perl -pe "s/(^-- (Data for )?Name: .*; Owner: ).*?(?=[;\n])/\1$newuser\2/gm;
+s/(^ALTER (?:TABLE|FUNCTION|SCHEMA|AGGREGATE|SEQUENCE|LARGE OBJECT) .* OWNER TO ).*?(?=[;\n])/\1\"$newuser\"\2/g;
+s/(^(?:REVOKE|GRANT) ALL ON (?:TABLE|SCHEMA) .* (?:FROM|TO) \"?).*?(\"?;)/\1$newuser\2/g"
+# The first clause handles lines like:
+#    -- Name: agile; Type: SCHEMA; Schema: -; Owner: jira-foo
+# Notice that Postgres doesn't quote the username when it is just a comment.
+#
+# The second clause handles lines like:
+#    ALTER SCHEMA agile OWNER TO "jira-edgecast";
+# The name may also come to us unquoted, as in:
+#    ALTER FUNCTION public.nextid(tablename character varying) OWNER TO postgres;
+# 

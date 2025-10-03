@@ -1,0 +1,39 @@
+(1) safety. 
+	- Use -T. 
+	- See https://nagios-plugins.org/doc/guidelines.html#SYSCMDAUXFILES
+
+(2) use nagios utils.pm
+	use lib "/usr/local/nagios/libexec";
+	use utils qw(...);
+    and initialize variables always. 
+    
+
+(3) see https://nagios-plugins.org/doc/guidelines.html#PERLPLUGIN
+
+(4) implement other options from https://nagios-plugins.org/doc/check-many.html 
+
+-s, --shell=<always|never|auto>
+   Specify when a shell should be invoked for executing commands.  "always"
+   invokes the shell for every command, "never" forces commands to be executed
+   directly, and "auto" (default) invokes the shell only if shell meta
+   characters are present in the check command.  Unless -d (--delimiter) is
+   specified, any whitespace is used for separating arguments.
+
+-d, --delimiter=CHARACTER
+   Delimiter to use for separating command arguments when shell is not used.
+   Implies --shell=never and is mutually exclusive with any other shell option.
+   Standard backslash escapes are allowed, except "\n".
+
+-P, --process=<all|first-fail|first-ok>
+   By default, all commands are processed and the worst state is returned
+   ("all").  "first-fail" stops at the first non-ok check and returns it, while
+   "first-ok" stops at the first successful check and returns it.  The latter
+   two override --status and --output and return the plugins's instead.
+
+--output=<normal|oneline|status>
+   "normal" outputs Nagios v3+ multi-line result, first line being a summary of
+   the checks performed; "oneline" squeezes everything into a single line; and
+   "status" returns only a status line.  This option has no effect with
+   --process=first-fail|first-ok.
+
+

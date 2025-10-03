@@ -1,0 +1,3 @@
+#!/bin/bash
+
+ATL_NEWSCHEMA=${1:-rt} atl_psql -tAXq <"$ATL_MANAGE/lib/pg_inheritedtables/generate.sql"

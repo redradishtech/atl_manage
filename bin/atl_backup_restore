@@ -1,0 +1,146 @@
+#!/bin/bash -eu
+## Restores a backup
+set -o pipefail
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE"/lib/common.sh --nolog
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	local PARSED
+	PARSED=$(getopt --options 'h' --longoptions 'help' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		--)
+			shift
+			break
+			;;
+		-h | --help) usage ;;
+		*) usage ;;
+		esac
+		shift
+	done
+	# }}
+	[[ $# == 1 ]] || usage
+	backupname="$1"
+	backuppath="$ATL_BACKUP_ROOT/$backupname"
+	[[ -d $backuppath ]] || error "No such backup: $backuppath"
+
+	echo "# Pipe these commands to 'bash -vx'"
+	echo "bigfail() { for i in {1..10}; do echo \"FAIL: $*\"; done; }"
+	echo "atl_db_user_create   #  Necessary if this is a new server; harmless otherwise"
+	echo "atl_db_user_passwordset"
+	echo "yes | atl_db_drop"
+	echo "atl_db_create"
+	case "$ATL_DATABASE_TYPE" in
+	postgresql*)
+		local expectedbackupdir="$backuppath/database/$ATL_DATABASE"
+		local otherbackupdirs
+		otherbackupdirs=($(find "$backuppath"/database -maxdepth 1 -mindepth 1 -type d -not -path '*/'"$ATL_DATABASE"))
+		restoreothers() {
+			for d in "${otherbackupdirs[@]}"; do
+				local db="$(basename "$d")"
+				echo "# WARNING: Auxiliary database:"
+				echo "# atl_pg_drop $db"
+				echo "atl_pg_create $db"
+				echo "pg_restore -f - $d/ | atl_pg_sql_owner_change | atl_psql --super -tAXq $db || bigfail \"Could not restore $d\""
+			done
+		}
+
+		if [[ -d $expectedbackupdir ]]; then
+			echo "pg_restore -f - $expectedbackupdir/ | atl_pg_sql_owner_change | atl_psql --super -tAXq || bigfail \"could not restore $expectedbackupdir\""
+			restoreothers
+		else
+			if ((${#otherbackupdirs} == 1)); then
+				echo "# WARNING: Unexpected database $(basename "${otherbackupdirs[0]}") in ${otherbackupdirs[0]}. We expected '$expectedbackupdir'"
+				echo "# WARNING: If this is intentional, e.g. you are restoring data from another instance, then proceed with:"
+				echo "pg_restore -f - ${otherbackupdirs[0]} | atl_pg_sql_owner_change | atl_psql --super -tAXq"
+			else
+				echo "# WARNING: Did not find expected database $expectedbackupdir. Instead we found multiple databases: ${otherbackupdirs[*]}. These may be restored with:"
+				restoreothers
+			fi
+		fi
+		;;
+	mysql)
+		local backupfile
+		fileprefix="$backuppath/database/$ATL_DATABASE/$ATL_DATABASE.sql"
+		if [[ -f "$fileprefix.zstd" ]]; then
+			backupfile="$fileprefix.zstd"
+		elif [[ -f "$fileprefix.xz" ]]; then
+			backupfile="$fileprefix.xz"
+		else
+			if [[ ${ATL_MULTITENANT:-} = true ]]; then
+				echo >&2 "No database found: ${fileprefix}*"
+				echo >&2 "If the database in $(dirname "$fileprefix") has a different name, prefix this command with ATL_DATABASE=..."
+				exit 1
+			else
+				# If we're not multi-tenant, then database/*/*.sql will be databases related to the app
+				mapfile -t backupfiles < <(compgen -G "$backuppath/database/*/*.sql.*")
+				if ((${#backupfiles[@]} == 0)); then
+					echo >&2 "No database backups found in $backuppath/database/*/*.sql.*"
+					exit 1
+				elif ((${#backupfiles[@]} == 1)); then
+					# 1 database, but it isn't ATL_DATABASE. This happens if e.g. we copy a 'jira' backup into 'jira-test' $ATL_BACKUPROOT/from_production and run 'atl_backup_restore from_production'
+					backupfile="${backupfiles[0]}"
+					echo "## Warning: Database is not '$ATL_DATABASE' as expected: $backupfile}"
+				else
+					# Multiple databases, e.g. jira plus eazybi, or a multitenant system
+					echo "# There are multiple databases backed up: ${backupfiles[*]}"
+					backupfile="<choose one>"
+				fi
+			fi
+		fi
+		if [[ "${backupfile:(-4)}" = zstd ]]; then
+			decompresscmd=zstdcat
+		elif [[ "${backupfile:(-3)}" = .xz ]]; then
+			decompresscmd=xzcat
+		fi
+		echo "$decompresscmd \"$backupfile\" | atl_mysql_sql_rename |  atl_mysql --super"
+		;;
+	esac
+
+	homedir="${backuppath}/home"
+	if [[ "${ATL_MULTITENANT:-}" = true ]]; then
+		tenanthomedir="${homedir}/$ATL_TENANT"
+		if [[ -d "$tenanthomedir" ]]; then
+			echo "rsync -raAHKl $tenanthomedir/ $ATL_DATADIR_NEW --exclude backups -v --delete"
+		else
+			echo "## Warning: we are multi-tenant, but did not find tenant home dir at $tenanthomedir. Restore the base home dir at your risk:"
+			echo "rsync -raAHKl $homedir/ $ATL_DATADIR_NEW --exclude backups -v --delete"
+		fi
+	else
+		echo "rsync -raAHKl $homedir/ $ATL_DATADIR_NEW --exclude backups -v --delete"
+	fi
+	case "$ATL_PRODUCT" in
+		jira|confluence)
+			echo "chown -R $ATL_USER: $ATL_DATADIR_NEW"
+			;;
+		jethro)
+			:  # Jethro perms must be root:root, as will be the case in the backup
+	esac
+	echo "echo 'Database and files from $backuppath restored'"
+
+}
+
+usage() {
+	local cmd="${CMD:-$0}"
+	cat <<EOF
+Purpose: $(grep -m1 '##' "$0" | sed -e 's/## //')
+Usage: $cmd RSNAPSHOT_BACKUP_TLD
+E.g.:
+	$cmd hourly.0
+
+If backups are located somewhere other than \$ATL_BACKUP_ROOT ($ATL_BACKUP_ROOT), use:
+ATL_BACKUP_ROOT=... $cmd RSNAPSHOT_BACKUP_TLD
+e.g.:
+ATL_BACKUP_ROOT=\$(cat /opt/atlassian/jira/current/.env/ATL_BACKUP_ROOT) $cmd hourly.0
+
+EOF
+	exit 2
+}
+
+main "$@"

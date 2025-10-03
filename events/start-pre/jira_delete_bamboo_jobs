@@ -1,0 +1,14 @@
+#!/bin/bash
+## Delete useless Bamboo jobs that run once a minute, and accumulate on each restart. https://jira.atlassian.com/browse/JRASERVER-66593
+
+# shellcheck source=/opt/atl_manage/events/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/../.common.sh
+
+PATH=$ATL_MANAGE/bin:$PATH
+
+require_app jira
+require_table clusteredjob
+
+echo "delete from public.clusteredjob where job_runner_key='com.atlassian.jira.plugin.ext.bamboo.service.PlanStatusUpdateJob' returning job_runner_key ;" | atl_psql -tAXq | wc -l | while read -r deletecount; do
+	[[ $deletecount = 0 ]] || log "Deleted $deletecount useless Bamboo job (https://jira.atlassian.com/browse/JRASERVER-66593)"
+done

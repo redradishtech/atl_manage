@@ -1,0 +1,10 @@
+#!/bin/bash -eu
+# If jj or something has messed up $ATL_APP permissions, this resets permissions and fixes them by re-running .hgpatchscript/webserver-apache
+
+(
+cd "$ATL_APPDIR"
+setfacl -R -b app
+setfacl -R -d -b app
+find app  \( -name .git -o -name .jj \) -type d -prune -o -type f -exec chmod ugo-x,o-r {} \; 
+. .hgpatchscript/webserver-apache
+)

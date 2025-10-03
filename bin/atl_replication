@@ -1,0 +1,67 @@
+#!/bin/bash -eu
+
+#shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --no_profile_needed --nolog
+
+if [[ ${1:-} = --help ]]; then
+	echo >&2 "Usage:"
+	echo -e "\tatl_replication        # replication status" >&2
+	echo -e "\tatl_replication run [command]" >&2
+	echo -e >&2
+	exit 2
+elif [[ ${1:-} = run ]]; then
+	shift
+	"$ATL_MANAGE/replication/remoterun" -t "$@"
+else
+	status=()
+	# FIXME: replace nagiocheck* with just nagiocheck some time after Jul/22
+	if [[ -f "$ATL_APPDIR"/replication/replication_database_working.nagioscheck.sh ]]; then
+		replication_database_working="$ATL_APPDIR"/replication/replication_database_working.nagioscheck.sh
+		warn "Deadnaming script: $replication_database_working"
+	else
+		replication_database_working="$ATL_APPDIR"/replication/replication_database_working.healthcheck
+	fi
+	if [[ -f "$ATL_APPDIR"/replication/replication_filesystem_working.nagioscheck.sh ]]; then
+		replication_filesystem_working="$ATL_APPDIR"/replication/replication_filesystem_working.nagioscheck.sh
+		warn "Deadnaming script: $replication_filesystem_working"
+	else
+		replication_filesystem_working="$ATL_APPDIR"/replication/replication_filesystem_working.healthcheck
+	fi
+	if [[ -f $replication_database_working ]]; then
+		tmpdir="$(mktemp -ud)"
+		trap 'rm -fr "$tmpdir"' EXIT TERM
+		if $replication_database_working >"$tmpdir"; then
+			status+=("✓ database replication working")
+		else
+			status+=("✗ database replication failed. Output: $(
+				echo
+				cat "$tmpdir"
+			)")
+			failed=true
+		fi
+
+		if $replication_filesystem_working >"$tmpdir"; then
+			status+=("✓ filesystem replication working")
+		else
+			status+=("✗ filesystem replication failed. Output: $(
+				echo
+				cat "$tmpdir"
+			)")
+			failed=true
+		fi
+		if [[ $("$ATL_MANAGE/monitoring/plugins/check_replication_ssh") =~ ^OK ]]; then
+			status+=("✓ SSH round-tripping works")
+		else
+			status+=("✗ SSH round-tripping failed")
+			failed=true
+		fi
+
+		(
+			export IFS=$'\n'
+			echo "${status[*]}"
+		) # https://stackoverflow.com/questions/1527049/join-elements-of-an-array
+		[[ $failed = true ]] && exit 1 || exit 0
+	else
+		log "Replication nagios script '$replication_database_working' not found. This suggests the 'replication' patchqueue item isn't enabled. Please 'hg qselect replication' in $ATL_APPDIR"
+	fi
+fi

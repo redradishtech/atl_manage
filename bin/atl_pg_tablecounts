@@ -1,0 +1,4 @@
+#!/bin/bash -eu
+# Prints database tables and their row count. When done before and after a change, this lets one determine which tables relate to particular functionality.
+
+atl_psql -tAXq < "$ATL_MANAGE/templates/sql/tablecounts.sql" | atl_psql -F$'\t' -tAX

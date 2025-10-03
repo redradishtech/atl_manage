@@ -1,0 +1,106 @@
+#!/bin/bash -eu
+
+install-post() {
+
+	check_permissions() {
+		local issobin=$ATL_MANAGE/venv/bin/isso
+		local issoconf="$ATL_APPDIR/isso-public-comments/isso.conf"
+		{ sudo -u "$ATL_ISSO_USER" test -r "$issobin" && test -x "$issobin"; } || error "Isso user $ATL_ISSO_USER cannot read/execute $issobin. Please fix the root cause. Quick fix: ( cd $ATL_MANAGE; .  $ATL_MANAGE/.hgpatchscript/worldreadable; )"
+		sudo -u "$ATL_ISSO_USER" test -r "$issoconf" || error "Isso user $ATL_ISSO_USER cannot read config file $issoconf"
+	}
+
+	install_isso() {
+		(
+			pkginstall build-essential
+			cd "$ATL_MANAGE/venv"
+			#shellcheck source=/opt/atl_manage/venv/bin/activate
+			. bin/activate
+			# https://github.com/posativ/isso/issues/617
+			pip3 install wheel # https://stackoverflow.com/questions/34819221/why-is-python-setup-py-saying-invalid-command-bdist-wheel-on-travis-ci
+			# No further need for my fork
+			#pip3 install --upgrade git+https://github.com/redradishtech/isso.git
+			#pip3 install --upgrade git+https://github.com/posativ/isso.git
+			pip3 install --upgrade isso
+			# Our umask means all pip-installed files are not readable by $ATL_ISSO_USER. We want them world-readable
+			setfacl -R -m o:rX "$ATL_MANAGE/venv"
+		)
+
+	}
+	add_user_and_group() {
+		if [[ ! -v ATL_ISSO_UID ]]; then
+			error "Please set ATL_ISSO_UID. Suggested value: ATL_ISSO_UID=$(getnextid user --use-reserved 10)"
+		fi
+		if [[ ! -v ATL_ISSO_GID ]]; then
+			error "Please set ATL_ISSO_GID. Suggested value: ATL_ISSO_GID=$(getnextid group --use-reserved 10)"
+		fi
+		log "Creating $ATL_ISSO_USER account for running Isso"
+		if ! getent group "$ATL_ISSO_GID" >/dev/null 2>&1; then
+			groupadd --gid "$ATL_ISSO_GID" "${ATL_ISSO_USER}"
+		fi
+		if ! id "$ATL_ISSO_USER" >/dev/null 2>&1; then
+			useradd --home-dir "$ATL_APPDIR/isso-public-comments" -s /bin/bash --comment "Role account for $ATL_SHORTNAME $ATL_PRODUCT isso (comments) service" -g "$ATL_ISSO_GID" --uid "$ATL_ISSO_UID" "${ATL_ISSO_USER}"
+		fi
+		# The isso-public-comments/ directory would have been created by the patchqueue, not us, so won't have the right permissions
+		#chgrp -R $ATL_ISSO_GID $ATL_APPDIR/isso-public-comments
+	}
+
+	install_isso
+	add_user_and_group
+	installservice systemd/isso-"$ATL_SYSTEMD_SERVICENAME".service
+	systemctl start "isso-$ATL_SYSTEMD_SERVICENAME"
+	install -o "$ATL_ISSO_USER" -g root -m 750 -d "$ATL_DATADIR/isso-public-comments"
+	# Ensure our user can see intermediate directories
+	setfacl -m "u:$ATL_ISSO_USER:rX" "$ATL_DATADIR_BASE" "$ATL_DATADIR"
+
+	[[ -d "$ATL_DATALOGDIR" ]] || install -d -o "$ATL_USER" "$ATL_DATALOGDIR" # logs/ won't exist on first deploy before Jira has started, so create it
+	setfacl -m u:"$ATL_ISSO_USER":rX "$ATL_DATALOGDIR"
+	local logfile="$ATL_DATALOGDIR"/isso.log
+	touch "$logfile"
+	chown "$ATL_ISSO_USER" "$logfile"
+	# For RequestHeader in apache2.conf
+	a2enmod headers
+	check_permissions
+}
+
+## FIXME: Copied from $ATL_MANAGE/lib/profile.sh.
+# Print the next available user UID/GID.
+# Usage:
+# getnextid <user|group> [ [--reserve N] | [--look-backwards N] ]
+# If passed '--reserve N', then an integer N is added to the next available UID. This lets the caller 'reserve' N UIDs for sub-services
+# If passwd '--use-reserved N', then up to N UIDs earlier than $ATL_USER's are examined (in decreasing order), and will be used if free. This is intended to be used by sub-services when the parent service has used --reserve N. If none of the N UIDs prior to $ATL_USER's UID are free, then the next free UID is chosen.
+getnextid() {
+	case "$1" in
+	user) entity=passwd ;;
+	group) entity=group ;;
+	*) error "Illegal arg. Usage: getnextid <user|group>: $1" ;;
+	esac
+	shift
+
+	if [[ $1 = --use-reserved ]]; then
+		shift
+		local backcount=$1
+		local uid
+		uid="$(id -u "$ATL_USER")"
+		for i in $(seq 1 "$backcount"); do
+			uid=$((uid - i))
+			if getent $entity $((uid - i)); then
+				log "Hooray, we found an ID ($uid) in the reserved set of 10 for $ATL_USER"
+				echo "$uid"
+				return
+			fi
+		done
+		log "No reserved set of UIDs; using next available UID"
+		getent $entity | awk -F: '($3>600) && ($3<10000) && ($3>maxuid) { maxuid=$3; } END { print maxuid+1; }'
+		return
+	fi
+	if [[ $1 = --reserve ]]; then
+		shift
+		local reserved="$1"
+	else
+		local reserved=0
+	fi
+	getent passwd | awk -F: '($3>600) && ($3<10000) && ($3>maxuid) { maxuid=$3; } END { print maxuid+'$((1 + reserved))'; }'
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/.common.sh

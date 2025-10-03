@@ -1,0 +1,14 @@
+--- /etc/logrotate.d/apache2.old	2018-07-10 11:07:16.836677217 +1000
++++ /etc/logrotate.d/apache2	2018-07-10 11:07:28.184772321 +1000
+@@ -1,5 +1,11 @@
+ /var/log/apache2/*.log /var/log/apache2/*/*.log {
+ 	daily
++
++        # Log with dates rather than a counter, so that the file containing a particular day's logs is always constant.  https://stackoverflow.com/questions/9555769/how-to-insert-a-date-inside-the-filename-with-logrotate
++        dateext
++        dateformat .%Y-%m-%d
++        dateyesterday
++
+ 	missingok
+ 	rotate 14
+ 	compress

@@ -1,0 +1,42 @@
+#!/bin/bash -eu
+# Check for file presence, and size being above a minimum.
+
+#shellcheck source=common.sh
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"/common.sh
+
+main()
+{
+	while true; do
+		if [[ $# = 0 ]]; then
+			break
+		elif [[ $# -lt 2 ]]; then
+			usage "Odd number of args."
+		fi
+		filename=$1; shift
+		minsize=$1; shift
+		test -f "$filename" || error "$filename does not exist"
+		(( filesize=$(stat -c%s "$filename") ))
+		(( ratio=filesize/minsize ))
+		if [[ $filesize -lt $minsize ]]; then
+			failcritical "$filename is of size $filesize, less than minimum size $minsize"
+		elif [[ $ratio -gt 3 ]]; then
+			failwarn "$filename is of size $filesize, which is ${ratio}x over the minimum size $minsize. The minimum size should be be updated"
+		else
+			echo "OK; $filename has size '$filesize', greater than minimum size '$minsize'"
+		fi
+	done
+}
+
+usage()
+{
+	cat <<-EOF
+	$*
+	Purpose: Checks that files exist within the current directory, with the indicated attributes (currently just size).
+	Usage:
+	check_files_exist <file1> <file1size> [<file2> <file2size> [....] ]
+
+	EOF
+	exit 255
+}
+
+main "$@"

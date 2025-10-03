@@ -1,0 +1,4 @@
+b6545d39f68848134c5f1471abf48e840453dc0b .hgext/hg-prompt
+b317fc5fbc9dff57fe15d0cb2aa695ffc12d2290 lib/activeobject_views
+b932bbf0885c1b709346551c2e9083579d755941 lib/requiresort
+bafdbe9c4f896702e9cdc2ce9cde3937387ad07c lib/versioned_directories

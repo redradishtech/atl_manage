@@ -1,0 +1,22 @@
+#!/bin/bash -eu
+
+set -o pipefail
+
+install-post() {
+	installcron "$ATL_APPDIR/${ATL_TOMCAT_SUBDIR}conf/tomcat_logcleanup.cron"
+	cleanup
+}
+
+uninstall-pre() {
+	uninstallcron "$ATL_APPDIR/${ATL_TOMCAT_SUBDIR}conf/tomcat_logcleanup.cron"
+}
+
+cleanup() {
+	OLDCRONFILE=/etc/cron.d/${ATL_SHORTNAME}_tomcat_logrotate
+	if [[ -f $OLDCRONFILE ]]; then rm "$OLDCRONFILE"; fi
+	OLDCRONFILE=/etc/cron.d/${ATL_SHORTNAME}_tomcat_logcleanup
+	if [[ -f $OLDCRONFILE ]]; then rm "$OLDCRONFILE"; fi
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

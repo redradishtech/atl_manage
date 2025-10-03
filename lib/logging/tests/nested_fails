@@ -1,0 +1,12 @@
+#!/bin/bash
+
+. /opt/atl_manage/lib/logging.sh
+
+bar() {
+	./error_in_function
+	log after_failure
+}
+
+foo() { bar "$@"; }
+
+foo "$@"

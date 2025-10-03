@@ -1,0 +1,58 @@
+#!/bin/bash
+
+## Rudimentary security checks, for hacks
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+
+main() {
+	[[ $EUID = 0 ]] || fail "Sorry, $0 must run as root"
+	nonjava_childpids
+	unexpected_tempfiles
+	check_suricata
+	nocron
+}
+
+# Check for non-Java processes, as might be found in a root shell
+nonjava_childpids() {
+	[[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ java ]] || return 0
+	local nonjavapids
+	local pid
+	pid=$(atl_pid)
+	[[ -n $pid ]] || return 0 # E.g. on standbys, atl_pid returns nothing
+	# 'inlets' are application tunnels: https://support.atlassian.com/organization-administration/docs/configure-application-tunnels/
+	# jspawnhelper is a legit JDK thing
+	nonjavapids="$(pstree -a "$pid" | grep -vE '(java|inlets|jspawnhelper)' || :)"
+	if [[ -n $nonjavapids ]]; then
+		error "Non-Java child processes found: $nonjavapids"
+	fi
+}
+
+unexpected_tempfiles() {
+	local unexpected
+	mapfile -t unexpected < <(find /tmp -type f -executable -user "$ATL_USER" -not -path '/tmp/hsperfdata*' -not -path '/tmp/.java_pid*' -not -path '/tmp/*/check_postgres*' -not -path '/tmp/snappy-*-libsnappyjava.so' -not -path '/tmp/liblz4-java*.so')
+	if [[ "${#unexpected[@]}" -gt 0 ]]; then
+		error "Unexpected files owned by $ATL_USER in /tmp: ${unexpected[*]}"
+	fi
+
+}
+
+check_suricata() {
+	command -v suricata-update >/dev/null || return 0
+	"$ATL_MANAGE/lib/run_only_once_per" day jwritelock -g security-suricata-update jrun security-suricata-update suricata-update
+	local alerts="$(cat /var/log/suricata/eve.json | jq 'select(.event_type=="alert" and .alert.severity<=2)')"
+	if [[ -n $alerts ]]; then
+		error "Suricata alerts: $alerts"
+	fi
+}
+
+nocron() {
+	local cronfile="/var/spool/cron/crontabs/$ATL_USER"
+	if [[ -f "$cronfile" ]]; then
+		if grep '^[^#]' /var/spool/cron/crontabs/$ATL_USER; then # It has non-commented-out lines too..
+			error "There is a cron file $cronfile, which shouldn't exist. Server hacked??"
+		fi
+	fi
+}
+
+main "$@"

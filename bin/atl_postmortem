@@ -1,0 +1,49 @@
+#!/bin/bash -eu
+
+main() {
+	# {{{ Parseopts
+	set -eu # Rely on quick failure from getopt if wrong arg is passed
+	#https://stackoverflow.com/questions/192249/how-do-i-parse-command-line-arguments-in-bash/38153758
+	PARSED=$(getopt --options 'ofth' --longoptions 'help,outagetype:,from:,to:' --name "$0" -- "$@")
+	# use eval with "$PARSED" to properly handle the quoting
+	eval set -- "$PARSED"
+	outagetype=
+	from=
+	to=
+	# now enjoy the options in order and nicely split until we see --
+	while true; do
+		case "$1" in
+		-o | --outagetype)
+			outagetype=$2
+			shift
+			;;
+		-f | --from)
+			from=$2
+			shift
+			;;
+		-t | --to)
+			to=$2
+			shift
+			;;
+		--)
+			shift
+			break
+			;;
+		-h | --help | *) usage ;;
+		esac
+		shift
+	done
+	# }}}
+	echo "Yay, handling $outagetype  from $from to $to"
+	# The args thing must be quoted
+	echo
+	#lnav "${args[@]:-}" "$@"
+}
+
+usage() {
+	echo >&2 "Usage: $(basename "$0") --outagetype <...> --from <date> --to <date>"
+	echo >&2 " E.g.: $(basename "$0") --outagetype hang --from '2018-07-05 02:00:00.000'   --to '2018-07-05 03:00:00.000'"
+	exit
+}
+
+main "$@"

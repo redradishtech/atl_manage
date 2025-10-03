@@ -1,0 +1,50 @@
+#!/bin/bash -eu
+# Script run by the app installer when first installing Nagios check javamelody.cfg.
+# This script ensures the Nagios check has permission to do its job, namely examine files in $ATL_APPDIR/temp/javamelody/*
+## Install rsnapshot backup crontab and ensure required packages are installed.
+
+homedir="${ATL_DATADIR}/javamelody"
+
+install-post() {
+	readable_javamelody_dir() {
+		# Our data dir was created by atl_deploy with 027 umask, so permission needs to be given to nagios to enter it
+		# Really we need to do all directories from ATL_ROOT
+		dir="$ATL_DATADIR"
+		while [[ $dir != "${ATL_ROOT:-/}" ]]; do
+			if sudo -u nagios test -r "$dir"; then
+				break
+			fi
+			log "Granting nagios rX to $dir"
+			setfacl -m u:nagios:rX "$dir"
+			dir=$(dirname "$dir")
+
+		done
+		sudo -u nagios test -r "$ATL_DATADIR" || fail "Failed to grant nagios -rX permissions. This should not normally happen"
+
+		# Set gid bit on directory so files/directories JavaMelody creates remain owned by 'nagios'
+		install -o "$ATL_USER" -g nagios -m u=rwx,g=rwxs,o=rx -d "$homedir"
+		# Set correct permissions on existing files. The Nagios check_jmelody plugin wants *write* permissions for some bizarre reason. Perhaps RRD is like a database with locks
+		find "$homedir" -type d -exec chmod u=rwx,g=rx,o=rx {} \;
+		find "$homedir" -type f -exec chmod u=rw,g=rw,o=r {} \;
+		# Ensure the group is 'nagios'
+		chgrp -R nagios "$homedir"
+		# We want new directories created by JavaMelody to have g+x (in fact g+s). Strangely this doesn't apply to files, which is conveniently what we want
+		setfacl -R -m "default:group::rwx" "$homedir"
+		sudo -u nagios test -r "$homedir" || error "User nagios cannot read the JavaMelody home dir $homedir"
+	}
+
+	set -euo pipefail
+	readable_javamelody_dir
+}
+
+cleanup() {
+	oldhomedir="${ATL_APPDIR}/${ATL_TOMCAT_SUBDIR}temp/javamelody/${ATL_SHORTNAME}"
+	if [[ -d $oldhomedir && -d $ATL_DATADIR && ! -d $homedir/$ATL_SHORTNAME ]]; then
+		echo >&2 "JavaMelody stats were found in the old location, '$oldhomedir'. Copying to the new location, '$homedir'. Note that the files are hardlinked and left in the old location too in case the app is running"
+		install -d "$homedir" -o "$ATL_USER"
+		rsync -raH "$oldhomedir" "$homedir" --link-dest="$oldhomedir"
+	fi
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

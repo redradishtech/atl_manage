@@ -1,0 +1,47 @@
+#!/bin/bash -eu
+set -o pipefail
+# Warning: if the WHERE clause doesn't match, lnav has a nasty habit of just returning all the log lines
+
+source $ATL_MANAGE/lib/common.sh --
+
+cmd=(lnav)
+cmd+=(-n)
+
+PREFIX=${ATL_URLPREFIX:+/$ATL_URLPREFIX}
+
+case $1 in
+dashboards_count)
+	cmd+=(-c ";select strftime('%Y-%m-%d %H:00:00', log_time) AS log_time, count(*), avg(c_requesttime) AS avg_reqtime from access_log WHERE cs_uri_stem = '$PREFIX/secure/Dashboard.jspa' and cs_username != 'anonymous' and cs_uri_query is null group by 1;")
+	;;
+dashboards_null)
+	cmd+=(-c ";select * from access_log where cs_uri_stem = '$PREFIX/secure/Dashboard.jspa' and cs_username != 'anonymous' and cs_uri_query is null; :spectrogram c_requesttime")
+	;;
+dashboards)
+	cmd+=(-c ";select distinct '${ATL_BASEURL%${PREFIX}}' || cs_uri_stem || '?' || coalesce(cs_uri_query, '') AS url, count(distinct cs_username) distinct_usercount, count(*) AS viewcount from access_log where cs_uri_stem = '${PREFIX}/secure/Dashboard.jspa' group by cs_uri_query order by viewcount desc LIMIT 10;")
+	;;
+agile)
+	cmd+=(-c ";select distinct '${ATL_BASEURL%${PREFIX}}' || cs_uri_stem || '?' || coalesce(cs_uri_query, '') AS url, count(distinct cs_username) distinct_usercount, count(*) AS viewcount from access_log where cs_uri_stem = '${PREFIX}/secure/RapidBoard.jspa' group by cs_uri_query order by viewcount desc LIMIT 40;")
+	;;
+portfolio)
+	cmd+=(-c ";select distinct '${ATL_BASEURL%${PREFIX}}' || cs_uri_stem || '?' || coalesce(cs_uri_query, '') AS url, count(distinct cs_username) distinct_usercount, count(*) AS viewcount from access_log where cs_uri_stem = '$PREFIX/secure/PortfolioPlanView.jspa' group by cs_uri_query order by viewcount desc LIMIT 10;")
+	;;
+eazybi)
+	cmd=(-c ";select distinct '${ATL_BASEURL%${PREFIX}}' || cs_uri_stem || '?' || coalesce(cs_uri_query, '') AS url, count(distinct cs_username) distinct_usercount, count(*) AS viewcount from access_log where cs_uri_stem = '$PREFIX/plugins/servlet/eazybi/accounts' group by cs_uri_query order by viewcount desc LIMIT 10;")
+	;;
+issue)
+	cmd+=(-c ";select '${ATL_BASEURL%${PREFIX}}' || cs_uri_stem, count(*) from access_log WHERE cs_uri_stem like '$PREFIX/browse/%' and cs_uri_stem != '$PREFIX/browse/'  group by 1 order by 2 desc LIMIT 10;")
+	;;
+pages)
+	cmd+=(-c ";select '${ATL_BASEURL%${PREFIX}}' || cs_uri_stem, count(*) from access_log WHERE cs_uri_stem like '$PREFIX/display/%' and cs_uri_stem != '$PREFIX/display/'  group by 1 order by 2 desc LIMIT 10;")
+	;;
+bigpicture)
+	cmd+=(-c ";select '${ATL_BASEURL%${PREFIX}}' || cs_uri_stem || '?' || coalesce(cs_uri_query, '') AS url, count(*) from access_log WHERE cs_uri_stem like '$PREFIX/plugins/servlet/softwareplant-bigpicture%' and cs_uri_stem != '$PREFIX/display/'  group by 1 order by 2 desc LIMIT 10;")
+	;;
+
+*)
+	error "Unknown query '$1'. Options are: dashboards	agile	portfolio	eazybi	issue"
+	;;
+esac
+cmd+=(/var/log/"$ATL_WEBSERVER/$ATL_LONGNAME"/access.log{,.1})
+#cmd+=(/var/log/"$ATL_WEBSERVER/$ATL_LONGNAME"/access.log{,.1,.{2..4}.gz})
+"${cmd[@]}"

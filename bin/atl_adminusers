@@ -1,0 +1,12 @@
+#!/bin/bash -eu
+## Print Jira system administrator usernames
+
+#shellcheck source=/opt/atl_manage/lib/common.sh
+. "$ATL_MANAGE/lib/common.sh"
+
+{
+	case "$ATL_PRODUCT" in
+	jira) echo "select lower_user_name from cwd_user JOIN cwd_membership ON cwd_user.id=cwd_membership.child_id JOIN cwd_group ON cwd_membership.parent_id=cwd_group.id JOIN globalpermissionentry ON cwd_group.lower_group_name=globalpermissionentry.group_id  WHERE permission='SYSTEM_ADMIN' and cwd_user.active='1';" ;;
+	esac
+
+} | atl_psql

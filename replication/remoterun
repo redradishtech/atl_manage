@@ -1,0 +1,7 @@
+#!/bin/bash -eu
+
+# shellcheck source=/opt/atl_manage/replication/common_source.sh
+. "$ATL_MANAGE/replication/common.sh"
+
+#shellcheck source=/opt/atl_manage/lib/remote/run
+. "$ATL_MANAGE/lib/remote/run" "$@"

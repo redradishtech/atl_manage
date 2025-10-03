@@ -1,0 +1,46 @@
+#!/bin/bash -eu
+
+if [[ $# -ne 1 ]]; then
+	echo >&2 "Purpose: SQL to print JIRA custom fields whose type is provided by the given plugin"
+	echo >&2 "E.g.: atl_pg_usage_jira_customfields com.keplerrominfo.jira.plugins"
+	echo >&2
+	exit 1
+fi
+
+echo "\\echo h3. Custom fields using $1 types:"
+echo "select cfname, customfieldtypekey, customfieldsearcherkey from customfield where customfieldtypekey ~ '$1' or customfieldsearcherkey ~ '$1';"
+
+echo "select 'There are ' || count(*) || ' usages in project ' || project.pkey || ' of the above custom fields, most recent update: ' || to_char(max(jiraissue.updated), 'YYYY-mm-dd') AS  Usage 
+FROM project JOIN jiraissue ON project.id = jiraissue.project
+	JOIN customfieldvalue ON customfieldvalue.issue = jiraissue.id 
+	JOIN customfield ON customfieldvalue.customfield = customfield.id
+WHERE (customfieldtypekey ~ '$1' or customfieldsearcherkey ~ '$1')
+GROUP BY project.pkey;"
+
+echo "\\echo h3. Uses of the above custom fields on issues created/updated in the last 3 years:"
+echo "select
+	cfname
+	, project.pkey || '-' || jiraissue.issuenum AS key
+	, jiraissue.created
+	, jiraissue.updated
+	, jiraissue.resolution
+FROM project JOIN jiraissue ON project.id = jiraissue.project
+	JOIN customfieldvalue ON customfieldvalue.issue = jiraissue.id 
+	JOIN customfield ON customfieldvalue.customfield = customfield.id
+WHERE (customfieldtypekey ~ '$1' or customfieldsearcherkey ~ '$1')
+	AND (jiraissue.created > now() - '2 years'::interval OR jiraissue.updated > now() - '2 years'::interval) 
+ORDER BY resolution desc, jiraissue.updated desc, jiraissue.created desc; "
+
+echo "\\echo h3. Uses of the above custom fields on issues created/updated ever (limit 10, newest/unresolved first):"
+echo "select
+	cfname
+	, project.pkey || '-' || jiraissue.issuenum AS key
+	, jiraissue.created
+	, jiraissue.updated
+	, jiraissue.resolution
+FROM project JOIN jiraissue ON project.id = jiraissue.project
+	JOIN customfieldvalue ON customfieldvalue.issue = jiraissue.id 
+	JOIN customfield ON customfieldvalue.customfield = customfield.id
+WHERE (customfieldtypekey ~ '$1' or customfieldsearcherkey ~ '$1')
+ORDER BY resolution desc, jiraissue.updated desc, jiraissue.created desc
+LIMIT 10;"

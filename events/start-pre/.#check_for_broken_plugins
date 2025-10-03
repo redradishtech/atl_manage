@@ -1,0 +1,29 @@
+#!/bin/bash -eu
+
+install-pre() {
+	command -v unzip >/dev/null || apt-get install unzip
+}
+
+start-pre() {
+	foundbadplugin=false
+	for j in $(
+		shopt -s nullglob
+		echo $ATL_DATADIR/plugins/installed-plugins/{plugin-license-storage-plugin-2.*jar,*jira-calendar-plugin-2.*.jar,*.jira-watcher-field-2.6*.jar,base-hipchat-integration-plugin-*.jar,base-hipchat-integration-plugin-api-*.jar,hipchat-for-jira-plugin-*.jar}
+	); do
+		# In JIRA 7.7.1, the presence of (one? all?) of these jars, even disabled:
+		# base-hipchat-integration-plugin-7.8.29.jar
+		# base-hipchat-integration-plugin-api-7.8.29.jar
+		# hipchat-for-jira-plugin-7.8.29.jar
+		# caused plugin start failure:
+		# 2018-02-14 19:38:13,564 JIRA-Bootstrap INFO      [c.a.plugin.util.WaitUntil] Plugins that have yet to be enabled: (1): [com.atlassian.plugins.base-hipchat-integration-plugin], 31 seconds remaining
+		# due to missing deps.
+		warn "Evil plugin present: $j  Please ensure it is at least disabled (but preferably removed) in the database:"
+		pluginkey=$(unzip -p $j atlassian-plugin.xml | grep -oP '(?<=atlassian-plugin key=")[^"]+')
+		warn "echo \"insert into pluginstate (pluginkey, pluginenabled) values ('$pluginkey', false);\" | atl_psql"
+		foundbadplugin=true
+	done
+	#$foundbadplugin && sleep 1
+}
+
+# shellcheck source=/opt/atl_manage/events/start-pre/../.run.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/../.run.sh

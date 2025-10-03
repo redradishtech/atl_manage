@@ -1,0 +1,33 @@
+#!/bin/bash -eu
+# Custom script to take a thread dump. Usually triggered on restart by systemd to identify causes of hangs. Thread dumps on restart can be suppressed by creating the .no_threaddump_on_restart marker file
+
+MARKERFILE="${ATL_APPDIR}/.no_threaddump_on_restart"
+if [[ "${ATL_ROLE}" = prod ]]; then PRODSERVER=prod; fi
+
+if [[ $* =~ -h ]]; then
+	echo >&2 "Purpose: Takes a thread dump of the ${ATL_SHORTNAME} app."
+	echo >&2 "Usage: atl_threaddump [--exit]"
+	echo >&2
+	echo >&2 "Where:"
+	echo >&2 "  --exit	indicates atl_threaddump is being invoked on Java exit. Thread dumps can be prevented by touching marker file $MARKERFILE ($([[ -f $MARKERFILE ]] && echo "currently present" || echo "currently missing"). Thread dumps will only be made on production servers ($([[ -v PRODSERVER ]] && echo "as this server is" || "this server isn't")), i.e. where ${ATL_SHORTNAME} was last deployed with atl_install role 'prod'"
+	echo >&2
+	echo >&2 "Thread dump, if taken, will be written to ${ATL_APPDIR}/${ATL_TOMCAT_SUBDIR}logs/catalina.out"
+	exit 1
+fi
+
+threaddump() {
+	# FIXME: use $(atl_ps). In fact kill -3 is an inferior way of taking a thread dump generally (vs. jcmd <pid> Thread.print or jstack) because it can't pass the -e or -l options that show locks. See what atl_diagnostic_snapshot does instead
+	ps axwu | grep [j]ava.*"${ATL_APPDIR}".*org.apache.catalina.startup.Bootstrap | awk '{print $2}' | xargs --no-run-if-empty kill -3
+}
+
+if [[ $* =~ --exit ]]; then
+	if [[ ! -f $MARKERFILE ]]; then
+		if [[ -v PRODSERVER ]]; then
+			echo "Taking routine shutdown thread dump:"
+			threaddump
+			sleep 3 # If the JVM is really hosed, it won't respond fast enough to the kill -3 before systemd kills it, hence this sleep.
+		fi
+	fi
+else
+	threaddump
+fi

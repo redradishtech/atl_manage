@@ -1,0 +1,136 @@
+#!/bin/bash -eu
+# Calls scripts in $ATL_MANAGE/events/$event/* for the indicated event (install-pre, uninstall-post, start-pre, stop-post, etc).
+#
+# Storing logic in events/ directories lets us make snippets dependent on hg patchqueue status. Each events/ directory may have a .getcommands script which returns a list of commands in its directory, sorted appropriately for the event. In particular, 'install-pre' and 'uninstall-post' events return a subset of commands relating to the currently-applied hg patchqueue. This means that if a feature like replication is disabled (hg patch guarded), then the events/install-pre/replication script isn't run.
+#
+# See also ../events/README
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+PATH="$ATL_MANAGE/lib/requiresort:$PATH"
+
+main() {
+	if (($# == 0)) || [[ $1 =~ --help ]]; then usage; fi
+
+	local event="$1"
+	shift
+
+	local eventscriptnames=()
+	# Everything up to the -- (if present) is specifying a script within the event. This loop leaves $@ as just the args, later passed to every eventscript
+	while [[ $# -gt 0 ]]; do
+		if [[ $1 = -- ]]; then
+			shift
+			break
+		fi
+		eventscriptnames+=("$1")
+		shift
+	done
+
+	log "Event: $event"
+	debug "	eventscripts: ${eventscriptnames[*]:-}, args: $*"
+
+	export ATL_EVENT="$event"                                                    # Inform event-agnostic scripts like atl_diagnostic_snapshot of the event through ATL_EVENT
+	[[ -d $ATL_MANAGE/events/$event || -d $ATL_APPDIR/events/$event ]] || exit 0 # If an event doesn't exist, ignore it. E.g. 'start-post' is run from the systemd startup script despite not (currently) existing
+	#error "'$event' is not a valid event: no $ATL_MANAGE/events/$event/ directory found"
+
+	scripts=()
+	if [[ $# -gt 0 && $1 = --help ]]; then usage_event "$event"; fi
+
+	# Say we have an empty array foo=() :
+	# In bash 5.x, "${foo[@]}" expands to nothing (not '')
+	# In bash 4.3.48 "${foo[@]}" results in 'foo[@]: unbound variable'
+	# This is really annoying. We want bash 5's behaviour.
+	# When bash 5 can be assumed, drop the else clause
+	if ((${#eventscriptnames[@]})); then
+		get_scripts_for_event "$event" "$ATL_MANAGE/events" "${eventscriptnames[@]}"
+		get_scripts_for_event "$event" "$ATL_APPDIR/events" "${eventscriptnames[@]}"
+	else
+		get_scripts_for_event "$event" "$ATL_MANAGE/events"
+		get_scripts_for_event "$event" "$ATL_APPDIR/events"
+	fi
+
+	for script in $(echo "${scripts[@]:-}" | sort); do
+		[[ -f "$script" ]] || continue # Ignore directories
+		log "============================= $event » $(basename "$script") $* ================================"
+		# FIXME: if the scripts are property written, couldn't we source them rather than invoke a subshell? It would avoid re-parsing lib/common.sh each time.
+		# Bizarrely, sourcing seems to be much slower
+		"$script" "$@"
+	done
+}
+
+get_scripts_for_event() {
+	local event="$1"
+	shift
+	local dir="$1"
+	shift
+	if [[ $# -gt 0 ]]; then
+		for script in "$@"; do
+			local eventscript="$dir/$event/$script"
+			shift
+			if [[ -f "$eventscript" ]]; then
+				scripts+=("$eventscript")
+			fi
+		done
+	elif [[ -x "$dir/$event/.getcommands" ]]; then
+		# 1/Sep/20: seems to work
+		#warn "Untested $dir/$event/.getcommands. Before: ${scripts[@]:-}"
+		scripts+=($(
+			shopt -s nullglob
+			for s in $(
+				cd "$dir/$event"
+				requiresort $("./.getcommands")
+			); do echo "$dir/$event/$s"; done
+		))
+		#warn "Untested $dir/$event/.getcommands. After: ${scripts[@]:-}"
+	else
+		#scripts+=($(shopt -s nullglob; echo "$dir/$event"/*))
+		# Note that if we ever need script ordering, we could use requiresort instead of echo:
+		scripts+=($(
+			shopt -s nullglob
+			requiresort "$dir/$event"/*
+		))
+	fi
+}
+
+# Runs a command that logs to catalina.out, extracts the new text from catalina.out and writes it to a file.
+# Useful for capturing thread dumps
+
+usage() {
+	log >&2 "Usage: event <event> [eventscript...]  [-- args]"
+	log >&2 "Eg:"
+	log >&2 "event install-post"
+	log >&2 "event install-post replication"
+	log >&2 "event install-post replication letsencrypt"
+	log >&2 "Events:"
+	for event in "$ATL_MANAGE"/events/*; do
+		local eventname="$(basename "$event")"
+		local eventdesc=
+		local eventusage=
+		if [[ -f $event/.description ]]; then
+			eventdesc=$(<"$event"/.description)
+		fi
+		if [[ -f $event/.usage ]]; then
+			eventusage=$(<"$event"/.usage)
+		fi
+		printf >&2 "\t%-20s %s %s\n" "$eventname" "$eventdesc" "$eventusage"
+	done
+	exit 1
+}
+
+usage_event() {
+	echo >&2 "Usage: $0 $event <command>"
+	echo >&2
+	echo >&2 "Where <command> is:"
+	echo >&2
+	if [[ -x "$ATL_MANAGE/events/$event/.getcommands" ]]; then
+		"$ATL_MANAGE/events/$event/.getcommands"
+	else
+		scripts=($(
+			shopt -s nullglob
+			echo "$ATL_MANAGE/events/$event"/*
+		))
+	fi
+	exit 2
+}
+
+main "$@"

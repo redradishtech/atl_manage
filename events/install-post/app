@@ -1,0 +1,75 @@
+#!/bin/bash -eu
+
+# Generic post-install tweaks
+# @require sql
+
+install-post() {
+
+	# Having deployed an instance, generate a version-specific .env so that cron scripts installed by subsequent patches can be informed of app information
+	. "$ATL_MANAGE/lib/profile.sh"
+	atl_freeze
+	case "$ATL_PRODUCT" in
+	confluence)
+		cfgfile="$ATL_DATADIR"/confluence.cfg.xml
+		if [[ -f $cfgfile ]]; then
+			if grep -qF '<property name="hibernate.c3p0.max_size">30</property>' "$cfgfile"; then
+				log "Increasing Confluence c3p0 database connection pool size from 30 to 60 connections, since 40 is not enough to support the default 48 Tomcat HTTP threads."
+				perl -i -pe 's,<property name="hibernate.c3p0.max_size">30</property>,<property name="hibernate.c3p0.max_size">60</property>,' "$cfgfile"
+			fi
+		fi
+		;;
+	esac
+}
+
+upgrade-stopped-pre() {
+	# Generate a .env for the new deployment
+	. "$ATL_MANAGE/lib/profile.sh"
+	atl_freeze
+}
+
+upgrade-running-pre() {
+	check_no_database_views() {
+		# https://dataedo.com/kb/query/postgresql/list-tables-used-by-a-view
+		local sql
+		sql="select u.view_schema as schema_name,
+		       u.view_name,
+		       u.table_schema as referenced_table_schema,
+		       u.table_name as referenced_table_name
+		from information_schema.view_table_usage u
+		join information_schema.views v 
+		     on u.view_schema = v.table_schema
+		     and u.view_name = v.table_name
+		where u.table_schema not in ('information_schema', 'pg_catalog')
+		and u.table_schema in ('public')
+		-- Hack: don't break for tables unlikely to change. 
+		and u.table_name not in ('customfield', 'customfieldvalue', 'issuetype', 'jiraissue', 'project', 'resolution', 'issuestatus', 'issuelink', 'worklog', 'changegroup', 'changeitem', 'priority', 'pluginhashes', 'pluginshortnames', 'app_user', 'cwd_user', 'content', 'content_label', 'label', 'spaces', 'bodycontent')
+		order by u.view_schema,
+		u.view_name;"
+		out="$(atl_psql -tAqc "$sql")"
+		if [[ -n "$out" ]]; then
+			if [[ $ATL_ROLE = standby ]]; then
+				log "We have SQL views defined that could interfere with DML, but as we're a read-only standby we ignore them"
+			else
+				atl_psql -qc "$sql"
+				fail "We have views (above) defined on tables, and cannot proceed with the upgrade until they are dropped"
+			fi
+		fi
+	}
+
+	saveplugins() {
+		if [[ $ATL_ROLE =~ prod ]]; then
+			if [[ ! -f "$ATL_PLUGINDATA_JSON" || -z $(find "$ATL_PLUGINDATA_JSON" -mtime -1) ]]; then
+				log "No saved plugin data at $ATL_PLUGINDATA_JSON"
+				log "Please save it elsewhere or do it here now:"
+				atl_plugins --save
+			fi
+		fi
+	}
+
+	[[ $ATL_PRODUCT =~ (jira|confluence|crowd|fisheye) ]] || return 0 # Only do this stuff for atlassian apps
+	check_no_database_views
+	saveplugins
+}
+
+# shellcheck source=/opt/atl_manage/events/install-post/.common.sh
+. "$(dirname "$(readlink -f ${BASH_SOURCE[0]})")"/.common.sh

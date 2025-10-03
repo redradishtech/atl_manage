@@ -1,0 +1,192 @@
+#!/bin/bash -eu
+## Installs AdoptOpenJDK or Oracle JDK as appropriate, and sets it to be the default using Debian's update-alternatives mechanism.
+
+## FIXME: add the man pages, as per https://askubuntu.com/questions/56104/how-can-i-install-sun-oracles-proprietary-java-jdk-6-7-8-or-jre
+
+set -o pipefail
+shopt -s lastpipe
+
+# shellcheck source=/opt/atl_manage/lib/common.sh
+source "$ATL_MANAGE/lib/common.sh" --nolog
+
+main() {
+	java_provider=
+	java_version=
+	validate_specified_java
+	case "$java_provider" in
+		openjdk)
+			pkginstall "openjdk-$java_version-jdk"
+			;;
+		azul)
+			update-java-alternatives -l zulu-8-amd64 &>/dev/null || {
+				cd /tmp
+				curl -LOJ 'https://cdn.azul.com/zulu/bin/zulu8.78.0.19-ca-jdk8.0.412-linux_amd64.deb'
+				dpkg -i zulu8.78.0.19-ca-jdk8.0.412-linux_amd64.deb
+			}
+			;;
+	esac
+	#update-java-alternatives --set "java-1.11*"
+}
+
+validate_specified_java() {
+	if [[ $ATL_PRODUCT_RUNTIME_TECHNOLOGY =~ ^java-(.+)-([0-9\.]+)$ ]]; then
+		java_provider="${BASH_REMATCH[1]}"
+		java_version="${BASH_REMATCH[2]}"
+		debug "Installing Java from $java_provider, version $java_version"
+	else
+		fail "Invalid ATL_PRODUCT_RUNTIME_TECHNOLOGY '$ATL_PRODUCT_RUNTIME_TECHNOLOGY'. It is expected to be of the form 'java-PROVIDER-VERSION', e.g. 'java-openjdk-11'. "
+	fi
+
+}
+
+adoptopenjdk() {
+	if command -v java >/dev/null && java -version |& grep -q "OpenJDK.*${java_version}"; then
+		log "AdoptOpenJDK ${java_version} already installed"
+		return
+	fi
+
+	if all_apps_openjdk_compatible; then
+		atl_maintenance check
+		pkginstall adoptopenjdk-${java_version}-hotspot
+		pkguninstall adoptopenjdk-8-jdk
+		update-java-alternatives -s adoptopenjdk-${java_version}-hotspot-amd64
+		java -version
+	else
+		install_oraclejdk
+	fi
+}
+
+all_apps_openjdk_compatible() {
+
+	warn "We're ASSUMING all apps are now openjdk compatible."
+	return
+	# FIXME: We will typically have profiles existing that aren't meant to be run on this server, and can't be reliably sourced.
+	find "$ATL_PROFILEDIR" -mindepth 1 -maxdepth 1 -type f -not -name ".*" | while read -r profilepath; do
+		profile=$(basename "$profilepath")
+		if openjdk_compatible "$profile"; then
+			log "✓     OpenJDK compatible: $profile "
+		else
+			log "✗ not OpenJDK compatible: $profile "
+			return 1
+		fi
+	done
+	return 0
+}
+
+openjdk_compatible() {
+	local app="$1"
+	(
+		#shellcheck source=/opt/atl_manage/lib/profile.sh
+		. "$ATL_MANAGE/lib/profile.sh"
+		_atl_profile load "$app"
+		VER=$ATL_VER
+		VMAJOR=${VER%%.*}
+		VPATCH=${VER##*.}
+		VMINOR=${VER#${VMAJOR}.}
+		VMINOR=${VMINOR%%.${VPATCH}}
+
+		if [[ $ATL_PRODUCT_FULL = "jira-servicedesk" ]]; then
+			warn "FIXME: What version of JSD is OpenJDK compatible?? Here we assume 4.1.0+ is"
+			! version_lessthan "$ATL_VER" 4.1.0
+		elif [[ $ATL_PRODUCT = jira ]]; then
+			! version_lessthan "$ATL_VER" 7.7.13
+		elif [[ $ATL_PRODUCT = confluence ]]; then
+			! version_lessthan "$ATL_VER" 6.13.0
+		else
+			false # Everything else we assume is incompatible
+		fi
+
+	)
+	return $?
+}
+
+# Install AdoptOpenJDK without the PPA (pre-May 2019)
+install_adoptopenjdk_manual() {
+	local tmpdir
+	tmpdir="$(tmpdir)"
+	# Find the latest OpenJDK 8 LTS at https://adoptopenjdk.net/releases.html#x64_linux
+	jdkver="8u232-b09"
+	sha256sum="7b7884f2eb2ba2d47f4c0bf3bb1a2a95b73a3a7734bd47ebf9798483a7bcc423"
+	url="https://github.com/AdoptOpenJDK/openjdk8-binaries/releases/download/jdk$jdkver/OpenJDK8U-jdk_x64_linux_hotspot_${jdkver/-/}.tar.gz"
+	tgz="$(basename $url)"
+
+	jdkdir_direct=/usr/lib/jvm/jdk$jdkver
+	jdkname=java-8-adoptopenjdk
+	jdkdir=/usr/lib/jvm/$jdkname
+
+	set -x
+	if [[ $(readlink /etc/alternatives/java) =~ adoptopenjdk ]]; then
+		log "AdoptOpenJDK already installed and in use"
+		exit
+	fi
+
+	if [[ ! -f $tmpdir/$tgz ]]; then
+		cd "$tmpdir"
+		curl -LOJ "$url"
+	else
+		log "JDK already downloaded"
+	fi
+
+	sha256sum -c <(echo "$sha256sum $tmpdir/$tgz")
+
+	if [[ ! -d $jdkdir_direct ]]; then
+		install -d -m 655 /usr/lib/jvm
+		tar xf "$tmpdir/$tgz" -C /usr/lib/jvm
+		[[ -d $jdkdir_direct ]] || error "Strange, directory $jdkdir_direct was not present after uncompressing $tgz"
+		log "Uncompressaed"
+	else
+		log "JDK already installed (at $jdkdir_direct)"
+	fi
+
+	ln -sf $jdkdir_direct $jdkdir
+
+	jinfo=/usr/lib/jvm/.$jdkname.jinfo
+	cat >$jinfo <<EOF
+name=$jdkname
+alias=$jdkname
+
+priority=1081
+section=main
+
+EOF
+
+	for path in $jdkdir/bin/*; do
+		fname=$(basename $path)
+		sudo update-alternatives --install /usr/bin/$fname $fname $path 1081
+		echo "jdk $fname $path" >>$jinfo
+	done
+
+	pkginstall java-common
+	update-java-alternatives -s java-8-adoptopenjdk
+
+	/usr/bin/java -version |& grep -q 1\.8\.0
+
+	pkguninstall oracle-java8-set-default
+
+	cat >/etc/profile.d/jdk.sh <<EOF
+# Set JAVA_HOME, which is needed for apps like JIRA/Confluence.
+export J2SDKDIR=$jdkdir
+export J2REDIR=$jdkdir/jre
+export PATH=\$PATH:$jdkdir/bin:$jdkdir/db/bin:$jdkdir/jre/bin
+export JAVA_HOME=$jdkdir
+export DERBY_HOME=$jdkdir/db
+EOF
+
+	# Cleanup
+	rm "$tmpdir/$tgz"
+}
+
+install_oraclejdk() {
+	if ! command -v java >/dev/null; then
+		if ! apt-cache policy | grep -q webupd8team; then
+			$SUDO add-apt-repository ppa:webupd8team/java
+			$SUDO apt-get update
+		fi
+		# https://askubuntu.com/questions/190582/installing-java-automatically-with-silent-option
+		echo debconf shared/accepted-oracle-license-v1-1 select true | $SUDO debconf-set-selections
+		echo debconf shared/accepted-oracle-license-v1-1 seen true | $SUDO debconf-set-selections
+		$SUDO apt-get install -y oracle-java8-installer
+	fi
+}
+
+main "$@"

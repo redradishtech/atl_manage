@@ -1,0 +1,29 @@
+#!/bin/bash -eu
+
+case "$ATL_DATABASE_TYPE" in
+	postgresql)
+		xtn=postgres
+		export PGUSER="$ATL_DATABASE_USER"
+		export PGPASSWORD="$ATL_DATABASE_PASSWORD"
+		export PGHOST="$ATL_DATABASE_HOST"
+		export PGPORT="$ATL_DATABASE_PORT"
+		export PGDATABASE="$ATL_DATABASE"
+		;;
+	mysql|mariadb)
+		xtn=mysql
+		db="${ATL_TENANT:-$ATL_SHORTNAME}"
+		# https://duckdb.org/docs/stable/core_extensions/mysql.html
+		export MYSQL_USER="$ATL_DATABASE_USER"
+		export MYSQL_PWD="$ATL_DATABASE_PASSWORD"
+		export MYSQL_HOST="$ATL_DATABASE_HOST"
+		export MYSQL_TCP_PORT="$ATL_DATABASE_PORT"
+		export MYSQL_DATABASE="$ATL_DATABASE"
+		;;
+esac
+set -x
+duckdb -init <(
+echo "INSTALL $xtn;
+LOAD $xtn;
+ATTACH '' AS \"$db\" (TYPE $xtn);
+-- USE \"$db\";
+") "$@"

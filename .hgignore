@@ -1,0 +1,22 @@
+node-v8*
+monitoring/cli/.*.pyc$
+^venv/
+^.rbenv/versions
+^.rbenv/test
+^lib/sdkman
+^.hgext/hg-prompt/.*.pyc$
+^lib/jsonlogutils/lib/jo
+^lib/jsonlogutils/.git
+^diagnostics/.redo
+^\.links2
+(^|/)\.git(/|$)
+(^|/)\.jj(/|$)
+.*/\.links2
+\.redo
+lib/jira-user-deactivator-groovy/
+.devbox
+\.idea
+# We don't want to reinstall lib/redo every time, but ignore .pyc files
+^lib/redo/.*\.pyc
+devbox.lock
+\.gitignore

@@ -1,0 +1,14 @@
+.hg/
+venv/
+.rbenv/versions
+.rbenv/test
+lib/sdkman/
+*.pyc
+lib/jsonlogutils/lib/jo
+lib/jsonlogutils/.git
+diagnostics/.redo
+.links2
+.redo
+.devbox
+devbox.lock
+.idea
