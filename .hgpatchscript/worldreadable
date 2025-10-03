@@ -1,5 +1,9 @@
 #!/bin/bash -eu
 
+shopt -s globstar dotglob
+
+
+
 # I'm pretttty sure we can assume PWD is the hg repo's directory, but it would be pretty disastrous if this were not the case. Leave this check in here for a few years.
 if [[ $(basename "$(pwd)") = atl_manage && -d .hg ]]; then
 	# Everything should be owned by root, rather than whatever used did the checkout. The practical reason for this is that if root tries to run a hg command, and .hg/hgrc isn't owned by root, hg throws a 'not trusting file' error. This happens e.g. when the start-pre event runs atl_check_appdeployment as root, which then runs hg commands in $ATL_MANAGE and $ATL_PROFILEDIR. The 'sudo' group then allows admins to see $ATL_PROFILEDIR (root or 'sudo -sE' required to modify)
@@ -8,7 +12,8 @@ if [[ $(basename "$(pwd)") = atl_manage && -d .hg ]]; then
 	chmod -R ug+rw .
 	setfacl -R -m o:rX .
 	# Make o+rX the default, so editing files (prior to a commit that triggers the above setfacl) doesn't instantly break validateperms_nagioscheck
-	setfacl -R -d -m o:rX .
+	# Edit: don't set the default ACL, as this causes bin/atl_upgrade.sh to become +x
+	#setfacl -R -d -m o:rX .
 	# isso wants read access to everything in lib
 	if [[ -d venv/lib ]]; then
 		# venv/lib is created by atl_setup
