@@ -187,7 +187,7 @@ replace_tokens() {
 		# If there are none of those, then the greedy regex matches expressions like '%{ATL_FOO:+Got %{ATL_FOO}}'
 		# We couldn't put the greedy regex first or '%{ATL_FOO} %{ATL_FOO}' would match as 'ATL_FOO} %{ATL_FOO'
 		# This ordering means that if simple and nested expressions are present on a single line, our loop will first process the simple ones, then the nested.
-		while [[ "$line" =~ %\{(ATL_[A-Za-z_0-9:+ \?\/%#-]*)\} || "$line" =~ %\{(ATL_.*)\} ]]; do
+		while [[ "$line" =~ %\{(ATL_[A-Za-z_0-9:+ \?\/%#\\.-]*)\} || "$line" =~ %\{(ATL_.*)\} ]]; do
 			fullvar="${BASH_REMATCH[0]}" # E.g. '%{ATL_VER}'
 			var="${BASH_REMATCH[1]}"     # e.g. 'ATL_VER'
 

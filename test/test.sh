@@ -80,6 +80,8 @@ test_replacetokens()
 	verify_equals '%{ATL_BASEURL##*://}' 'foobar'
 	export ATL_MULTITENANT=true
 	export ATL_FQDN=foo.example.com
+	verify_equals '%{ATL_FQDN//\./\\.}' 'foo\.example\.com'
+	verify_equals '%{ATL_FQDN//\./\\.} ${ignored}' 'foo\.example\.com ${ignored}'
 	verify_equals '%{ATL_MULTITENANT:+$pool}.%{ATL_FQDN}'	'$pool.foo.example.com'   # Note that $pool is not evaluated. Often our template is generating bash code, where $pool is evaluated later.
 }
 
