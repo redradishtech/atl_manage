@@ -47,7 +47,7 @@ invoiceninja=(app/.env app/storage app/public/logo)
 jethro=(app/conf.php app/index.php app/include/version.txt congregation_attendance_group_refresher/* lastlogins/*.service app/include/user_system.class.php)
 fisheye=(config.xml)
 php_apps=(php/*.conf php/README php/*.snippet)
-for file in bin/!(*.tar.gz|*.jar|*.bat|*.exe*|*.txt|*.dll*) "${ATL_TOMCAT_SUBDIR}"bin/*.sh "${ATL_TOMCAT_SUBDIR}"conf/**/*.xml apache2/*.conf apache2/conf.d/*.conf apache2/*.pem nginx/*.conf systemd/*.service replication/*.service backups/*.{conf,cron,healthcheck,nagioscheck.sh} monitoring/* monitoring/bin/* monitoring/.eventhandler replication/*.cron replication/lsyncd.conf "${ATL_TOMCAT_SUBDIR}"conf/*.cron isso-public-comments/isso.conf local/isso.js emailprocessing/* cloudflare/cloudflare_origin_cert/* letsencrypt/secrets/*.ini oomhandler/* "${invoiceninja[@]}" "${php_apps[@]}" "${jethro[@]}" "${fisheye}"; do
+for file in bin/!(*.tar.gz|*.jar|*.bat|*.exe*|*.txt|*.dll*) "${ATL_TOMCAT_SUBDIR}"bin/*.sh "${ATL_TOMCAT_SUBDIR}"conf/**/*.xml apache2/*.conf apache2/conf.d/*.conf apache2/*.pem nginx/*.conf nginx/conf.d/*.conf systemd/*.service replication/*.service backups/*.{conf,cron,healthcheck,nagioscheck.sh} monitoring/* monitoring/bin/* monitoring/.eventhandler replication/*.cron replication/lsyncd.conf "${ATL_TOMCAT_SUBDIR}"conf/*.cron isso-public-comments/isso.conf local/isso.js emailprocessing/* cloudflare/cloudflare_origin_cert/* letsencrypt/secrets/*.ini oomhandler/* "${invoiceninja[@]}" "${php_apps[@]}" "${jethro[@]}" "${fisheye}"; do
 	if [[ -L "$file" ]]; then
 		ref="$(readlink "$file")" # E.g. file 'app/storage' in invoiceninja references '%{ATL_DATADIR}/storage'
 		newref="$(echo "$ref" | replace_tokens)"
