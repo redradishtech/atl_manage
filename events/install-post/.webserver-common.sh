@@ -39,6 +39,7 @@ install_webserver_listener() {
 				}
 		fi
 	elif [[ $ATL_WEBSERVER = nginx ]]; then
+		nginx -t
 		if [[ ! -v ATL_WEBSERVER_NGINX_CONFIGURED ]]; then
 			error "FIXME: Please manually configure nginx to listen on $INTERNAL_HOSTNAME:80 (in addition to the defaults), or set ATL_WEBSERVER_NGINX_CONFIGURED if this has been done"
 		fi
