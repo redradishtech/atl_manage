@@ -106,6 +106,10 @@ main() {
 		superuser=true
 		mysqlargs=(-e "alter user '$ATL_DATABASE_USER'@'$ATL_DATABASE_HOST' identified by '$ATL_DATABASE_PASSWORD' \p; flush privileges; \p;")
 		;;
+	atl_mysql_user_unixauthset)
+		superuser=true
+		mysqlargs=(-e "alter user '$ATL_DATABASE_USER'@'$ATL_DATABASE_HOST' identified with unix_socket \p; flush privileges; \p;")
+		;;
 	*)
 		fail "Unhandled command: $(basename "$0")"
 		;;
