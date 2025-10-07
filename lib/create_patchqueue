@@ -1334,10 +1334,10 @@ push_patches_upstream() {
 
 apply_patchscripts() {
 	assert_state "" "$workingcopy"
-	for patch in "$(hg -q qseries)"; do
+	for patch in $(hg -q qseries); do
 		ps=".hgpatchscript/$patch"
 		if [[ -f $ps ]]; then
-			. "$ps"
+			. "$ps" || :  # Will fail e.g. .hgpatchscript/app chmods .env which doesn't exist yet.
 		fi
 	done
 }
