@@ -103,6 +103,7 @@ main() {
 	warn_if_local_patch_not_merged
 	[[ $nopush ]] || push_patches_upstream # Push all patchqueue mods upstream
 	apply_patchscripts					# Unless rebasing, we may not have applied the .hgpatchscript/* scripts that clean up permissions. Do so now
+	generate_hgignore					# Coalesce .hgignore.d/* into .hgignore (which is itself .hgignored so this doesn't affect hg)
 	assert_state "" "$workingcopy"
 }
 
@@ -1340,6 +1341,13 @@ apply_patchscripts() {
 			. "$ps" || :  # Will fail e.g. .hgpatchscript/app chmods .env which doesn't exist yet.
 		fi
 	done
+}
+
+# Coalesce .hgignore.d/* into .hgignore and .gitignore, so jujutsu and hg don't complain about patchqueue files
+generate_hgignore() {
+	assert_state "" "$workingcopy"
+	cat .hgignore.d/* >> .hgignore
+	cat .hgignore.d/* >> .gitignore
 }
 
 # Transient guards complicate things - disabled until a really good use-case presents
