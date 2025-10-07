@@ -372,6 +372,7 @@ mercurialize() {
 			echo ".idea"
 			echo ".jj"
 		} | if [[ -d app ]]; then cat - >> app/.gitignore; else cat - >> .gitignore; fi
+		#
 		hg -q init >&2
 		[[ ! -d .git ]] || fail "What?? Why would there ever be a .git directory here, in $PWD, and not in $PWD/app/.git (if any)?"
 		[[ ! -f .hgignore ]] || fail "Unexpected .hgignore"
@@ -394,7 +395,6 @@ mercurialize() {
 			echo "app/.devbox"
 			echo "app/.idea"
 		} > .hgignore
-		# Also create a .gitignore for the sake of jujutsu. If the app has a .gitignore it will be in app/
 
 		hg -q commit -X app/.git --addremove -m "Clean deployment" >&2
 		mv "$tmp" "$cache"
