@@ -4,6 +4,8 @@ set -o pipefail
 
 main() {
 	[[ $ATL_DATABASE_TYPE = mysql ]] || { fail "Database type is '$ATL_DATABASE_TYPE'; Not running atl_mysql $*" && exit; }
+	local superuser quiet var mysqlcmd mysqlargs
+
 	superuser=false
 	quiet=true
 
@@ -26,7 +28,6 @@ main() {
 		*) break ;;
 		esac
 	done
-
 	declare -A cmdmap
 	case "$(basename "$0")" in
 		atl_mysql_createuser) warn "In future please use 'atl_mysql_user_create'";;
@@ -36,7 +37,6 @@ main() {
 		atl_mysql_dropuser) warn "In future please use 'atl_mysql_user_drop'";;
 		atl_mysql_rename) warn "In future please use 'atl_mysql_sql_rename'";;
 	esac
-
 
 	mysqlcmd=mariadb
 	case "$(basename "$0")" in
@@ -66,7 +66,14 @@ main() {
 		;;
 	atl_mysql_user_create | atl_mysql_createuser)
 		superuser=true
-		mysqlargs=(-e "CREATE USER IF NOT EXISTS '$ATL_DATABASE_USER'@'$ATL_DATABASE_HOST' identified by '$ATL_DATABASE_PASSWORD';  GRANT ALL PRIVILEGES on \`${ATL_DATABASE:?}\`.* to '$ATL_DATABASE_USER'@'$ATL_DATABASE_HOST'  \p;")
+		local sql="CREATE USER IF NOT EXISTS '$ATL_DATABASE_USER'@'$ATL_DATABASE_HOST' "
+		if [[ -v ATL_DATABASE_PROTOCOL && $ATL_DATABASE_PROTOCOL = socket ]]; then
+			sql+="identified with unix_socket; "
+		else
+			sql+="identified by '$ATL_DATABASE_PASSWORD'; "
+		fi
+		sql+="GRANT ALL PRIVILEGES on \`${ATL_DATABASE:?}\`.* to '$ATL_DATABASE_USER'@'$ATL_DATABASE_HOST'  \p;"
+		mysqlargs=(-e "$sql")
 		;;
 	atl_mysql_drop | atl_mysql_dropdb)
 		superuser=true
@@ -114,36 +121,57 @@ main() {
 		fail "Unhandled command: $(basename "$0")"
 		;;
 	esac
-	TMP_CNF="$(mktemp)"
-	trap 'rm -f "$TMP_CNF"' EXIT TERM
-	cat > "$TMP_CNF" <<-EOF
-	# Generated for a temporary $mysqlcmd invocation, $(date)
-	[client]
-	# Note that if host is 'localhost' then MySQL uses a socket where possible even if protocol=tcp is specified
-	protocol=tcp
-	host=$ATL_DATABASE_HOST
-	port=$ATL_DATABASE_PORT
-	EOF
-	# Set password as env var rather than --password to stop MySQL complaining. https://www.codingwithjesse.com/blog/mysql-using-a-password-on-the-command-line-interface-can-be-insecure/
-	if $superuser; then
-		#export MYSQL_PWD="$ATL_DATABASE_SUPERPASSWORD"
-		cat >> "$TMP_CNF" <<-EOF
-		user=$ATL_DATABASE_SUPERUSER
-		password='$ATL_DATABASE_SUPERPASSWORD'
-		EOF
-	else
-		#export MYSQL_PWD="$ATL_DATABASE_PASSWORD"
-		cat >> "$TMP_CNF" <<-EOF
-		user=$ATL_DATABASE_USER
-		password='$ATL_DATABASE_PASSWORD'
-		EOF
-	fi
 
-	# With mysql, later args take precedence over earlier ones. This is handy, as it means args like --database=abc or --protocol=socket can be specified, and will override the defaults set above.
-	# In the case of atl_mysql --super, ATL_DATABASE may be unset (as straight after ej_create).
-	# The --defaults-file overrides ~/.my.cnf which contains who-knows-what
-	mysqlcmd=("$mysqlcmd" "--defaults-file=$TMP_CNF" "${mysqlargs[@]}")
-	MYSQL_HISTFILE=~/.mysql_history-"${ATL_DATABASE:-}" "${mysqlcmd[@]}" "$@"
+	if ! $superuser && [[ -v ATL_DATABASE_PROTOCOL && $ATL_DATABASE_PROTOCOL = socket ]]; then
+		# Socket auth: run $mysqlcmd as $ATL_USER, relying on there being a working ~/.my.cnf for $ATL_USER.
+		# Note, --super only works via TCP currently.
+	
+		mysqlcmd=("$mysqlcmd" "${mysqlargs[@]}")
+		set -x
+		MYSQL_HISTFILE=~/.mysql_history-"${ATL_DATABASE:-}" runuser -u "$ATL_USER" -- "${mysqlcmd[@]}" "$@"
+	else
+		# TCP auth. Run as the current user, but with a hand-rolled .my.cnf containing all the settings
+
+		TMP_CNF="$(mktemp)"
+		trap 'rm -f "$TMP_CNF"' EXIT TERM
+		cat > "$TMP_CNF" <<-EOF
+		# Generated for a temporary $mysqlcmd invocation, $(date)
+		[client]
+		# Note that if host is 'localhost' then MySQL uses a socket where possible even if protocol=tcp is specified
+		host=$ATL_DATABASE_HOST
+		port=$ATL_DATABASE_PORT
+		ssl-verify-server-cert=off
+		EOF
+		# Set password as env var rather than --password to stop MySQL complaining. https://www.codingwithjesse.com/blog/mysql-using-a-password-on-the-command-line-interface-can-be-insecure/
+		if $superuser; then
+			#export MYSQL_PWD="$ATL_DATABASE_SUPERPASSWORD"
+			cat >> "$TMP_CNF" <<-EOF
+			user=$ATL_DATABASE_SUPERUSER
+			password='$ATL_DATABASE_SUPERPASSWORD'
+			EOF
+		else
+			echo >&2 "We are NOT superuser"
+			#export MYSQL_PWD="$ATL_DATABASE_PASSWORD"
+			{
+				if [[ -v ATL_DATABASE_USER ]]; then
+					echo "user=$ATL_DATABASE_USER"
+				else
+					echo "# ATL_DATABASE_USER was unset"
+				fi
+				if [[ -v ATL_DATABASE_PASSWORD ]]; then
+					echo "password='$ATL_DATABASE_PASSWORD'"
+				else
+					echo "# ATL_DATABASE_PASSWORD was unset"
+				fi
+			} | cat >> "$TMP_CNF"
+		fi
+
+		# With mysql, later args take precedence over earlier ones. This is handy, as it means args like --database=abc or --protocol=socket can be specified, and will override the defaults set above.
+		# In the case of atl_mysql --super, ATL_DATABASE may be unset (as straight after ej_create).
+		# The --defaults-file overrides ~/.my.cnf which contains who-knows-what
+		mysqlcmd=("$mysqlcmd" "--defaults-file=$TMP_CNF" "${mysqlargs[@]}")
+		MYSQL_HISTFILE=~/.mysql_history-"${ATL_DATABASE:-}" "${mysqlcmd[@]}" "$@"
+	fi
 }
 
 usage() {
