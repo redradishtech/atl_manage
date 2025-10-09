@@ -1453,7 +1453,9 @@ _atl_tenant_freeze() {
 	install -d -o root -g "$ATL_USER" -m 750 "$ATL_DATADIR/.env"
 	chmod g+s "$ATL_DATADIR/.env"
 	for v in $ATL_TENANT_SPECIFIC_VARS; do
-		echo "${!v}" >"$ATL_DATADIR"/.env/"$v"
+		if [[ -v "$v" ]]; then
+			echo "${!v}" >"$ATL_DATADIR"/.env/"$v"
+		fi
 	done
 	rm -f "$ATL_DATADIR"/.env/atl_env
 	# Unlike atl_freeze, we can't just symlink to $ATL_MANAGE/lib/atl_env, because we want to use --envdir twice to load our tenant .env/ATL_* and our app-wide .env/ATL_*
