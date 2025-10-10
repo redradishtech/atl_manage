@@ -127,7 +127,6 @@ main() {
 		# Note, --super only works via TCP currently.
 	
 		mysqlcmd=("$mysqlcmd" "${mysqlargs[@]}")
-		set -x
 		MYSQL_HISTFILE=~/.mysql_history-"${ATL_DATABASE:-}" runuser -u "$ATL_USER" -- "${mysqlcmd[@]}" "$@"
 	else
 		# TCP auth. Run as the current user, but with a hand-rolled .my.cnf containing all the settings
