@@ -127,7 +127,17 @@ main() {
 		# Note, --super only works via TCP currently.
 	
 		mysqlcmd=("$mysqlcmd" "${mysqlargs[@]}")
-		MYSQL_HISTFILE=~/.mysql_history-"${ATL_DATABASE:-}" runuser -u "$ATL_USER" -- "${mysqlcmd[@]}" "$@"
+		# We want the history file owned by the caller, not ATL_USER which may not have write access to its home dir.
+		export MYSQL_HISTFILE=$(mktemp)
+		permanent_histfile=~/.mysql_history-"${ATL_DATABASE:-}"
+		if [[ -f $permanent_histfile ]]; then
+			cp "$permanent_histfile" "$MYSQL_HISTFILE"
+		fi
+		chown "$ATL_USER" "$MYSQL_HISTFILE"
+		# Connect as ATL_USER so that it is the DEFINER for created db objects.
+		runuser -u "$ATL_USER" -- "${mysqlcmd[@]}" "$@"
+		cp "$MYSQL_HISTFILE" ~/.mysql_history-"${ATL_DATABASE:-}"
+		
 	else
 		# TCP auth. Run as the current user, but with a hand-rolled .my.cnf containing all the settings
 
