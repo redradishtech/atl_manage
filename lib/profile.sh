@@ -362,7 +362,6 @@ atl_load() {
 			_err "Please define ATL_PRODUCT_FULL"
 			return $?
 		}
-		echo "Checking what $ATL_PRODUCT_FULL matches"
 		case "$ATL_PRODUCT_FULL" in
 			jira-software) ;;
 			jira-core) ;;
@@ -666,14 +665,19 @@ atl_load() {
 			esac
 
 			_load_profile_defaults_database() {
-				ATL_DATABASE="${ATL_DATABASE:-$ATL_SHORTNAME}"
 				ATL_DATABASE_TYPE=${ATL_DATABASE_TYPE:-postgresql} # Could also be 'postgresql-rds'. As long as the value starts with 'postgresql' it is considered postgres-compatible, and scripts like atl_psql will work. The part after the '-' is chopped off for the purpose of evaluating strings like /var/lib/postgresql or jdbc:postgresql://..
-				ATL_DATABASE_USER=${ATL_DATABASE_USER:-$ATL_SHORTNAME}
+				if [[ ${ATL_MULTITENANT:-} = true ]]; then
+					ATL_DATABASE="${ATL_SHORTNAME_PREFIX:-je_}${ATL_TENANT}"
+					ATL_DATABASE_USER="$ATL_DATABASE"
+				else
+				  ATL_DATABASE="${ATL_DATABASE:-$ATL_SHORTNAME}"
+				  ATL_DATABASE_USER=${ATL_DATABASE_USER:-$ATL_SHORTNAME}
+				fi
 				if [[ -v ATL_DATABASE_PROTOCOL && $ATL_DATABASE_PROTOCOL = socket ]]; then
-				  : # user and password are not needed for socket
-        else
-				  ATL_DATABASE_PASSWORD=${ATL_DATABASE_PASSWORD:-setme:Please set ATL_DATABASE_PASSWORD. If none is set, a good random choice is $(pwgen -1s)}
-        fi
+					: # user and password are not needed for socket
+				else
+					ATL_DATABASE_PASSWORD=${ATL_DATABASE_PASSWORD:-setme:Please set ATL_DATABASE_PASSWORD. If none is set, a good random choice is $(pwgen -1s)}
+				fi
 				ATL_DATABASE_HOST=${ATL_DATABASE_HOST:-localhost}
 				# The external hostname of ATL_DATABASE_HOST. This is used by atlassian_documentationcopy.
 				#ATL_DATABASE_PRIMARY_HOST=
@@ -811,16 +815,22 @@ atl_load() {
 			esac
 
 			case "$ATL_PRODUCT_FULL" in
-			invoiceninja)
-				[[ ! -v ATL_USER || $ATL_USER = "www-data" ]] || { echo >&2 "ATL_USER must be 'www-data', not '$ATL_USER'. You can unset it to accept this default"; return 1; }
-				[[ ! -v ATL_GROUP || $ATL_GROUP = "www-data" ]] || { echo >&2 "ATL_GROUP must be 'www-data'. You can unset it to accept this default"; return 1; }
-				ATL_USER=www-data
-				ATL_GROUP=www-data
-				;;
-			*)
-				ATL_USER=${ATL_USER:-$ATL_SHORTNAME}
-				[[ -v ATL_GROUP ]] || ATL_GROUP="$(id -gn "$ATL_USER" 2>/dev/null)" || ATL_GROUP="$ATL_SHORTNAME"
-				;;
+				invoiceninja)
+					[[ ! -v ATL_USER || $ATL_USER = "www-data" ]] || { echo >&2 "ATL_USER must be 'www-data', not '$ATL_USER'. You can unset it to accept this default"; return 1; }
+					[[ ! -v ATL_GROUP || $ATL_GROUP = "www-data" ]] || { echo >&2 "ATL_GROUP must be 'www-data'. You can unset it to accept this default"; return 1; }
+					ATL_USER=www-data
+					ATL_GROUP=www-data
+					;;
+				*)
+					if [[ ${ATL_MULTITENANT:-} = true ]]; then
+						ATL_USER="${ATL_SHORTNAME_PREFIX:-je_}${ATL_TENANT}"
+						ATL_UID="$(id -u "$ATL_USER")" || unset ATL_UID   # If ATL_USER exists, assume it's ATL_UID is correct and set it. If the user doesn't exist the caller will be prompted to hardcode ATL_UID which will result in a new user with that UID being created.
+					else
+						ATL_USER=${ATL_USER:-$ATL_SHORTNAME}
+					fi
+					[[ -v ATL_GROUP ]] || ATL_GROUP="$(id -gn "$ATL_USER" 2>/dev/null)" || ATL_GROUP="$ATL_SHORTNAME"
+					ATL_GID="$(id -g "$ATL_GROUP")" || unset ATL_GID
+					;;
 			esac
 
 			ATL_SERVICES_USER=${ATL_SERVICES_USER:-$USER}
@@ -1604,7 +1614,7 @@ atl_grep() {
 # https://stackoverflow.com/questions/13588457/forward-declarations-in-bash
 
 # Export these functions so they can be inherited by subshells. This lets the caller write scripts that call e.g. 'atl_list' (or 'atl list'), which should work from subshells just like invoking an atl_* script would. EDIT: replaced by 'set -a'. EDIT: reinstated since 'set -a' breaks subshells after autocomplete
-export -f atl_freeze _atl_tenant_freeze atl_list atl_load atl_unload _atl_unset_vars _getprofilepath _atl_store_profile_timestamps _atl_setversion _atl_vars_sensitive
+export -f atl_freeze _atl_tenant_freeze atl_list atl_load atl_unload _atl_unset_vars _getprofilepath _atl_store_profile_timestamps _atl_setversion _atl_vars_sensitive _set_longname_and_tenant_from_path
 
 #alias atl_edit='source "$ATL_MANAGE"/bin/atl_editprofile'
 #alias atl_editprofile='source "$ATL_MANAGE"/bin/atl_editprofile'
