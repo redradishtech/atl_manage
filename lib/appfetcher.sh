@@ -231,8 +231,8 @@ fetcher_jethro_definitions() {
 				jj git fetch --remote jeff
 				jj bookmark track 'glob:push-*@jeff'
 				jj git remote add ej git@github.com:jefft/jethro-pmm-easyjethro.git
-				jj git fetch --remote ej
-				jj bookmark track 'glob:*@ej'
+				#jj git fetch --remote ej
+				#jj bookmark track 'glob:*@ej'
 				;;
 			*)
 				fail "Unexpected git origin url: $originurl"
