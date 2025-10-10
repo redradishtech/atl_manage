@@ -28,7 +28,6 @@ main() {
 		*) break ;;
 		esac
 	done
-	declare -A cmdmap
 	case "$(basename "$0")" in
 		atl_mysql_createuser) warn "In future please use 'atl_mysql_user_create'";;
 		atl_mysql_createdb) warn "In future please use 'atl_mysql_create'";;
