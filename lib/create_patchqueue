@@ -102,7 +102,9 @@ main() {
 	tag_cleanapplying_branches
 	warn_if_local_patch_not_merged
 	[[ $nopush ]] || push_patches_upstream # Push all patchqueue mods upstream
-	apply_patchscripts					# Unless rebasing, we may not have applied the .hgpatchscript/* scripts that clean up permissions. Do so now
+	# Note, we shouldn't apply .hgpatchscript/* to fix permissions, as we're likely generating an interim cache copy
+	# that might be reused by multiple actual deployments. Instead, .hgpatchscript/* is applied in
+	# atl_deploy#apply_patchscripts
 	generate_hgignore					# Coalesce .hgignore.d/* into .hgignore (which is itself .hgignored so this doesn't affect hg)
 	assert_state "" "$workingcopy"
 }
@@ -1331,16 +1333,6 @@ push_patches_upstream() {
 		# OBSOLETE: no longer doing this as we rm -rf our directory later when hg might stil be going."" using '& disown' to do it in the background without spamming us in output"
 		hg -q push --mq --new-branch &
 	fi
-}
-
-apply_patchscripts() {
-	assert_state "" "$workingcopy"
-	for patch in $(hg -q qseries); do
-		ps=".hgpatchscript/$patch"
-		if [[ -f $ps ]]; then
-			. "$ps" || :  # Will fail e.g. .hgpatchscript/app chmods .env which doesn't exist yet.
-		fi
-	done
 }
 
 # Coalesce .hgignore.d/* into .hgignore and .gitignore, so jujutsu and hg don't complain about patchqueue files

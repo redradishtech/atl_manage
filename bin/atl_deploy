@@ -287,11 +287,11 @@ jjpatchqueue() {
 			echo "Applied $(hg -q qtop)"
 		done || exit $?
 
-		jj new -m "Patchqueue" 
+		jj new
 		jj parallelize "$basereporoot..description('patch:_replacetokens')-" || :  # .. because $basereporoot is before the first patch
 		jj bookmark create -r @ master
 
-		jj -R app new -m "Patchqueue"
+		jj -R app new
 		jj -R app parallelize "$appreporoot::description('patch:_replacetokens')-" || :  # :: because $appreporoot is the first patch
 		jj -R app bookmark create -r @ patchqueued
 
@@ -669,6 +669,17 @@ install_runtime() {
 
 		fi
 	fi
+}
+
+apply_patchscripts() {
+	cd "$ATL_APPDIR"
+	local ps
+	while read -r first _; do
+		ps=.hgpatchscript/"$first"
+		if [[ -f $ps ]]; then
+			. "$ps" || :  # Will fail e.g. .hgpatchscript/app chmods .env which doesn't exist yet.
+		fi
+	done < .hg/patches/series
 }
 
 main "$@"
