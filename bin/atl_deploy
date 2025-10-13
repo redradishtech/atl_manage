@@ -633,7 +633,7 @@ install_runtime() {
 		if [[ $HOSTNAME = jturner-desktop ]]; then
 			warn "On jturner-desktop we are using the Ubuntu-default, non-ondrej PHP libraries. Ubuntu $(lsb_release -rs) is not?? LTS and ondrej only supports LTS"
 		else
-			[[ -f $(compgen -G /etc/apt/sources.list.d/ondrej-ubuntu-$ATL_WEBSERVER-$(lsb_release --short --codename).*) ]] || add-apt-repository ppa:ondrej/apache2
+			[[ -f $(compgen -G /etc/apt/sources.list.d/ondrej-ubuntu-$ATL_WEBSERVER-$(lsb_release --short --codename).*) ]] || add-apt-repository ppa:ondrej/$ATL_WEBSERVER
 			[[ -f $(compgen -G /etc/apt/sources.list.d/ondrej-ubuntu-php-$(lsb_release --short --codename).*) ]] || add-apt-repository ppa:ondrej/php
 		fi
 		pkginstall "$ATL_WEBSERVER"
@@ -659,8 +659,10 @@ install_runtime() {
 					pkginstall "${ATL_PRODUCT_RUNTIME_TECHNOLOGY%-fpm}-xdebug"
 				fi
 
-				# conf.d/debugging-logposts.conf now needs security2 to log POSTS
-				pkginstall libapache2-mod-security2
+				if [[ $ATL_WEBSERVER = apache2 ]]; then
+					# conf.d/debugging-logposts.conf now needs security2 to log POSTS
+					pkginstall libapache2-mod-security2
+				fi
 			else
 				log "WARNING: didn't install ${ATL_PRODUCT_RUNTIME_TECHNOLOGY%-fpm}-{zip,xml,curl,gd} as upstream repo is missing them"
 			fi
