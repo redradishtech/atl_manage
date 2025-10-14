@@ -636,7 +636,8 @@ install_runtime() {
 			[[ -f $(compgen -G /etc/apt/sources.list.d/ondrej-ubuntu-$ATL_WEBSERVER-$(lsb_release --short --codename).*) ]] || add-apt-repository ppa:ondrej/$ATL_WEBSERVER
 			[[ -f $(compgen -G /etc/apt/sources.list.d/ondrej-ubuntu-php-$(lsb_release --short --codename).*) ]] || add-apt-repository ppa:ondrej/php
 		fi
-		pkginstall "$ATL_WEBSERVER"
+
+		# pkginstall of ATL_WEBSERVER is done by $ATL_MANAGE/events/install-post/webserver-apache or $ATL_MANAGE/events/install-post/webserver-nginx
 		pkginstall "${ATL_PRODUCT_RUNTIME_TECHNOLOGY}" # e.g. php7.4-fpm
 		a2enmod proxy_fcgi
 		# Particular PHP apps may want other packages, like php7.4-mysql. We don't yet have a well-defined place to install those. atl_setup? It hasn't historically been app-specific. Here? Perhaps. For InvoiceNinja we pkginstall some PHP deps in $ATL_APPDIR/events/install-post/generalsettings
