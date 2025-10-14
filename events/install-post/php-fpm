@@ -10,7 +10,7 @@ install-post() {
 
 		srcfile="$ATL_APPDIR/php/php-fpm-pool.conf"
 		destdir="/etc/php/$phpver/fpm/pool.d"
-		destfile="$destdir/$ATL_SHORTNAME.conf"
+		destfile="$destdir/$ATL_APPDOMAIN.conf"
 
 		[[ -f "$srcfile" ]] || fail "Missing '$srcfile'"
 		[[ -d $destdir ]] || fail "Missing '$destdir'. This is expected to have been provided by the ${ATL_PRODUCT_RUNTIME_TECHNOLOGY} Debian package"

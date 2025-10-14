@@ -53,11 +53,11 @@ install-post() {
 uninstall-pre() {
 	set -euo pipefail
 	disable_webserver_site() {
-		symlink=/etc/nginx/sites-enabled/"$ATL_LONGNAME".conf
+		symlink=/etc/nginx/sites-enabled/"$ATL_APPDOMAIN".conf
 		if [[ -e $symlink ]]; then
 			if [[ ! -L $symlink ]]; then error "'$symlink' is unexpectedly not a symlink"; fi
 			log "Removing symlink $symlink"
-			rm /etc/nginx/sites-enabled/"$ATL_LONGNAME".conf
+			rm /etc/nginx/sites-enabled/"$ATL_APPDOMAIN".conf
 		fi
 	}
 	if [[ $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then

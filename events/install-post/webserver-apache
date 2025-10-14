@@ -7,9 +7,9 @@ set -euo pipefail
 install-post() {
 	enable_webserver_site() {
 		if [[ $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then
-			log "Enabling Apache vhost: $ATL_LONGNAME"
-			a2ensite -q "$ATL_LONGNAME"
-			apachectl configtest || warn "Something is wrong with Apache's config files. Fix before restarting Apache"
+			log "Enabling Apache vhost: $ATL_APPDOMAIN"
+			a2ensite -q "$ATL_APPDOMAIN"
+			apachectl configtest || warn "We just enabled site $ATL_APPDOMAIN. Something is wrong with Apache's config files. Fix before restarting Apache"
 		else
 			warn "Our $ATL_APPDIR_BASE/current/ symlink does not point to \$ATL_VER ($ATL_VER). We expect it should, as we're in the POST install step. atl_install does not mess with current/ at all - that is the job for atl_upgrade. Please fix"
 		fi
@@ -150,8 +150,8 @@ validate_sslcert() {
 
 uninstall-pre() {
 	disable_webserver_site() {
-		webserverconf="/etc/apache2/sites-available/$ATL_LONGNAME.conf"
-		if a2dissite -q "$ATL_LONGNAME" >/dev/null 2>&1; then
+		webserverconf="/etc/apache2/sites-available/$ATL_APPDOMAIN.conf"
+		if a2dissite -q "$ATL_APPDOMAIN" >/dev/null 2>&1; then
 			log "Removed Apache config file $webserverconf"
 		fi
 		apachectl configtest || warn "Something is wrong with Apache's config files. Fix before restarting Apache"

@@ -55,7 +55,7 @@ install_webserver_config() {
 		return
 	}
 
-	webserver_symlink=/etc/$webserver/sites-available/$ATL_LONGNAME.conf
+	webserver_symlink=/etc/$webserver/sites-available/$ATL_APPDOMAIN.conf
 
 	if [[ ! -f $webserver_file ]]; then
 		error "No $webserver config file found: $webserver_file. Normally this is created by applying the patchqueue. Has atl_patchqueue been run?"
@@ -99,7 +99,7 @@ install_webserver_config() {
 uninstall_webserver_config() {
 	local webserver="$1"
 	webserver_file=$webserver/${ATL_SHORTNAME}.conf
-	webserver_symlink="/etc/$webserver/sites-available/$ATL_LONGNAME.conf"
+	webserver_symlink="/etc/$webserver/sites-available/$ATL_APPDOMAIN.conf"
 	if [[ -f $webserver_symlink ]]; then rm "$webserver_symlink"; fi
 }
 
@@ -112,7 +112,7 @@ rotatelogs() {
 create_logdir() {
 	local webserver="$1"
 	# Create the log directory that our CustomLog and ErrorLog directives specify
-	install -d -o root -g adm -m 755 /var/log/"$webserver"/"$ATL_LONGNAME"
+	install -d -o root -g adm -m 755 /var/log/"$webserver"/"$ATL_APPDOMAIN"
 }
 
 install_webserver_selfsigned_ssl() (
@@ -122,8 +122,8 @@ install_webserver_selfsigned_ssl() (
 		return
 	fi
 	# {{{ If we're installing the Apache template for the first time, install the self-signed certs too.
-	certfile=/etc/ssl/local/$ATL_LONGNAME.crt
-	keyfile=/etc/ssl/local/$ATL_LONGNAME.key
+	certfile=/etc/ssl/local/$ATL_APPDOMAIN.crt
+	keyfile=/etc/ssl/local/$ATL_APPDOMAIN.key
 	log "Configuring self-signed cert: $certfile (specify ATL_SSLCERTFILE if you have a real one, or define it as blank for none)"
 	install -d /etc/ssl/local
 	if [[ ! -e $certfile ]]; then
@@ -145,8 +145,8 @@ install_webserver_selfsigned_ssl() (
 uninstall_webserver_selfsigned_ssl() (
 	set -eu -p pipefail
 	# Note we don't check ATL_SSLCERTFILE as this 'uninstall' is pretty harmless (only removes symlinks) and we could have symlinks created before ATL_SSLCERTFILE was set
-	certfile=/etc/ssl/local/$ATL_LONGNAME.crt
-	keyfile=/etc/ssl/local/$ATL_LONGNAME.key
+	certfile=/etc/ssl/local/$ATL_APPDOMAIN.crt
+	keyfile=/etc/ssl/local/$ATL_APPDOMAIN.key
 	# Only do non-destructive delete i.e. if the file is a symlink
 	for file in $certfile $keyfile; do
 		if [[ ! -e $file ]]; then continue; fi
