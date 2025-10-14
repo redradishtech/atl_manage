@@ -4,9 +4,11 @@ install-post() {
 	set -euo pipefail
 	enable_webserver_site() {
 		if [[ $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then
-			log "Enabling Nginx vhost: $ATL_LONGNAME"
-			ln -sf /etc/nginx/sites-available/"${ATL_LONGNAME}".conf /etc/nginx/sites-enabled/"${ATL_LONGNAME}".conf
-			nginx -t || warn "Something is wrong with Nginx's config files. Fix before restarting"
+			log "Enabling Nginx vhost: $ATL_APPDOMAIN"
+			local dest
+			dest=/etc/nginx/sites-enabled/"${ATL_APPDOMAIN}".conf
+			ln -sf ../sites-available/"${ATL_APPDOMAIN}".conf	"$dest"
+			nginx -t || warn "We just symlinked in $dest and now 'nginx' -t is failing. Fix before restarting nginx"
 		else
 			error "Our $ATL_APPDIR_BASE/current/ symlink does not point to \$ATL_VER ($ATL_VER). We expect it should, as we're in the POST install step. atl_install does not mess with current/ at all - that is the job for atl_upgrade. Please fix"
 		fi
