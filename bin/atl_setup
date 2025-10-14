@@ -326,7 +326,6 @@ setup_mercurial() {
 setup_tarsnap() {
 	[[ "${ATL_BACKUP_TYPES:-}" =~ tarsnap ]] || return 0
 	# Install per https://www.tarsnap.com/pkg-deb.html
-	set -x
 	local gpg=/usr/share/keyrings/tarsnap-archive-keyring.gpg
 	if [[ ! -f $gpg ]]; then
 		gpgasc=$(mktemp)
@@ -342,7 +341,6 @@ setup_tarsnap() {
 	[[ -f "$listfile" && "$(cat $listfile)" = "$listfilestr" ]] || {
 		echo "$listfilestr" >"$listfile"
 	}
-	set +x
 
 	pkginstall tarsnap
 }
