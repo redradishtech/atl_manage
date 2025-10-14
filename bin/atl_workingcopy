@@ -129,17 +129,27 @@ apply_workingcopy() {
 
 	# Given the name of a .hgignore file (or directory of files) with 'syntax: rootglob', converts each line to an rsync-style --exclude
 	globfile_to_excludes() {
+		set -x
 		[[ -e $1 ]] || fail "Missing ${1:-}"
 		{
-			if [[ -f "$1" ]]; then
-				cat "$1"
-			elif [[ -d "$1" ]]; then
+			if [[ -d "$1" ]]; then
 				cat "$1"/*
+			else
+				# A regular file or a <(...) process substitution
+				cat "$1"
 			fi
+
 		} | grep -v '^#' | grep -v '^syntax:' | sort | uniq | sed -e 's,^,--exclude=/,'
+		set +x
 	}
 
 	rsync_workingcopy_to_production() {
+
+		# Returns globs of files the running app may be using, and that we shouldn't change from under the app.
+		files_possibly_in_use() {
+			# Start with .hgignore, which indicates "temporary files" (logs/, work/ etc), and then exclude files we know the app doesn't care about (like .git) - .ignored_by_app/*
+			cat "$hgignore" | sort | uniq | grep -v -f <(cat "$ATL_APPDIR/.ignored_by_app"/*)
+		}
 
 		local excludes
 		set_rsync_excludes() {
@@ -148,10 +158,12 @@ apply_workingcopy() {
 			local hgignore="$ATL_APPDIR/.hgignore"
 			local runtime_excludes
 			if grep -q '^syntax: rootglob' "$hgignore"; then
-				mapfile -t runtime_excludes < <(globfile_to_excludes "$hgignore")
+				mapfile -t runtime_excludes < <(globfile_to_excludes <(files_possibly_in_use))
+				#echo >&2 "Not copying back: ${runtime_excludes[*]}"
+				#mapfile -t runtime_excludes < <(globfile_to_excludes "$hgignore")
 			elif grep -q '^syntax: rootglob' "$hgignore"; then
-				warn "Our currently live app in $ATL_APPDIR has an obsolete .hgignore, missing 'syntax: rootglob'. falling back to new .hgignore in -workingcopy, which is correct"
-				mapfile -t runtime_excludes < <(globfile_to_excludes "$hgignore")
+				fail "Our currently live app in $ATL_APPDIR has an obsolete .hgignore, missing 'syntax: rootglob'. falling back to new .hgignore in -workingcopy, which is correct"
+				#mapfile -t runtime_excludes < <(globfile_to_excludes "$hgignore")
 			else
 				fail "$hgignore is expected to have 'syntax: rootglob'."
 			fi
