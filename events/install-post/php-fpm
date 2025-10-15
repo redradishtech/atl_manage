@@ -10,26 +10,16 @@ install-post() {
 
 		srcfile="$ATL_APPDIR/php/php-fpm-pool.conf"
 		destdir="/etc/php/$phpver/fpm/pool.d"
-		destfile="$destdir/$ATL_APPDOMAIN.conf"
+		destfile="$destdir/$ATL_LONGNAME.conf"
 
-
-		if [[ ${ATL_MULTITENANT:-} = true ]]; then
-			log "Multitenant: we assume each tenant has symlinked something into $destdir"
-			return
-		fi
 
 		[[ -f "$srcfile" ]] || fail "Missing '$srcfile'"
 		[[ -d $destdir ]] || fail "Missing '$destdir'. This is expected to have been provided by the ${ATL_PRODUCT_RUNTIME_TECHNOLOGY} Debian package"
 		log "Symlinking $ATL_PRODUCT_RUNTIME_TECHNOLOGY pool config file $destfile"
 
-		# We may have multiple versions of (say) Jethro installed, but only one php-fpm. The first one to install
-		# $destfile 'wins'. In practice, all versions of Jethro will have identical $srcfile's, saying "load pools from
-		# ATL_DATADIR_BASE/*/conf/php-fpm.conf"
-		if [[ ! -f "$destfile" ]]; then
-			ln -s "$srcfile" "$destfile"
-		else
-			echo "$destfile already exists. Not rewriting"
-		fi
+		# Note, it's okay for more than one app (app and app-dev, say) to install .confs 
+		# Force overwrite, so that when upgrading the new file replaces the old
+		ln -sf "$srcfile" "$destfile"
 	else
 		fail "Invaid ATL_PRODUCT_RUNTIME_TECHNOLOGY value '$ATL_PRODUCT_RUNTIME_TECHNOLOGY'. It must be in format 'phpX.X-fpm'"
 	fi
