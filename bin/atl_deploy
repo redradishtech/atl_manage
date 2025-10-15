@@ -466,8 +466,11 @@ add_user_and_group() {
 
 	create_datadir() {
 		if [[ -v ATL_DATADIR_BASE ]]; then install -d -o root -g "$ATL_GROUP" -m 750 "$ATL_DATADIR_BASE"; fi
-		# Oct/25: Previously we set the owner to root. That might be good for EJ but not for Jira or Confluence, which regularly create new stuff in their home dirs.
-		if [[ -v ATL_DATADIR ]]; then install -d -o "$ATL_USER" -g "$ATL_GROUP" -m 750 "$ATL_DATADIR"; fi
+		local owner
+		# Jethro's home dir has mixed ownership - conf/ is for deployment stuff, other dirs are for 'data' - so
+		# ATL_DATADIR is owned by root. Other apps can have the whole dir owned by ATL_USER
+		owner="$( if [[ ${ATL_DATADIR_OWNED_BY_ROOT:-} = true ]]; then echo root; else echo "$ATL_USER"; fi)"
+		if [[ -v ATL_DATADIR ]]; then install -d -o "$owner" -g "$ATL_GROUP" -m 750 "$ATL_DATADIR"; fi
 	}
 
 	create_user() {

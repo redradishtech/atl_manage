@@ -1217,6 +1217,10 @@ atl_load() {
 				fi
 			fi
 
+			case "$ATL_PRODUCT" in
+				jethro) ATL_DATADIR_OWNED_BY_ROOT=true;;
+			esac
+
 			# Put $ATL_APPDIR/bin first in the path so it takes precedence over ATL_MANAGE/bin (e.g. for 'atl help')
 			# Note: this causes problems because PATH accumulates on each 'atl load'. So e.g. atl_sql from the previously
 			# loaded app will take precedence to $ATL_MANAGE/bin/atl_sql
