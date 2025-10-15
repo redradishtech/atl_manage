@@ -2,17 +2,6 @@
 
 install-post() {
 	set -euo pipefail
-	enable_webserver_site() {
-		if [[ $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then
-			log "Enabling Nginx vhost: $ATL_APPDOMAIN"
-			local dest
-			dest=/etc/nginx/sites-enabled/"${ATL_APPDOMAIN}".conf
-			ln -sf ../sites-available/"${ATL_APPDOMAIN}".conf	"$dest"
-			nginx -t || warn "We just symlinked in $dest and now 'nginx' -t is failing. Fix before restarting nginx"
-		else
-			error "Our $ATL_APPDIR_BASE/current/ symlink does not point to \$ATL_VER ($ATL_VER). We expect it should, as we're in the POST install step. atl_install does not mess with current/ at all - that is the job for atl_upgrade. Please fix"
-		fi
-	}
 
 	install_webserver_globalconfig() {
 		install -d -m 755 /etc/nginx/conf.d
@@ -37,6 +26,8 @@ install-post() {
 		fi
 	}
 
+	webserver_test() { nginx -t; }
+
 	define_internal_interface # Define $ATL_SHORTNAME.internal
 	pkginstall nginx-full
 	install_webserver_listener # Make the webserver listen on $ATL_SHORTNAME.internal
@@ -46,8 +37,7 @@ install-post() {
 	# Create the log directory that our CustomLog and ErrorLog directives specify
 	create_logdir nginx
 	install_webserver_selfsigned_ssl
-	enable_webserver_site
-	nginx -t
+	webserver_test
 	log "FIXME: manually reload nginx"
 	rotatelogs nginx
 }

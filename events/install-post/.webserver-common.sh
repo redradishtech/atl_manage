@@ -39,23 +39,22 @@ install_webserver_listener() {
 				}
 		fi
 	elif [[ $ATL_WEBSERVER = nginx ]]; then
-		nginx -t
+		webserver_test
 		if [[ ! -v ATL_WEBSERVER_NGINX_CONFIGURED ]]; then
 			error "FIXME: Please manually configure nginx to listen on $INTERNAL_HOSTNAME:80 (in addition to the defaults), or set ATL_WEBSERVER_NGINX_CONFIGURED if this has been done"
 		fi
-		nginx -t
+		webserver_test
 	fi
 }
 
+# Create /etc/apache2/sites-available/{appdomain}.conf or /etc/nginx/sites-available/{appdomain}.conf, if one doesn't
+# already exist.
 install_webserver_config() {
 	local webserver="$1"
-	webserver_file=$ATL_APPDIR_BASE/current/$webserver/${webserver}.conf
-	[[ -f $webserver_file ]] || {
-		warn "Could not find webserver config file (either $ATL_SHORTNAME.conf or ${ATL_SHORTNAME}_proxied.conf)"
-		return
-	}
-
-	webserver_symlink=/etc/$webserver/sites-available/$ATL_APPDOMAIN.conf
+	local webserver_file
+	webserver_file="$ATL_APPDIR_BASE/current/$webserver/$webserver.conf"
+	webserver_symlink="/etc/$webserver/sites-available/$ATL_APPDOMAIN.conf"
+	webserver_symlink_referent="$(readlink "$webserver_symlink")" || :
 
 	if [[ ! -f $webserver_file ]]; then
 		error "No $webserver config file found: $webserver_file. Normally this is created by applying the patchqueue. Has atl_patchqueue been run?"
@@ -64,23 +63,40 @@ install_webserver_config() {
 	fi
 	if [[ $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then
 		# We don't want atl_install to mess with current/, but at the same time, if ATL_NEWVER=$ATL_VER then our newly created apache file should be used.
-		# So we check where current/ currently points, and if at $ATL_VER, go ahead with the Apache symlink
-		if [[ -L $webserver_symlink && $(readlink "$webserver_symlink") != "$webserver_file" ]]; then
-			warn "Symlink $webserver_symlink unexpectedly does NOT point to $webserver_file, but instead to $(readlink -f "$webserver_symlink"). Re-linking"
-			set -x
-			ln -sf "$webserver_file" "$webserver_symlink"
-			set +x
+		# So we check where current/ currently points, and if at $ATL_VER, go ahead with the webserver symlink
+		if [[ -L $webserver_symlink && $webserver_symlink_referent != "$webserver_file" ]]; then
+			warn "Symlink $webserver_symlink points to $webserver_symlink_referent, NOT $webserver_file as this app would like. This can happen e.g. if 'app' and 'app-dev' are installed on the same server, used by different tenants. The first installed (hopefully 'app') wins. Not altering anything."
+			return
 		else
 			ln -sf "$webserver_file" "$webserver_symlink"
 		fi
+
+		local dest
+		dest=/etc/nginx/sites-enabled/"${ATL_APPDOMAIN}".conf
+		if [[ ! -e $dest ]]; then
+			log "Enabling $webserver vhost: $ATL_APPDOMAIN"
+			ln -sf ../sites-available/"$ATL_APPDOMAIN".conf	"$dest"
+			webserver_test || warn "We just symlinked in $dest and now $webserver is failing. Fix before restarting $webserver"
+		else
+			# At this point, ../sites-available/$ATL_APPDOMAIN.conf is guaranteed to point to what we want.
+			local referent
+			referent="$(readlink "$dest")"
+			if [[ "$referent" != "../sites-available/$ATL_APPDOMAIN.conf" ]]; then
+				# This should never happen. Why would the sites-enabled symlink not point to sites-available?
+				error "$dest does not point to ../sites-available/$ATL_APPDOMAIN.conf as expected"
+			fi
+		fi
+
+
 	else
 		# We're not installing to current/. Proceed with caution to avoid messing up production.
 		if [[ -L $webserver_symlink ]]; then
 			# A sites-available/ config file exists. Is it valid?
-			if [[ -f $(readlink -f "$webserver_symlink") ]]; then
-				warn "$webserver_symlink already exists, pointing to $(readlink -f "$webserver_symlink"). Not modifying"
+			if [[ -f $webserver_symlink_referent ]]; then
+				warn "$webserver_symlink already exists, pointing to $webserver_symlink_referent. Not modifying"
+				return
 			else
-				warn "$webserver_symlink existed, but pointing to nonexistent file $(readlink -f "$webserver_symlink"). Recreating symlink to point to $webserver_file (which doesn't exist yet but will when $ATL_NEWVER becomes current)."
+				warn "$webserver_symlink existed, but pointing to nonexistent file $webserver_symlink_referent. Recreating symlink to point to $webserver_file (which doesn't exist yet but will when $ATL_NEWVER becomes current)."
 				ln -sf "$webserver_file" "$webserver_symlink"
 			fi
 		else
@@ -91,6 +107,7 @@ install_webserver_config() {
 				warn "How unusual, there is no $webserver_symlink file, despite an earlier version being deployed (symlinked to current/). Please check, and if okay, 'ln -s $webserver_file $webserver_symlink'"
 			fi
 		fi
+		error "Our $ATL_APPDIR_BASE/current/ symlink does not point to \$ATL_VER ($ATL_VER). We expect it should, as we're in the POST install step. atl_install does not mess with current/ at all - that is the job for atl_upgrade. Please fix"
 	fi
 	# }}}
 
@@ -166,7 +183,7 @@ define_internal_interface() {
 	## {{{ Define a *.internal internal hostname to bind :8009 to
 	# Note that Apache 2.4.25+ refuses to allow hostnames containing '_', so we change them to '-'. http://apache-http-server.18135.x6.nabble.com/Underscores-in-hostnames-td5034985.html
 	# Don't count commented-out lines
-	if ! grep -qP "^\s*[^#].+${INTERNAL_HOSTNAME}" /etc/hosts; then
+	if ! getent hosts "$INTERNAL_HOSTNAME" >/dev/null; then
 		# Internal IP not yet defined
 
 		if [[ -n ${ATL_INTERNALIP-} ]]; then
@@ -195,7 +212,7 @@ define_internal_interface() {
 			echo -e "$ATL_INTERNALIP\t${INTERNAL_HOSTNAME}" >>/etc/hosts
 		fi
 	fi
-	if [[ $INTERNAL_HOSTNAME_OLD != "$INTERNAL_HOSTNAME" ]] && grep -q "${INTERNAL_HOSTNAME_OLD}" /etc/hosts; then
+	if [[ $INTERNAL_HOSTNAME_OLD != "$INTERNAL_HOSTNAME" ]] && grep -q "[[:blank:]]${INTERNAL_HOSTNAME_OLD}" /etc/hosts; then
 		warn "Warning: The old '.localhost' form of internal hostname, '$INTERNAL_HOSTNAME_OLD',  is still in /etc/hosts. It should be removed once '${INTERNAL_HOSTNAME}' is used everywhere"
 	fi
 	# }}}

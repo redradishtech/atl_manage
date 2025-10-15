@@ -5,15 +5,6 @@ set -euo pipefail
 # Note: validateperms() is implemented in .webserver-common.sh
 
 install-post() {
-	enable_webserver_site() {
-		if [[ $(basename "$(readlink -f "$ATL_APPDIR_BASE"/current)") = "$ATL_VER" ]]; then
-			log "Enabling Apache vhost: $ATL_APPDOMAIN"
-			a2ensite -q "$ATL_APPDOMAIN"
-			apachectl configtest || warn "We just enabled site $ATL_APPDOMAIN. Something is wrong with Apache's config files. Fix before restarting Apache"
-		else
-			warn "Our $ATL_APPDIR_BASE/current/ symlink does not point to \$ATL_VER ($ATL_VER). We expect it should, as we're in the POST install step. atl_install does not mess with current/ at all - that is the job for atl_upgrade. Please fix"
-		fi
-	}
 	fix_apache_servername_warnings() {
 		grep -q ^ServerName /etc/apache2/apache2.conf || {
 			sn="ServerName $(uname -n).${ATL_FQDN#*.}"
@@ -74,6 +65,8 @@ install-post() {
 	ubuntu_version_greaterthan() { version_greaterthan "$(lsb_release --release --short)" "$1"; }
 	apache2_version_greaterthan() { version_greaterthan "$(dpkg-query --showformat='${Version}' --show apache2)" "$1"; }
 
+	webserver_test() { apachectl configtest; }
+
 	define_internal_interface # Define $ATL_SHORTNAME.internal (aka ATL_FQDN_INTERNAL)
 	create_logdir apache2
 	pkginstall apache2
@@ -119,7 +112,6 @@ install-post() {
 	fix_apache_logrotate
 	install_webserver_config apache2
 	install_webserver_selfsigned_ssl
-	enable_webserver_site
 	validate_sslcert
 	validateperms
 	# FIXME: configtest fails here if the letsencrypt patch has added a RemoteIPHeader directive to apache2/apache2.conf
